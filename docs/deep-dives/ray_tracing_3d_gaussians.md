@@ -1,19 +1,8 @@
 # VK3DGRT: Efficient 3D Gaussian Ray Tracing (3DGRT) [Moënne-Loccoz2024] using Vulkan RTX
 
-![Raytracing 3D gaussians and 3D meshes with reflections and refractions](ray_tracing_rendering_ui.png)  
+![Raytracing 3D gaussians and 3D meshes with reflections and refractions](../images/ray_tracing_rendering_ui.png)  
 
 We implement the rendering algorithm of 3D Gaussian Ray Tracing (3DGRT) as described in [Moënne-Loccoz2024] using the Vulkan Ray Tracing (RTX) extension.
-
-## Table of Contents
-
-1. [Principle](#principle)
-2. [Any Hit Based Implementation](#any-hit-based-implementation)
-3. [Acceleration Structures](#acceleration-structures)
-4. [Compositing with 3D Meshes and Secondary Rays](#compositing-with-3d-meshes-and-secondary-rays)
-6. [Depth of Field](#depth-of-field)
-7. [Performance Results](#performance-results)
-8. [Continue Reading](#continue-reading)
-9. [References](#references)
 
 ## Principle
 
@@ -21,16 +10,18 @@ As with 3DGS [Kerbl2023], the compositing of radiance for each particle intersec
 
 Unlike [VK3DGSR](rasterization_of_3d_gaussian_splatting.md), where screen-aligned 2D quads are used to render the particles, the ray tracing variant solves the particle intersection in 3D space, using a 3D volume to describe the particle.
 
-![Comparison of triangle based primitives used for rasterization (quads) and for raytracing (icosahedrons)](particle_primitives_raster_vs_ray.png)  
+![Comparison of triangle based primitives used for rasterization (quads) and for raytracing (icosahedrons)](../images/particle_primitives_raster_vs_ray.png)  
 
 To compute the intersections between rays and particles, each particle is defined using either:
+
 * A bounding volume defined by a **3D mesh of an icosahedron**, or
 * A bounding volume defined by a **3D Axis Aligned Bounding Box (AABB)**.
 
 ![Comparison of particle bounding volumes using AABBs and 
-parametric intersections or using icosahedron 3D meshes with TTU intersections](particle_primitives_aabb_vs_icosahedron.png)
+parametric intersections or using icosahedron 3D meshes with TTU intersections](../images/particle_primitives_aabb_vs_icosahedron.png)
 
 **In the case of the Icosahedron 3D Mesh**, the intersection is computed by the built-in Traversal and Triangle Intersection Unit (TTU):
+
 * The TTU is a hardware unit designed to accelerate the process of traversing acceleration structures (such as BVH – Bounding Volume Hierarchies) and performing ray-triangle intersection tests, which are critical operations in ray tracing. This specialized unit helps improve the performance and efficiency of ray tracing computations on GPUs.
 
 **In the case of the AABB**, the intersection is computed using a programmable intersection shader that implements parametric intersection with the particle ellipsoid.
@@ -43,17 +34,18 @@ To overcome this issue, [Moënne-Loccoz2024] proposes using the **any hit shader
 
 The Ray Payload (also known as Per Ray Data - PRD) is used to exchange data between the **hit shader** and the **ray generation shader** (using `rayPayloadEXT`/`rayPayloadInEXT`). Instead of storing the result of one intersection as one would do when using a closest hit, a sorted array of $K$ intersections is stored in the payload. For each intersection, the any hit shader tests if the new particle intersection (which may come in any order) should be inserted in the array using simple insertion sort. The farther intersection of the array might be discarded in the process. After tracing one ray, the payload array contains a subset of $k \leq K$ nearest particles sorted front to back. The **ray generation shader** computes the particle response using a 3D Gaussian and the particle properties, and performs the compositing of the computed radiances for each intersected particle. It then reruns the tracing of a new ray starting from the last intersected particle of the previous run if needed (if $minTransmittance$ is not reached and $k = K$). And so on.
 
-![Raytracing 3D gaussians using the any hit shader](./pipeline_ray_tracing_example.png)
+![Raytracing 3D gaussians using the any hit shader](../images/pipeline_ray_tracing_example.png)
 
 The example of the above diagram is developed hereafter:
+
 * We configure the Ray Payload as an array of intersection results containing a distance and a particle ID.
     * Let $K$ be the maximum number of results that can be stored in the array of intersections.
-* In this example, three rays are traced by the [**ray generation**](../shaders/threedgrt_raytrace.rgen.slang) shader (for the same pixel).
+* In this example, three rays are traced by the [**ray generation**]({{ source_base }}/shaders/threedgrt_raytrace.rgen.slang){:target="_blank"} shader (for the same pixel).
     * Before each `traceRayEXT` call, each entry of the payload array is reset to infinite distance.
 * Each `traceRayEXT` of index $n$ will systematically go:
     * Through all the splats between $Tmin_n$ and $Tmax_n$, invoking the **any hit shader** for each intersection.
-    * The [**any hit shader**](../shaders/threedgrt_raytrace.rahit.slang) handles the insertion and sorting of the $k \leq K$ closest particles within the payload buffer.
-* After each ray trace, the raygen shader (using the `particleProcessHit` function, see file [threedgrt.h.slang](../shaders/threedgrt.h.slang)):
+    * The [**any hit shader**]({{ source_base }}/shaders/threedgrt_raytrace.rahit.slang){:target="_blank"} handles the insertion and sorting of the $k \leq K$ closest particles within the payload buffer.
+* After each ray trace, the raygen shader (using the `particleProcessHit` function, see file [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}):
     * Computes the radiance of each intersected splat and blends the result to the pixel radiance.
     * The $transmittance$ is decreased by the opacity of the blended values.
     * $Tmin_{n+1}$ is set to the distance to the last intersected splat.
@@ -63,17 +55,19 @@ The example of the above diagram is developed hereafter:
 
 The parameters to control the generation of the ray tracing acceleration structures are found in the Properties panel of "**Assets > Radiance Fields > SplatSet**".
 
-![Acceleration structures variants](./raytracing_acceleration_structures.png)
+![Acceleration structures variants](../images/raytracing_acceleration_structures.png)
 
 The particle primitives can be described using the two approaches mentioned above:
+
 * **Use AABBs**: *Enabled* activates the use of a procedural intersection shader.
 * **Use AABBs**: *Disabled* activates the use of an Icosahedron 3D Mesh and built-in TTU intersection.
 
 The ray acceleration structures (AS) can be built with different approaches:
+
 * **Use TLAS Instances**: *Enabled* will generate ASs where the geometry of a single unit particle is stored in a Bottom Level Acceleration Structure (BLAS) and where the Top Level Acceleration Structure (TLAS) contains as many instances of the BLAS as there are particles, each instance having an associated transformation matrix. 
 * **Use TLAS Instances**: *Disabled* will generate ASs where the geometry of all the particles transformed in global coordinates is stored in a Bottom Level Acceleration Structure (BLAS) and where the Top Level Acceleration Structure (TLAS) contains a single instance of this BLAS.
 
-![AABB mode with or without TLAS instances](./aabbs_instances_on_off.png)
+![AABB mode with or without TLAS instances](../images/aabbs_instances_on_off.png)
 
 *Activating* **Use AABBs** *together with deactivating* **Use TLAS Instances** leads to BLAS containing massive AABB overlap, due to the fact that AABBs of particles transformed to their world coordinates can become very large. This configuration leads to extremely slow ray tracing performance, possibly leading to a Device Lost error. This is not the case when using instances since there is only one AABB that is then transformed by the instance matrix into a non-axis-aligned box. **This combination is thus disabled in the GUI**.
 
@@ -81,7 +75,7 @@ Finally, the **BLAS compaction** option allows compressing the BLAS, which leads
 
 ## Compositing with 3D Meshes and Secondary Rays
 
-The provided implementation allows composing scenes with 3D meshes and a particle set. For this, the ray tracing loop is extended so that meshes occlude particles placed behind them and are overlaid by closer particles. To do so efficiently, the meshes are stored in a separate acceleration structure (`topLevelASMesh` in the file [threedgrt_raytrace.rgen.slang](../shaders/threedgrt_raytrace.rgen.slang)).
+The provided implementation allows composing scenes with 3D meshes and a particle set. For this, the ray tracing loop is extended so that meshes occlude particles placed behind them and are overlaid by closer particles. To do so efficiently, the meshes are stored in a separate acceleration structure (`topLevelASMesh` in the file [threedgrt_raytrace.rgen.slang]({{ source_base }}/shaders/threedgrt_raytrace.rgen.slang){:target="_blank"}).
 
 1. The meshes are traced before the particle set. While particle sets make use of the `any hit shader`, the 3D meshes use the `closest hit shader` of the same pipeline. In case of a hit, the `closest hit shader` uses the same payload array to return the distance $meshHitDist$ to the intersection, the object ID, the material ID of the object, the position, and the normal of the intersection point in world coordinates. These are stored for later use, and shading of the mesh is postponed. In this way, if some particles in front of the mesh are opaque enough, the shading of the mesh (including potential secondary rays evaluations) will not be computed for better performance.
 2. The tracing of the particles acceleration structure (`topLevelAS`) occurs from $min$ to $meshHitDist$. This prevents the need for costly tracing of particles placed behind the mesh if any. The $radiance$ for this pixel is updated by the `processHit` function as described in the previous section.
@@ -90,10 +84,10 @@ The provided implementation allows composing scenes with 3D meshes and a particl
 
 ## Depth of Field
 
-![Raytracing depth of field, using a single sample frame](./raytracing_dof_one_frame.png)
+![Raytracing depth of field, using a single sample frame](../images/raytracing_dof_one_frame.png)
 *Raytracing depth of field, using a single sample frame*
 
-Depth of field (DoF) is implemented in the [ray generation shader](../shaders/raytrace.rgen.slang) main function using a sampling approach. We initialize a random number seed based on the launch ID and frame sample ID:
+Depth of field (DoF) is implemented in the [ray generation shader]({{ source_base }}/shaders/threedgrt_raytrace.rgen.slang){:target="_blank"} main function using a sampling approach. We initialize a random number seed based on the launch ID and frame sample ID:
 
 ```c
 // Initialize the random number 
@@ -114,10 +108,10 @@ rayDirection = finalRayDir;
 
 This method calculates a new ray origin and direction to simulate the blur effect due to depth of field, by perturbing the ray direction based on the aperture size and focus distance. The random aperture position is generated using a combination of cosine and sine functions to ensure a uniform distribution within the aperture.
 
-![Raytracing depth of field, accumulating hundred sample frames](./raytracing_dof_hundred_frames.png)
+![Raytracing depth of field, accumulating hundred sample frames](../images/raytracing_dof_hundred_frames.png)
 *Raytracing depth of field, accumulating hundred sample frames*
 
-Using this method on a single frame ($frameInfo.frameSampleId = 0$) leads to a noisy image result due to the random approach. To achieve a clean denoised blur effect, we use **temporal sampling** and **accumulation over multiple frames** with a random seed evolving as a function of $frameInfo.frameSampleId$. By averaging the contributions from each frame, at the end of the ray generation main function, the noise is reduced:
+Using this method on a single frame (\(frameInfo.frameSampleId = 0\)) leads to a noisy image result due to the random approach. To achieve a clean denoised blur effect, we use **temporal sampling** and **accumulation over multiple frames** with a random seed evolving as a function of \(frameInfo.frameSampleId\). By averaging the contributions from each frame, at the end of the ray generation main function, the noise is reduced:
 
 ```c
 if(frameInfo.frameSampleId > 0)
@@ -131,7 +125,7 @@ if(frameInfo.frameSampleId > 0)
 image[launchID] = float4(fragRadiance, 1.0);
 ```
 
-Here, the color from previous frames is blended with the current frame's color. The accumulation factor $$a = \frac{1.0}{\text{frameSampleId} + 1}$$ ensures that the contribution of each frame decreases over time, resulting in a smoother and cleaner image.
+Here, the color from previous frames is blended with the current frame's color. The accumulation factor \(a = \frac{1.0}{\text{frameSampleId} + 1}\) ensures that the contribution of each frame decreases over time, resulting in a smoother and cleaner image.
 
 The use of a denoiser such as DLSS would lead to better visual quality during the convergence period. This is kept for future work.
 
@@ -155,21 +149,13 @@ The following charts presents the results of such a benchmark, when run on an `N
 
 Note that only setup **D - TLAS inst. on, Use AABB** provides accurate visual results, as it uses parametric intersections matching the reconstruction method of the 3DGRT dataset models. While the other setups (icosahedron-based) would show correct visual results on some icosahedron-reconstructed models, the relative rendering performance difference between parametric and icosahedron methods presented hereafter remains representative.
 
-![Raytracing (3DGRT) Pipeline Performance Comparison Using Acceleration Structures Variants](histogram_as_format_timers_3dgrt.png) 
+![Raytracing (3DGRT) Pipeline Performance Comparison Using Acceleration Structures Variants](../images/histogram_as_format_timers_3dgrt.png) 
 
 Note that in the following histogram, the results are essentially identical for each model because they all feature 1 million splats in the provided 3DGRT dataset.
 
-![Raytracing (3DGRT) Memory Consumption Comparison Using Acceleration Structures Variants](histogram_as_format_memory_3dgrt.png) 
+![Raytracing (3DGRT) Memory Consumption Comparison Using Acceleration Structures Variants](../images/histogram_as_format_memory_3dgrt.png) 
 
 ## Acknowledgment
 
 Thanks to Qi Wu (@wilsonCernWq) for generating the 3DGRT dataset for us. Thanks to Nicolas Moënne-Loccoz (@moennen) for the great discussions around 3DGRT.
 
-## Continue Reading
-
-1. [VK3DGUT: Efficient 3D Gaussian Unscented Transform (3DGUT) [Wu2024] Using Vulkan Rasterization](./doc/rasterization_of_3dgut.md)
-2. [VK3DGHR: 3D Gaussians Hybrid Rendering Using Vulkan RTX and Rasterization](./hybrid_rendering_3d_gaussians.md)
-
-## References
-
-Please consult the consolidated [References](../README.md#references) section of the main `README.md`.

@@ -1,0 +1,13 @@
+[data-md-color-primary="custom"] {
+  --md-primary-fg-color: #76b900;
+  --md-primary-fg-color--light: #8ad100;
+  --md-primary-fg-color--dark: #5a8f00;
+  --md-primary-bg-color: #ffffff;
+  --md-primary-bg-color--light: #ffffffb3;
+}
+
+.md-header__button.md-logo img {
+  max-height: 1.2rem;
+  width: auto;
+  filter: brightness(0) invert(1);
+}

@@ -1,0 +1,100 @@
+site_name: Vulkan Gaussian Splatting
+site_description: Real-time visualization of 3D Gaussian Splatting using the Vulkan API
+site_url: https://nvpro-samples.github.io/vk_gaussian_splatting/
+repo_url: https://github.com/nvpro-samples/vk_gaussian_splatting
+repo_name: nvpro-samples/vk_gaussian_splatting
+
+theme:
+  name: material
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: custom
+      accent: light green
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: custom
+      accent: light green
+      toggle:
+        icon: material/brightness-4
+        name: Switch to light mode
+  features:
+    - navigation.instant
+    - navigation.top
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+  logo: assets/nvidia-favicon.ico
+  favicon: assets/nvidia-favicon.ico
+  icon:
+    repo: fontawesome/brands/github
+
+plugins:
+  - search
+  - macros
+
+copyright: Copyright &copy; 2025-2026 NVIDIA Corporation. All rights reserved.
+
+extra:
+  # Base URL for source code links.
+  # Change this when working on a branch, e.g.:
+  #   source_base: https://github.com/nvpro-samples/vk_gaussian_splatting/blob/my-feature-branch
+  source_base: https://github.com/nvpro-samples/vk_gaussian_splatting/blob/main
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.arithmatex:
+      generic: true
+  - tables
+  - attr_list
+  - md_in_html
+  - toc:
+      permalink: true
+
+extra_css:
+  - stylesheets/extra.css
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+nav:
+  - Home: index.md
+  - Getting Started: getting-started.md
+  - Release Notes: release-notes.md
+  - Feature Videos: feature-videos.md
+  - User Guides:
+    - Overview: user-guides/overview.md
+    - Workflow: user-guides/workflow.md
+    - File Menu: user-guides/file-menu.md
+    - Assets and Properties:
+      - user-guides/assets-and-properties.md
+      - Renderer Pipelines: user-guides/renderer-pipelines.md
+      - Radiance Fields: user-guides/radiance-fields.md
+      - Mesh Models: user-guides/mesh-models.md
+      - Cameras: user-guides/cameras.md
+      - Lights: user-guides/lights.md
+    - Toolbar: user-guides/toolbar.md
+    - Image Comparison: user-guides/image-comparison.md
+    - Shader Feedback: user-guides/shader-feedback.md
+    - Monitoring Panels: user-guides/monitoring-panels.md
+  - Deep Dives:
+    - VK3DGSR - Rasterization: deep-dives/rasterization_of_3d_gaussian_splatting.md
+    - VK3DGRT - Ray Tracing: deep-dives/ray_tracing_3d_gaussians.md
+    - VK3DGUT - Unscented Transform: deep-dives/rasterization_of_3dgut.md
+    - VK3DGHR - Hybrid Rendering: deep-dives/hybrid_rendering_3d_gaussians.md
+    - Stochastic Transparency: deep-dives/stochastic_transparency.md
+    - Lighting and Shadows: deep-dives/lighting_and_shadows.md
+  - Datasets: datasets.md
+  - Benchmarking: benchmarking.md
+  - References: references.md

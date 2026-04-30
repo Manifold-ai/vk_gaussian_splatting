@@ -1,7 +1,7 @@
 
 # VK3DGUT: Efficient 3D Gaussian Unscented Transform (3DGUT) [Wu2024] Using Vulkan Rasterization
 
-![](raytrace_vs_3dgut.png)
+![](../images/raytrace_vs_3dgut.png)
 
 3D Gaussian Splatting [Kerbl2023] (3DGS) rasterization with global sorting is highly efficient in terms of rendering performance but is feature-limited. 3D Gaussian Ray Tracing [Moënne-Loccoz2024] (3DGRT) opens up more possibilities, such as fisheye lenses, rolling shutters, depth of field, fast shadows, etc. However, the ray tracing approach presents lower rendering frame rates.
 
@@ -9,42 +9,31 @@
 
 We implement VK3DGUT on the same infrastructure as the "Raster mesh shader 3DGS" pipeline (see [VK3DGS](./rasterization_of_3d_gaussian_splatting.md)) and replace the Elliptical Weighted Average (EWA) projections from 3DGS with the new Unscented Transform (UT) projection from 3DGUT. For mathematical details, please refer to the 3DGUT publication [[Wu2024](https://research.nvidia.com/labs/toronto-ai/3DGUT/)].
 
-![Unscented Transform illustration](ut_explain.jpg)
-
-## Table of Contents
-
-1. [Implementation Details](#implementation-details)
-   * [Mesh Shader](#mesh-shader)
-   * [Fragment Shader](#fragment-shader)
-   * [Adaptation for Temporal Multi-Sampling](#adaptation-for-temporal-multi-sampling)
-2. [Current Limitations](#current-limitations)
-3. [Performance Results](#performance-results)
-4. [Continue Reading](#continue-reading)
-5. [References](#references)
+![Unscented Transform illustration](../images/ut_explain.jpg)
 
 ## Implementation Details
 
-We have added a new renderer pipeline named **"Raster mesh shader 3DGUT"** in the Renderer parameters. Although we did not create a vertex shader version, it would be straightforward to do so by starting from the VK3DGS version and making the necessary updates, similar to what we did for the mesh shader variant. The new pipeline is built using two new shader files: [threedgut_raster.mesh.slang](../shaders/threedgut_raster.mesh.slang) and [threedgut_raster.frag.slang](../shaders/threedgut_raster.frag.slang). The projections functions functions are found in [threedgut.h.slang](../shaders/threedgut.h.slang) and other slang files prefixed by "threedgut".
+We have added a new renderer pipeline named **"Raster mesh shader 3DGUT"** in the Renderer parameters. Although we did not create a vertex shader version, it would be straightforward to do so by starting from the VK3DGS version and making the necessary updates, similar to what we did for the mesh shader variant. The new pipeline is built using two new shader files: [threedgut_raster.mesh.slang]({{ source_base }}/shaders/threedgut_raster.mesh.slang){:target="_blank"} and [threedgut_raster.frag.slang]({{ source_base }}/shaders/threedgut_raster.frag.slang){:target="_blank"}. The projections functions functions are found in [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"} and other slang files prefixed by "threedgut".
 
 ### Mesh Shader
 
-The mesh shader [threedgut_raster.mesh.slang](../shaders/threedgut_raster.mesh.slang) is based on [threedgs_raster.mesh.slang](../shaders/threedgs_raster.mesh.slang). It replaces the EWA projection with the UT one. The projection is computed in two steps:
+The mesh shader [threedgut_raster.mesh.slang]({{ source_base }}/shaders/threedgut_raster.mesh.slang){:target="_blank"} is based on [threedgs_raster.mesh.slang]({{ source_base }}/shaders/threedgs_raster.mesh.slang){:target="_blank"}. It replaces the EWA projection with the UT one. The projection is computed in two steps:
 
-1. We compute the covariance using the function `threedgutParticleProjection` (defined in the file [threedgut.h.slang](../shaders/threedgut.h.slang)).
+1. We compute the covariance using the function `threedgutParticleProjection` (defined in the file [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"}).
 
 2. We compute the rectangular 2D bounding box (the projection extent) to emit a screen-aligned quad with the proper extent:
 
-   a. If **"Projection Method > Conic"** is selected, use the function `threedgutProjectedExtentConicOpacity` (also defined in the file [threedgut.h.slang](../shaders/threedgut.h.slang)).
+   a. If **"Projection Method > Conic"** is selected, use the function `threedgutProjectedExtentConicOpacity` (also defined in the file [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"}).
 
-   b. If **"Projection Method > Eigen"** is selected, use the function `threedgsProjectedExtentBasis` (defined in the file [threedgs.h.slang](../shaders/threedgs.h.slang)).
+   b. If **"Projection Method > Eigen"** is selected, use the function `threedgsProjectedExtentBasis` (defined in the file [threedgs.h.slang]({{ source_base }}/shaders/threedgs.h.slang){:target="_blank"}).
 
 The **Conic** extent method is comparable to the approach used in the original 3DGS paper for finding the rectangular bounding box of the projection. This bounding box is then used in both 3DGS and 3DGUT to rasterize using CUDA. The version presented here is adapted from the CUDA code of 3DGUT.
 
-It differs from the **Eigen** approach also used in the VK3DGS implementation, where we use the eigenvalues and eigenvectors of the 2D covariance matrix to determine the 2D basis for the splat. This leads to non-axis-aligned rectangular 2D extents that, in some cases, better fit the particles and prevent rasterizing many fragments with negligible or zero contributions (see comments in [threedgs.h.slang](../shaders/threedgs.h.slang)). 
+It differs from the **Eigen** approach also used in the VK3DGS implementation, where we use the eigenvalues and eigenvectors of the 2D covariance matrix to determine the 2D basis for the splat. This leads to non-axis-aligned rectangular 2D extents that, in some cases, better fit the particles and prevent rasterizing many fragments with negligible or zero contributions (see comments in [threedgs.h.slang]({{ source_base }}/shaders/threedgs.h.slang){:target="_blank"}). 
 
 As can be seen in the [Performance Results](#performance-results) section, both approaches tend to be comparable in terms of performance. Although we did not conduct extensive tests, an image comparison of the Bicycle model's default view between **Conic** (considered the reference) and **Eigen** yields a PSNR of 52.83 dB, meaning that the Eigen approach is also highly accurate. The minor differences arise from slight threshold variations between the two implementations.
 
-![Comparison of particle projection extents - Pinhole camera example](./particle_extent_VK3DGUT_Conic_vs_Eigen.png)
+![Comparison of particle projection extents - Pinhole camera example](../images/particle_extent_VK3DGUT_Conic_vs_Eigen.png)
 
 The quad is finally emitted (as two triangles) with the following per-face attributes to avoid data fetches in the fragment shader:
 
@@ -55,22 +44,22 @@ The opacity is then evaluated per fragment in the fragment shader using the prov
 
 ### Fragment Shader
 
-The fragment shader [threedgut_raster.frag.slang](../shaders/threedgut_raster.frag.slang) is quite different from the VK3DGS one (see [threedgs_raster.frag.slang](../shaders/threedgs_raster.frag.slang)), which only performs interpolations.
+The fragment shader [threedgut_raster.frag.slang]({{ source_base }}/shaders/threedgut_raster.frag.slang){:target="_blank"} is quite different from the VK3DGS one (see [threedgs_raster.frag.slang]({{ source_base }}/shaders/threedgs_raster.frag.slang){:target="_blank"}), which only performs interpolations.
 
 In this new fragment shader, we evaluate, for each fragment of each emitted particle screen quad, the intersection of the associated primary ray and the particle using the particle intersection from 3DGRT.
 
-We first compute the primary ray for the given fragment according to the camera model using `generatePinholeRay` or `generateFisheyeRay` (functions defined in [cameras.h.slang](../shaders/cameras.h.slang)).
+We first compute the primary ray for the given fragment according to the camera model using `generatePinholeRay` or `generateFisheyeRay` (functions defined in [cameras.h.slang]({{ source_base }}/shaders/cameras.h.slang){:target="_blank"}).
 
-We then apply ray perturbation if the **depth of field** effect is activated, using the `depthOfField` function (also defined in [cameras.h.slang](../shaders/cameras.h.slang)).
+We then apply ray perturbation if the **depth of field** effect is activated, using the `depthOfField` function (also defined in [cameras.h.slang]({{ source_base }}/shaders/cameras.h.slang){:target="_blank"}).
 
-We finally evaluate the ray/particle intersection using the function `particleProcessHitGut`, adapted from VK3DGRT (see [threedgrt.h.slang](../shaders/threedgrt.h.slang)). The core of this function is similar to the VK3DGRT version (see `particleProcessHit` in the same file). We perform two adaptations for VK3DGUT:
+We finally evaluate the ray/particle intersection using the function `particleProcessHitGut`, adapted from VK3DGRT (see [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}). The core of this function is similar to the VK3DGRT version (see `particleProcessHit` in the same file). We perform two adaptations for VK3DGUT:
 
 * The new function only returns the evaluated opacity for the fragment instead of performing the blending with previous radiance values. The blending is handled by the alpha blending mechanism of the Vulkan rasterization pipeline (recall that splats are sorted back to front prior to rasterization).
 * Additionally, the VK3DGRT version of the function performs the particle data fetch, whereas in this new VK3DGUT version, we use the values provided by the mesh shader, passed as function parameters through triangle attributes. This approach ensures that fetches are done once per particle instead of once per fragment, which is critical for performance.
 
 The following image clearly shows the deformations of the particles (the green one being the most visually obvious) in extreme fisheye conditions, thanks to the ray/particle evaluation and the proper adaptation of the 2D extent.
 
-![](./particle_extent_fisheye_VK3DGRT_vs_VK3DGUT.png)
+![](../images/particle_extent_fisheye_VK3DGRT_vs_VK3DGUT.png)
 
 > **Note**: We currently compute/generate these rays per **fragment** (whereas in the raytracer, we do it per **pixel**), resulting in multiple computations per pixel for each particle projection that covers the pixel. We could consider preparing a ray buffer with these per-pixel rays in a pre-pass, which could potentially accelerate the execution of the fragment shader. However, while this approach would reduce the cost of mathematical evaluations, it would come with the trade-offs of increased memory storage, pre-pass execution time, synchronization, and data fetches (which is also a costly operation) in the fragment shader. This is left as an interesting exercise for the reader.
 
@@ -78,13 +67,13 @@ The following image clearly shows the deformations of the particles (the green o
 
 The depth of field effect is achieved by applying pseudo-random perturbations to the primary rays to sample the diaphragm aperture (see [depth of field in VK3DGRT](./ray_tracing_3d_gaussians.md#depth-of-field)). 
 
-![TODO](dof_vk3dgrt_vs_vk3dgut.png)
+![TODO](../images/dof_vk3dgrt_vs_vk3dgut.png)
 
 One primary ray is cast per pixel and per frame. Similar to the ray tracing approach, in order to obtain a converged, denoised image (without using a denoiser), it is necessary to accumulate the results of several frames (or several samples per frame).
 
 In the VK3DGRT ray tracing pipeline, this temporal accumulation is directly performed in the ray generation shader, which reads the color of the pixel from the previous frame in the framebuffer and mixes this value with the current frame pixel color before writing it back to the color buffer.
 
-With rasterization, we cannot do this in the fragment shader since we already use alpha blending to blend the fragments of the current frame and we do not want to perform fetches from the framebuffer in the fragment shader for performance reasons. Therefore, we **use two color buffers**: one to render the current frame and one to store the accumulated frames, with the latter being displayed to the viewport. At each new frame with index > 0, the accumulation is performed in a simple new post-processing compute shader [post.comp.slang](../shaders/post.comp.slang) using the current frame index as for ray tracing. Frame numbering restarts on scene or camera changes and stops when the number of samples is reached (**"Temporal samples count"** in the **"Ray tracing and 3DGUT specifics"** tab of the renderer).
+With rasterization, we cannot do this in the fragment shader since we already use alpha blending to blend the fragments of the current frame and we do not want to perform fetches from the framebuffer in the fragment shader for performance reasons. Therefore, we **use two color buffers**: one to render the current frame and one to store the accumulated frames, with the latter being displayed to the viewport. At each new frame with index > 0, the accumulation is performed in a simple new post-processing compute shader [post.comp.slang]({{ source_base }}/shaders/post.comp.slang){:target="_blank"} using the current frame index as for ray tracing. Frame numbering restarts on scene or camera changes and stops when the number of samples is reached (**"Temporal samples count"** in the **"Ray tracing and 3DGUT specifics"** tab of the renderer).
 
 ### Current Limitations
 
@@ -114,19 +103,12 @@ This benchmark evaluates the Vulkan rendering time per frame and the frame rate 
 
 The following charts presents the results of this benchmark, when run on an `NVIDIA RTX 6000 Ada Generation`, drivers version 576.8.0, Intel(R) Core(TM) i9-14900K, 3200Mhz, 24 Cores, 32 Logical Processors. The rendering resolution was 1920x1080.
 
- ![Comparison of VK3DGUT rendering performances on 3DGUT dataset, framerate.](./histogram_timers_3dgut_fps.png)
+ ![Comparison of VK3DGUT rendering performances on 3DGUT dataset, framerate.](../images/histogram_timers_3dgut_fps.png)
 
- ![Comparison of VK3DGUT rendering performances on 3DGUT dataset, GPU time.](./histogram_timers_3dgut.png)
+ ![Comparison of VK3DGUT rendering performances on 3DGUT dataset, GPU time.](../images/histogram_timers_3dgut.png)
 
 ## Acknowledgment
 
 Thanks to Qi Wu (@wilsonCernWq) for generating the 3DGUT dataset for us. Thanks to Nicolas Moënne-Loccoz (@moennen) for the great discussions around 3DGUT.
 
-## Continue Reading
-
-1. [VK3DGHR: 3D Gaussians Hybrid Rendering Using Vulkan RTX and Rasterization](./hybrid_rendering_3d_gaussians.md)
-
-## References
-
-Please consult the consolidated [References](../README.md#references) section of the main `README.md`.
 

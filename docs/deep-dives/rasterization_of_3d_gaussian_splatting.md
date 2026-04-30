@@ -1,42 +1,13 @@
 
 # VK3DGSR: Efficient 3D Gaussian Splatting (3DGS) [Kerbl2023] Using Vulkan Rasterization
 
-![Image showing the user interface viewing the 6.13M SPlats bicycle 3DGS model from INRIA dataset rendered at 587FPS for a viewport size of 1465x766 pixels.](rasterization_rendering_ui.jpg)
+![Image showing the user interface viewing the 6.13M SPlats bicycle 3DGS model from INRIA dataset rendered at 587FPS for a viewport size of 1465x766 pixels.](../images/rasterization_rendering_ui.jpg)
 
 This rendering implementation of 3DGS is based on **rasterization** and demonstrates two approaches for rendering splats: one leveraging **mesh shaders** and another utilizing **vertex shaders**. 
 
 Since **Gaussian splats require back-to-front sorting for correct alpha compositing**, we present two alternative sorting methods. The first is a **GPU-based Radix Sort** implemented in a compute pipeline, while the second is a **CPU-based asynchronous sorting strategy** that uses the **multi-threaded sort function** from the C++ STL. 
 
 This project serves as a **reference for efficient 3D Gaussian rendering with Vulkan**, showcasing **modern shader techniques** and **optimized sorting strategies**.
-
-## Table of Contents
-
-1. [Overview](#overview)
-2. [Sorting Methods](#sorting-methods)
-   * [Synchronous Sorting on the GPU](#synchronous-sorting-on-the-gpu)
-   * [Asynchronous Sorting on the CPU](#asynchronous-sorting-on-the-cpu)
-3. [Data Flow Using GPU-Based Sorting](#data-flow-using-gpu-based-sorting)
-   * [Resetting the Indirect Parameters Buffer](#resetting-the-indirect-parameters-buffer)
-   * [Distances Computation and Culling](#distances-computation-and-culling)
-   * [Sorting via Radix Sort](#sorting-via-radix-sort)
-4. [Data Flow Using CPU-Based Sorting](#data-flow-using-cpu-based-sorting)
-5. [Rendering Pipelines](#rendering-pipelines)
-   * [Indirect Draw Calls](#indirect-draw-calls)
-   * [Direct Draw Calls](#direct-draw-calls)
-   * [Vertex Shader](#vertex-shader)
-     - [Vertex Shader Processing Steps](#vertex-shader-processing-steps)
-   * [Fragment Shader](#fragment-shader)
-   * [Mesh Shader](#mesh-shader)
-     - [Shader Setup](#shader-setup)
-     - [Workgroup Management](#workgroup-management)
-     - [Mesh Shader Output Setup](#mesh-shader-output-setup)
-     - [Vertex and Primitive Emission](#vertex-and-primitive-emission)
-     - [Notes on Implementation](#notes-on-implementation)
-6. [On Using a Jacobian When Rasterizing 3D Gaussian Splatting with a Perspective Camera](#on-using-a-jacobian-when-rasterizing-3d-gaussian-splatting-with-a-perspective-camera)
-7. [Performance Results](#performance-results)
-8. [Continue Reading](#continue-reading)
-9. [References](#references)
-
 
 ## Overview
 
@@ -53,23 +24,24 @@ The visualization workflow follows these main steps:
 ### Rendering Panel
 
 The Rendering Panel provides controls to fine-tune the rendering process. Users can adjust the following parameters:
-*	**V-Sync** – Toggles vertical synchronization on or off. Disabling V-Sync is recommended when benchmarking to obtain accurate performance measurements in the Profiler Panel.
-*	**Sorting Method** – Chooses between GPU-based radix sort or CPU-based asynchronous sorting.
-*	**Lazy CPU Sorting** – When the CPU Sorting Method is selected, enabling this option will trigger a new sorting pass only when the viewpoint changes. Otherwise, sorting will continuously restart as soon as the previous sorting process completes.
-*	**Pipeline** – Selects the rendering pipeline, either Mesh Shader or Vertex Shader.
-*	**Frustum Culling** – Defines where frustum culling is performed: in the distance compute shader, vertex shader, or mesh shader. Culling can also be disabled for performance comparisons.
+
+* **V-Sync** – Toggles vertical synchronization on or off. Disabling V-Sync is recommended when benchmarking to obtain accurate performance measurements in the Profiler Panel.
+* **Sorting Method** – Chooses between GPU-based radix sort or CPU-based asynchronous sorting.
+* **Lazy CPU Sorting** – When the CPU Sorting Method is selected, enabling this option will trigger a new sorting pass only when the viewpoint changes. Otherwise, sorting will continuously restart as soon as the previous sorting process completes.
+* **Pipeline** – Selects the rendering pipeline, either Mesh Shader or Vertex Shader.
+* **Frustum Culling** – Defines where frustum culling is performed: in the distance compute shader, vertex shader, or mesh shader. Culling can also be disabled for performance comparisons.
 *   **Frustum Dilation** – Adjusts the frustum culling bounds to account for the fact that visibility is tested only at the center of each splat, rather than its full elliptical shape. A positive value expands the frustum by the given percentage, reducing the risk of prematurely discarding splats near the frustum boundaries. More advanced culling methods are left for future work.
-*	**Splat Scale** – Adjusts the size of the splats for visualization purposes.
-*	**Spherical Harmonics Degree** – Sets the degree of Spherical Harmonics (SH) used for view-dependent effects:
-    *	0: Disables per splat view dependence of color. Uses SH of degree 0 only.
-    *	1 to 3: Enables SH of increasing degrees for improved view-dependent rendering.
-*	**Show SH Only** – Removes the base color from SH degree 0, applying only color deduced from higher-degree SH to a neutral gray. This helps visualize their contribution.
-*	**Disable Splatting** – Switches to point cloud mode, displaying only the splat centers. Other parameters still apply in this mode.
-*	**Disable Opacity Gaussian** – Disables the alpha component of the Gaussians, making their full range visible. This helps analyze splat distribution and scales, especially when combined with Splat Scale adjustments.
+* **Splat Scale** – Adjusts the size of the splats for visualization purposes.
+* **Spherical Harmonics Degree** – Sets the degree of Spherical Harmonics (SH) used for view-dependent effects:
+    * 0: Disables per splat view dependence of color. Uses SH of degree 0 only.
+    * 1 to 3: Enables SH of increasing degrees for improved view-dependent rendering.
+* **Show SH Only** – Removes the base color from SH degree 0, applying only color deduced from higher-degree SH to a neutral gray. This helps visualize their contribution.
+* **Disable Splatting** – Switches to point cloud mode, displaying only the splat centers. Other parameters still apply in this mode.
+* **Disable Opacity Gaussian** – Disables the alpha component of the Gaussians, making their full range visible. This helps analyze splat distribution and scales, especially when combined with Splat Scale adjustments.
 
 ## Sorting methods
 
-![image showing gaussian splatting sorting methods](sorting.png)
+![image showing gaussian splatting sorting methods](../images/sorting.png)
 
 ### Synchronous sorting on the GPU
 
@@ -97,9 +69,9 @@ This approach provides a viable fallback for low-end systems, albeit with some t
 
 ## Data flow using GPU based sorting
 
-![image showing gaussian splatting rasterization pipelines with GPU sorting](pipeline_gpu_sorting.png)
+![image showing gaussian splatting rasterization pipelines with GPU sorting](../images/pipeline_gpu_sorting.png)
 
-When GPU-based sorting is enabled, the `processSortingOnGPU` method (see [gaussian_splatting.cpp](../src/gaussian_splatting.cpp)) is invoked. This method adds the processings to the command buffer in three steps.
+When GPU-based sorting is enabled, the `processSortingOnGPU` method (see [gaussian_splatting.cpp]({{ source_base }}/src/gaussian_splatting.cpp){:target="_blank"}) is invoked. This method adds the processings to the command buffer in three steps.
 
 ### Resetting the Indirect Parameters Buffer
 
@@ -109,7 +81,8 @@ To ensure that the indirect parameters are fully available for the next stages, 
 
 ### Distances computation and culling
 
-When GPU-based sorting is enabled, the compute shader responsible for distance computation and culling (see [dist.comp.slang](../shaders/dist.comp.slang)) is executed first. This shader stage processes the splat positions buffer or texture as input and writes to three write-only data buffers:
+When GPU-based sorting is enabled, the compute shader responsible for distance computation and culling (see [dist.comp.slang]({{ source_base }}/shaders/dist.comp.slang){:target="_blank"}) is executed first. This shader stage processes the splat positions buffer or texture as input and writes to three write-only data buffers:
+
 * Distances Buffer – Stores unsigned integer-encoded distances from the center of projection.
 * Indices Buffer – Stores indices referencing sorted splats.
 * Indirect Parameters Buffer – Used for issuing indirect draw calls.
@@ -148,9 +121,9 @@ Finally, a last memory barrier is added to ensure the availability of the sorted
 
 ## Data Flow Using CPU-Based Sorting  
 
-![Image showing Gaussian Splatting rasterization pipelines with CPU sorting](pipeline_cpu_sorting.png)  
+![Image showing Gaussian Splatting rasterization pipelines with CPU sorting](../images/pipeline_cpu_sorting.png)  
 
-The **CPU-based sorting** is executed in a **separate thread**, with its implementation residing in the **`innerSort`** method (see [splat_sorter_async.cpp](../src/splat_sorter_async.cpp#L81)). The **rendering loop** controls both the **start of a new sort** (triggered when sorting is idle and the camera changes) and the **consumption of sorted indices**. This logic is implemented in the **`tryConsumeAndUploadCpuSortingResult`** method (see [gaussian_splatting.cpp](../src/gaussian_splatting.cpp#L206)).
+The **CPU-based sorting** is executed in a **separate thread**, with its implementation residing in the **`innerSort`** method (see [splat_sorter_async.cpp]({{ source_base }}/src/splat_sorter_async.cpp#L81){:target="_blank"}). The **rendering loop** controls both the **start of a new sort** (triggered when sorting is idle and the camera changes) and the **consumption of sorted indices**. This logic is implemented in the **`tryConsumeAndUploadCpuSortingResult`** method (see [gaussian_splatting.cpp]({{ source_base }}/src/gaussian_splatting.cpp#L206){:target="_blank"}).
 
 Within this method, executed by the main thread (rendering loop):
 
@@ -190,11 +163,12 @@ The `WORK_GROUP_SIZE` value will be discussed in the **Mesh Shader** section.
 
 ### Vertex Shader  
 
-The vertex shader is implemented in [threedgs_raster.vert.slang](../shaders/threedgs_raster.vert.slang). The code has been adapted to **Vulkan** from the **WebGL-based** implementation by [mkkellogg/GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D). Some mathematical formulations and comments have been directly retained from this source.
+The vertex shader is implemented in [threedgs_raster.vert.slang]({{ source_base }}/shaders/threedgs_raster.vert.slang){:target="_blank"}. The code has been adapted to **Vulkan** from the **WebGL-based** implementation by [mkkellogg/GaussianSplats3D](https://github.com/mkkellogg/GaussianSplats3D). Some mathematical formulations and comments have been directly retained from this source.
 
 The vertex shader operates on each of the **four vertices** of each quad. Since the input quad has **normalized 2D positions** in the range **[-1,1]**, the shader does not need to distinguish between individual vertices. Instead, the transformation—derived from the **splat position** and **covariance matrix**—determines the final scale and placement of the splat.  
 
 The **same color and opacity** (computed from **Spherical Harmonics (SH) coefficients** and the viewpoint position) are assigned to all four vertices of the quad. The shader outputs:  
+
 - The **final vertex position** in `gl_Position`.  
 - The **normalized vertex position** in `outFragPos` (the original normalized 2D position).  
 - The **splat color and opacity** for the given view direction in `outFragCol`.  
@@ -216,7 +190,7 @@ The **same color and opacity** (computed from **Spherical Harmonics (SH) coeffic
 
 ### Fragment Shader  
 
-The fragment shader is implemented in [**threedgs_raster.frag.slang**](../shaders/threedgs_raster.frag.slang).  
+The fragment shader is implemented in [**threedgs_raster.frag.slang**]({{ source_base }}/shaders/threedgs_raster.frag.slang){:target="_blank"}.  
 
 It is designed to be extremely **lightweight**, as most computations are already handled in the **vertex shader**. Since **Gaussian Splatting** is inherently **fragment-intensive**, minimizing the workload in this stage is crucial for performance.  
 
@@ -228,7 +202,7 @@ The fragment shader operates as follows:
 
 ### Mesh shader
 
-The mesh shader is implemented in [**threedgs_raster.mesh.slang**](../shaders/threedgs_raster.mesh.slang). Compared to the vertex shader approach, most processing (culling, color computation, projection) is performed per splat rather than per vertex, significantly improving efficiency. The key aspects of the mesh shader are outlined below.
+The mesh shader is implemented in [**threedgs_raster.mesh.slang**]({{ source_base }}/shaders/threedgs_raster.mesh.slang){:target="_blank"}. Compared to the vertex shader approach, most processing (culling, color computation, projection) is performed per splat rather than per vertex, significantly improving efficiency. The key aspects of the mesh shader are outlined below.
 
 #### Shader Setup
 
@@ -254,7 +228,7 @@ The mesh shader is implemented in [**threedgs_raster.mesh.slang**](../shaders/th
 
 * Each quad is defined in local space with:
 
-    `const vec2 positions[4] = {{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}};`
+    <!-- {% raw %} -->`const vec2 positions[4] = {{-1.0, -1.0}, {1.0, -1.0}, {1.0, 1.0}, {-1.0, 1.0}};`<!-- {% endraw %} -->
 
 * Outputs per-vertex attributes as early as possible (outFragPos).
 * Assigns triangle indices to form two triangles per quad:
@@ -301,29 +275,20 @@ The following charts presents the results of such a benchmark, when run on an `N
 
 Settings: Storage=Buffers, Pipeline=Mesh, SH Format=**variable**, Rendering SH degree=3, Culling at distance stage.
 
-![Image showing Pipeline Performance Comparison - SH storage formats in float 32, float 16 and uint 8](histogram_format_timers_sh3.png)
+![Image showing Pipeline Performance Comparison - SH storage formats in float 32, float 16 and uint 8](../images/histogram_format_timers_sh3.png)
 
-![Image showing Memory Consumption Comparison - SH storage formats in float 32, float 16 and uint 8](histogram_format_memory.png)
+![Image showing Memory Consumption Comparison - SH storage formats in float 32, float 16 and uint 8](../images/histogram_format_memory.png)
 
 Settings: Storage=Buffers, Pipeline=**variable**, SH Format=float32, **Rendering SH degree=3**, Culling at distance stage.
 
-![Image showing pipeline Performance Comparison - Mesh vs. Vertex](histogram_shader_timers_sh3.png)
+![Image showing pipeline Performance Comparison - Mesh vs. Vertex](../images/histogram_shader_timers_sh3.png)
 
 Settings: Storage=Buffers, Pipeline=**variable**, SH Format=float32, **Rendering SH degree=2**, Culling at distance stage.
 
-![Image showing pipeline Performance Comparison - Mesh vs. Vertex](histogram_shader_timers_sh2.png)
+![Image showing pipeline Performance Comparison - Mesh vs. Vertex](../images/histogram_shader_timers_sh2.png)
 
 Settings: Storage=Buffers, Pipeline=**variable**, SH Format=float32, **Rendering SH degree=1**, Culling at distance stage.
 
-![Image showing pipeline Performance Comparison - Mesh vs. Vertex](histogram_shader_timers_sh1.png)
+![Image showing pipeline Performance Comparison - Mesh vs. Vertex](../images/histogram_shader_timers_sh1.png)
 
-## Continue Reading
-
-1. [VK3DGRT: 3D Gaussian Ray Tracing (3DGRT) [Moënne-Loccoz2024] using Vulkan RTX](./ray_tracing_3d_gaussians.md)
-2. [VK3DGUT: 3D Gaussian Unscented Transform (3DGUT) [Wu2024] Using Vulkan Rasterization](./doc/rasterization_of_3dgut.md)
-3. [VK3DGHR: 3D Gaussians Hybrid Rendering Using Vulkan RTX and Rasterization](./hybrid_rendering_3d_gaussians.md)
-
-## References
-
-Please consult the consolidated [References](../README.md#references) section of the main `README.md`.
 

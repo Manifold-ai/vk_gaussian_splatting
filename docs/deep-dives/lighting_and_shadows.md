@@ -1,6 +1,6 @@
 # Lighting, Shading and Shadows
 
-![Hybrid 3DGS+3DGRT rendering with four light sources, soft and tinted shadows, and 3 reflection/refraction bounces — bottom-right insets show reconstructed depth and normals](./splat_set_lighting_teaser.png)
+![Hybrid 3DGS+3DGRT rendering with four light sources, soft and tinted shadows, and 3 reflection/refraction bounces — bottom-right insets show reconstructed depth and normals](../images/splat_set_lighting_teaser.png)
 
 In this page we describe and compare the implementation of lighting and shading for both rasterization and ray tracing pipelines. Shadows are covered in the ray tracing pipeline section. 
 
@@ -10,32 +10,9 @@ In any case, we assign a unique material to each Gaussian particle set (per mode
 
 The user can then tweak the material (**Assets > Splat Set > Material**) — for instance, reduce the emissive component and raise the diffuse component — so that lighting and shading of the model will include the contribution of additional synthetic light sources. The implementation supports point, spot, and directional lights.
 
-![Gaussian splat set lit by synthetic lights — emissive reduced and diffuse/specular enabled, with spot lights affecting the model](./splat_set_lighting_example.png)
+![Gaussian splat set lit by synthetic lights — emissive reduced and diffuse/specular enabled, with spot lights affecting the model](../images/splat_set_lighting_example.png)
 
 Computing lighting, shading, and shadows requires positional information and normals. These are described in the first two sections, before we present the lighting for the rasterization and ray tracing pipelines.
-
-## Table of Contents
-
-1. [Positional Information and Distance Picking](#1-positional-information-and-distance-picking)
-    1. [Distance Picking in Sorted Blending Mode](#11-distance-picking-in-sorted-blending-mode)
-    2. [Distance Picking in Stochastic Splat (Raster) and Stochastic Any Hit (Ray Tracing) Modes](#12-distance-picking-in-stochastic-splat-raster-and-stochastic-any-hit-ray-tracing-modes)
-    3. [Distance Picking in Stochastic Pass (Ray Tracing) Mode](#13-distance-picking-in-stochastic-pass-ray-tracing-mode)
-    4. [Hit Distance for a Single 3D Gaussian Particle](#14-hit-distance-for-a-single-3d-gaussian-particle)
-        1. [Ray Tracing Mode](#141-ray-tracing-mode)
-        2. [Rasterization Mode](#142-rasterization-mode)
-        3. [Comparison of Picked Surface Results](#143-comparison-of-picked-surface-results-depending-on-hit-distance-method)
-    5. [Front-to-Back Rasterization](#15-front-to-back-rasterization)
-        1. [Vulkan Blend Modes for BTF Rasterization — Baseline](#151-vulkan-blend-modes-for-back-to-front-btf-rasterization--baseline)
-        2. [Adaptation of Vulkan Blend Modes for FTB Rasterization](#152-adaptation-of-vulkan-blend-modes-for-front-to-back-ftb-rasterization)
-        3. [Three-Pass FTB Rendering for Mesh–Splat Compositing](#153-three-pass-ftb-rendering-for-meshsplat-compositing)
-2. [Normal Vector Integration and Picking](#2-normal-vector-integration-and-picking)
-    1. [Normal Integration in Sorted Blending Mode](#21-normal-integration-in-sorted-blending-mode)
-    2. [Normal Picking in Stochastic Splat (Raster) and Stochastic Any Hit (Ray Tracing) Mode](#22-normal-picking-in-stochastic-splat-raster-and-stochastic-any-hit-ray-tracing-mode)
-    3. [Normal Integration in Stochastic Pass (Ray Tracing) Mode](#23-normal-integration-in-stochastic-pass-ray-tracing-mode)
-    4. [Normal Vectors of a Single 3D Gaussian Particle](#24-normal-vectors-of-a-single-3d-gaussian-particle)
-3. [Lighting and Shading in the Rasterization Pipelines](#3-lighting-and-shading-in-the-rasterization-pipelines)
-4. [Lighting, Shadows and Shading in the Ray Tracing Pipeline](#4-lighting-shadows-and-shading-in-the-ray-tracing-pipeline)
-5. [Lighting, Shadows and Shading in the Hybrid Pipelines](#5-lighting-shadows-and-shading-in-the-hybrid-pipelines)
 
 ## 1. Positional Information and Distance Picking
 
@@ -43,7 +20,7 @@ In order to compute a **surface position** in global coordinates, we use the cam
 
 ### 1.1. Distance Picking in Sorted Blending Mode
 
-![Surface reconstruction from volumetric splats — depth picking in Sorted Blending mode, showing the iso-opacity surface or depth result used for lighting](./surface_reconstruction_example_depth_picking.png)
+![Surface reconstruction from volumetric splats — depth picking in Sorted Blending mode, showing the iso-opacity surface or depth result used for lighting](../images/surface_reconstruction_example_depth_picking.png)
 
 In Sorted Blending mode, we do not treat the particle set as a fully volumetric medium, where lighting — and especially shadows — would need to be computed for each particle and the results integrated. This would lead to very high computational costs in both rasterization and ray tracing pipelines. Instead, we consider that the particle set, even if volumetric, mostly describes surfaces. We thus deduce surface information from the volumetric information (i.e. from the multiple layers of particles), then associate the integrated radiance and normal with this surface to compute the lighting (including shadows).
 
@@ -51,7 +28,7 @@ In Sorted Blending mode, we do not treat the particle set as a fully volumetric 
 
 **Iso-opacity surface approach.** The idea is to find a surface where the integrated opacity is uniform. The integrated opacity is simply equal to one minus the integrated transmittance during the **front-to-back** traversal of the splats. The transmittance starts at 1.0 and decreases whenever a splat is hit. As an approximation, during the evaluation of the sorted hits, we pick the distance to the first particle whose evaluation causes the transmittance to drop below a given threshold. This value can be controlled by the **Depth Iso Threshold** parameter, available in both the rasterization panel and the ray tracing panel. These are two separate values, since the two rendering approaches may lead to different per-particle hit distances. 
 
-![Visualization of the any-hit profile along a ray — transmittance front-to-back and the Depth Iso Threshold used to pick the surface distance](./visualization_of_the_any_hit_profile.png)
+![Visualization of the any-hit profile along a ray — transmittance front-to-back and the Depth Iso Threshold used to pick the surface distance](../images/visualization_of_the_any_hit_profile.png)
 
 In practice, we set the `Depth Iso Threshold` parameter to a default integrated transmittance value of 0.7 (corresponding to an integrated opacity of 0.3), which leads to coherent results with most scenes. If the threshold is not reached, the pixel contribution is discarded. Note that this is only performed when a depth is required (lighting enabled, DLSS enabled, auto-focus, etc.). When none of these modes are activated, all pixels are preserved.
 
@@ -69,15 +46,15 @@ With the Stochastic Pass mode, the approach falls between the two previous modes
 
 ### 1.4. Hit distance for a Single 3D Gaussian Particle
 
-![Hit distance for a single 3D Gaussian particle — ray tracing (icosahedron front face or AABB max-density point) vs rasterization (billboard depth)](./particle_hit_distance.png)
+![Hit distance for a single 3D Gaussian particle — ray tracing (icosahedron front face or AABB max-density point) vs rasterization (billboard depth)](../images/particle_hit_distance.png)
 
 #### 1.4.1. Ray tracing mode
 
-In ray tracing mode, the distance, retrieved by the [any-hit shader](../shaders/threedgrt_raytrace.rahit.slang) in `payload.dist[i]` and used for depth picking, depends on the acceleration structure geometry mode and on the intersection computation method. It is the same distance used for sorting:
+In ray tracing mode, the distance, retrieved by the [any-hit shader]({{ source_base }}/shaders/threedgrt_raytrace.rahit.slang){:target="_blank"} in `payload.dist[i]` and used for depth picking, depends on the acceleration structure geometry mode and on the intersection computation method. It is the same distance used for sorting:
 
 **Icosahedron mesh mode.** Each particle is represented by an icosahedron (20 triangles). The hardware ray–triangle intersection provides `RayTCurrent()` as the distance to the **front face of the icosahedron** proxy. This is an actual geometric surface intersection. The icosahedron surface approximates the ellipsoid boundary at a radius scaled by the golden ratio in canonical space, producing a distance that sits on the "shell" of the particle.
 
-**AABB parametric mode.** Each particle is represented by an axis-aligned bounding box. A custom intersection shader ([threedgrt_raytrace.rint.slang](../shaders/threedgrt_raytrace.rint.slang)) computes `hitT` via `particleDensityHitInstance()` as the distance to the **point of maximum density** along the ray — the closest point on the ray to the Gaussian center in canonical space:
+**AABB parametric mode.** Each particle is represented by an axis-aligned bounding box. A custom intersection shader ([threedgrt_raytrace.rint.slang]({{ source_base }}/shaders/threedgrt_raytrace.rint.slang){:target="_blank"}) computes `hitT` via `particleDensityHitInstance()` as the distance to the **point of maximum density** along the ray — the closest point on the ray to the Gaussian center in canonical space:
 
 $$t_{\text{hit}} = \frac{-\mathbf{o}_c \cdot \mathbf{d}_c}{\mathbf{d}_c \cdot \mathbf{d}_c}$$
 
@@ -89,13 +66,13 @@ In rasterization mode, the distance used for a single particle hit is the distan
 
 #### 1.4.3. Comparison of Picked Surface Results Depending on Hit Distance Method
 
-![Comparison of picked surface results for different hit distance methods — icosahedron, AABB parametric, and rasterization billboard](./surface_reconstruction_comparison.png)
+![Comparison of picked surface results for different hit distance methods — icosahedron, AABB parametric, and rasterization billboard](../images/surface_reconstruction_comparison.png)
 
 ### 1.5. Front-to-Back Rasterization
 
 The iso-opacity surface approach requires the integrated transmittance/opacity to pick a surface depth. Since transmittance is updated front-to-back starting from a value of 1.0 (as in ray tracing mode), we adapt the rasterization — originally back-to-front — to a front-to-back mode. This mode is only activated when a picked surface is needed (lighting, DLSS, auto-focus, etc.). In all other cases, the default back-to-front rasterization is used, as it is faster. When front-to-back is activated, the global sorting order is simply inverted.
 
-The front-to-back pass then uses interlocked (atomic) operations and an intermediate image buffer to store the running transmittance and the picked depth at the fragment stage (see [threedgs_raster.frag.slang](../shaders/threedgs_raster.frag.slang) and [threedgut_raster.frag.slang](../shaders/threedgut_raster.frag.slang)). An option to disable the interlocked mode is available for faster evaluation at the cost of minor artifacts (Renderer Properties > Rasterization Specifics > FTB). The front-to-back fragment shader excerpt is presented below:
+The front-to-back pass then uses interlocked (atomic) operations and an intermediate image buffer to store the running transmittance and the picked depth at the fragment stage (see [threedgs_raster.frag.slang]({{ source_base }}/shaders/threedgs_raster.frag.slang){:target="_blank"} and [threedgut_raster.frag.slang]({{ source_base }}/shaders/threedgut_raster.frag.slang){:target="_blank"}). An option to disable the interlocked mode is available for faster evaluation at the cost of minor artifacts (Renderer Properties > Rasterization Specifics > FTB). The front-to-back fragment shader excerpt is presented below:
 
 ``` c
 ...
@@ -158,13 +135,13 @@ This gives: $C_{\text{dst}} = C_{\text{src}}^{\text{premul}} \cdot (1 - \alpha_{
 
 The normal buffer uses the same blend operators as the color buffer in both modes. The depth buffer, however, is handled differently: in FTB mode it is accessed as a **storage image** with manual interlocked reads/writes (not as a color attachment), while in BTF mode it is a standard color attachment with hardware blending.
 
-The blend states are configured in the `initPipelines()` method of [gaussian_splatting.cpp](../src/gaussian_splatting.cpp).
+The blend states are configured in the `initPipelines()` method of [gaussian_splatting.cpp]({{ source_base }}/src/gaussian_splatting.cpp){:target="_blank"}.
 
 #### 1.5.3. Three-Pass FTB Rendering for Mesh–Splat Compositing
 
 When a scene contains both meshes and Gaussian splats, front-to-back rasterization requires a three-pass approach to correctly composite them. The issue is that in FTB mode, splats are rendered front-to-back and accumulated into the framebuffer — but meshes are opaque and must interact correctly with the splat transmittance. A single pass cannot handle this because the mesh contribution depends on the total accumulated splat transmittance at each pixel, which is not yet known when the mesh would be drawn.
 
-![Gaussian Splatting Front to Back Rasterization and Compositing](./gaussian_splatting_front_to_back_raster_and_compositing.png)
+![Gaussian Splatting Front to Back Rasterization and Compositing](../images/gaussian_splatting_front_to_back_raster_and_compositing.png)
 
 The three passes are:
 
@@ -172,7 +149,7 @@ The three passes are:
 2. **Splat FTB pass** — Splats are rendered front-to-back with the "under" blend operator. The depth test against the mesh depth buffer ensures that only splats in front of meshes contribute. Color and transmittance are accumulated into the framebuffer, and depth picking is performed via the storage image.
 3. **Mesh color pass** — Meshes are rendered again, this time with color output. The blend state uses the accumulated splat alpha (stored in the destination alpha channel) as transmittance: $C_{\text{final}} = C_{\text{mesh}} \cdot (1 - \alpha_{\text{dst}}) + C_{\text{splats}}$. This correctly composites the mesh behind all the splats that were accumulated in pass 2.
 
-After these three passes, a **depth consolidation pass** writes the picked splat depth (from the storage image) into the hardware depth buffer. A screen triangle is used to perform this operation (see [depth_consolidate.frag.slang](../shaders/depth_consolidate.frag.slang)). This enables visual helpers and other post-effects to access the complete scene depth including both meshes and splats. Note that in hybrid mode, the [ray generation shader](../shaders/threedgrt_raytrace.rgen.slang) reads the picked depth directly from the raster depth storage image via `initRtxStateFromRasterPass()` — it does not depend on the consolidation pass. The consolidation pass still runs in hybrid mode but serves the same purpose as in pure rasterization: providing a complete hardware depth buffer for visual helpers and other post-effects.
+After these three passes, a **depth consolidation pass** writes the picked splat depth (from the storage image) into the hardware depth buffer. A screen triangle is used to perform this operation (see [depth_consolidate.frag.slang]({{ source_base }}/shaders/depth_consolidate.frag.slang){:target="_blank"}). This enables visual helpers and other post-effects to access the complete scene depth including both meshes and splats. Note that in hybrid mode, the [ray generation shader]({{ source_base }}/shaders/threedgrt_raytrace.rgen.slang){:target="_blank"} reads the picked depth directly from the raster depth storage image via `initRtxStateFromRasterPass()` — it does not depend on the consolidation pass. The consolidation pass still runs in hybrid mode but serves the same purpose as in pure rasterization: providing a complete hardware depth buffer for visual helpers and other post-effects.
 
 ## 2. Normal Vector Integration and Picking
 
@@ -180,7 +157,7 @@ Depending on the rendering strategy used to integrate radiance — stochastic tr
 
 ### 2.1. Normal Integration in Sorted Blending Mode
 
-![Normal integration in Sorted Blending mode — accumulated normals weighted by alpha and transmittance, used for lighting](./normal_integration_example.png)
+![Normal integration in Sorted Blending mode — accumulated normals weighted by alpha and transmittance, used for lighting](../images/normal_integration_example.png)
 
 With the **Sorted Blending** strategy, the normal is accumulated in the same way as radiance, using the normal at the particle–ray intersection weighted by the particle's alpha response at the hit point. In rasterization, this is performed through alpha blending of the normal values, just as for colors. In ray tracing, the normal is integrated for each hit following the same alpha-blending equation as for radiance:
 
@@ -199,6 +176,7 @@ With the **Stochastic Splat** strategy in rasterization mode, only one sample is
 With the **Stochastic Pass** strategy, the approach is a mix between full integration and Monte Carlo picking: normals are integrated along with colors within each pass, and the resulting normal vector for the pass is used as the final normal. It is thus representative of the integrated radiance for that pass.
 
 In any stochastic approach, the normal is never temporally accumulated. Instead, the picked normal is used to compute the shading of the selected sample, whose final color is then temporally accumulated. **Sorted Blending**, **Stochastic Splat and Any Hit**, and **Stochastic Pass** lead to variations in the final lit images:
+
 - **Sorted Blending** produces more of a surface-like hard shading and shadowing, 
 - **Stochastic Splat and Any Hit** yields more of a volumetric soft shading and shadowing. 
 - **Stochastic Pass** sits in between and tends toward one or the other depending on the number of hits per pass.
@@ -206,22 +184,23 @@ In any stochastic approach, the normal is never temporally accumulated. Instead,
 ### 2.4. Normal Vectors of a Single 3D Gaussian Particle
 
 We present two methods to compute particle normals (see the "Normal vectors" option in the renderer control panel):
+
 - **Max density plane** (default method)
 - **Kernel ellipsoid**
 
 In both cases, we approximate the normal at the ray–particle intersection. We never use the maximum density response point for the computation of normals, since this leads to a non-continuous surface. Instead, we either compute the normal at the surface of the ellipsoid described by the minimal kernel response (**Kernel ellipsoid** mode) or use the normal of the plane that linearly approximates the maximum density surface (**Max density plane** mode).
 
-The **Kernel ellipsoid** method is not developed in detail here, since it is slower to compute and does not lead to better visual quality when shading. This method is implemented in the function `computeEllipsoidNormal` and kept for reference in [threedgrt_h.slang](../shaders/threedgrt_h.slang).
+The **Kernel ellipsoid** method is not developed in detail here, since it is slower to compute and does not lead to better visual quality when shading. This method is implemented in the function `computeEllipsoidNormal` and kept for reference in [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}.
 
 The **Max density plane** method computes the plane that linearly approximates the maximum density surface [Kheradmand2025], then uses its normal $\mathbf{n}$. Let $\boldsymbol{\mu}$ be the mean of the Gaussian particle and $\mathbf{o}$ be the origin of the ray associated with a pixel. For any point $\mathbf{x}$ on the plane, the plane is defined by:
 
 $$\mathbf{n}^\top (\mathbf{x} - \boldsymbol{\mu}) = 0, \quad \text{where} \quad \mathbf{n} = \Sigma^{-1}(\boldsymbol{\mu} - \mathbf{o})$$
 
-The **Max density plane** method is implemented in the function `computeEllipsoidNormalMaxDensityPlane` defined in [threedgrt_h.slang](../shaders/threedgrt_h.slang).
+The **Max density plane** method is implemented in the function `computeEllipsoidNormalMaxDensityPlane` defined in [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}.
 
 ## 3. Lighting and Shading in the Rasterization Pipelines
 
-![Gaussian Splatting Front to Back Rasterization and Lighting pipeline](./gaussian_splatting_front_to_back_rasterization_and_shading.png)
+![Gaussian Splatting Front to Back Rasterization and Lighting pipeline](../images/gaussian_splatting_front_to_back_rasterization_and_shading.png)
 
 In the rasterization pipelines, lighting does not include indirect illumination or shadows. Shading and lighting are performed in a **deferred shading** pass. The stages of the rasterization lighting pipeline are:
 
@@ -239,31 +218,28 @@ In the rasterization pipelines, lighting does not include indirect illumination 
 
 5. **Depth consolidation** — A fullscreen triangle pass reads the picked splat depth from the storage image and writes it into the hardware depth buffer via `SV_Depth`. Pixels with no valid picked depth are discarded, preserving the existing mesh depth. This provides a complete scene depth buffer for visual helpers and post-effects.
 
-6. **Splat ISO surface deferred shading** — A compute shader ([deferred_shading.comp.slang](../shaders/deferred_shading.comp.slang)) reads the color, normal, picked depth, and splat ID buffers. For each splat pixel, it reconstructs the world position from the picked depth, looks up the splat set material via the splat ID, and applies lighting from all scene lights (or a camera headlight if no lights are defined). Mesh pixels (no valid splat ID) are passed through unchanged. No shadows are computed in this path.
+6. **Splat ISO surface deferred shading** — A compute shader ([deferred_shading.comp.slang]({{ source_base }}/shaders/deferred_shading.comp.slang){:target="_blank"}) reads the color, normal, picked depth, and splat ID buffers. For each splat pixel, it reconstructs the world position from the picked depth, looks up the splat set material via the splat ID, and applies lighting from all scene lights (or a camera headlight if no lights are defined). Mesh pixels (no valid splat ID) are passed through unchanged. No shadows are computed in this path.
 
 ## 4. Lighting, Shadows and Shading in the Ray Tracing Pipeline
 
-![Ray tracing 3D Gaussians shadow rays using the any-hit shader — example run for one pixel with payload size K=4, showing multi-pass primary ray evaluation and single-pass shadow ray with early transmittance termination](./threed_gaussian_raytracing_shadows.png)
+![Ray tracing 3D Gaussians shadow rays using the any-hit shader — example run for one pixel with payload size K=4, showing multi-pass primary ray evaluation and single-pass shadow ray with early transmittance termination](../images/threed_gaussian_raytracing_shadows.png)
 
 Shadow rays are traced after the ray evaluation of the bounce that performs color, normal vector integration and iso-surface picking. For each light, a single pass of any-hit is used (one call to `traceRayEXT`). A `particle shadow offset` is applied along the light direction to avoid self-shadowing artifacts, and tracing is terminated early when the accumulated shadow transmittance drops below `Particle shadow threshold`. 
 
-![Ray tracing self-shadowing control through the shadow offset parameter — shadows disabled, hard shadows with offset 0.0 and 0.1, and soft shadows with offset 0.2](./shadows_off_hard_soft_offset.png)
+![Ray tracing self-shadowing control through the shadow offset parameter — shadows disabled, hard shadows with offset 0.0 and 0.1, and soft shadows with offset 0.2](../images/shadows_off_hard_soft_offset.png)
 
 Using the any-hit shader with multiple sorted hits — rather than accepting only the first encountered hit — permits capturing accurate silhouettes of objects made of splats. A single unsorted hit would lead to strongly dilated silhouettes and would capture floaters, leading to inaccurate shadows.
 
 The `Particle shadow threshold` (`shadowTransmittanceThreshold`) controls how many hits are integrated before early termination. A high threshold (e.g. 0.99) terminates early and produces hard, opaque shadows. A lower threshold allows more particles to contribute, producing softer shadow edges at the cost of potentially unwanted semi-transparent inaccurate shadows when the payload cannot capture all occluding particles.
 
-![Ray tracing shadow control through the shadow transmittance threshold — top: hard shadows, bottom: soft shadows with light radius 0.09](./threed_gaussian_raytracing_shadows_transmittance_threshold_hard_and_soft_shadows.png)
+![Ray tracing shadow control through the shadow transmittance threshold — top: hard shadows, bottom: soft shadows with light radius 0.09](../images/threed_gaussian_raytracing_shadows_transmittance_threshold_hard_and_soft_shadows.png)
 
 Integrating multiple samples (up to the payload size) on shadow rays also enables colored transmittance at shadow edges. This stained-glass tint effect is controlled by the `Colored shadow strength` parameter, combined with a `Particle shadow threshold` lower than 0.99.
 
-![Ray tracing colored shadow control through the Colored Shadow Strength and Particle Shadow Threshold parameters — soft shadows with light radius 0.09](./threed_gaussian_raytracing_shadows_color_hard_and_soft_shadows.png)
+![Ray tracing colored shadow control through the Colored Shadow Strength and Particle Shadow Threshold parameters — soft shadows with light radius 0.09](../images/threed_gaussian_raytracing_shadows_color_hard_and_soft_shadows.png)
 
 ## 5. Lighting, Shadows and Shading in the Hybrid Pipelines
 
 In hybrid mode, the rasterization deferred shading pass is disabled. Instead, the ray tracing pipeline ingests the pixel's integrated radiance, normal, and picked depth from the raster pass output buffers, and uses those values in place of first-bounce ray tracing. The rest of the pipeline is identical to pure ray tracing. At the end of each bounce, shading — including lighting and shadows — is computed for both the mesh and splat set results, then composited and integrated into the final pixel color.
 
-## References
-
-Please consult the consolidated [References](../README.md#references) section of the main `README.md`.
 
