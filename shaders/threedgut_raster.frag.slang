@@ -23,7 +23,7 @@
 
 #include "shaderio.h"
 #include "cameras.h.slang"
-#include "threedgrt.h.slang"
+#include "threedgut.h.slang"
 
 // clang-format off
 [[vk::binding(BINDING_FRAME_INFO_UBO, 0)]] ConstantBuffer<FrameInfo> frameInfo;
@@ -73,7 +73,7 @@ struct FragmentOutput
 [shader("fragment")]
 FragmentOutput main(FragmentInput input)
 {
-  FragmentOutput output;
+  FragmentOutput output = {};
 
   // use this to visualize full splat rectangular extent.
 #if 0
@@ -128,12 +128,12 @@ FragmentOutput main(FragmentInput input)
 
 #if NEED_SURFACE_INFO
   // Use the version that computes normals for surface generation
-  acceptedHit = particleProcessHitGutWithNormal(frameInfo, splatSetModelRayOrigin, splatSetModelRayDirection, int(splatIndex),
+  acceptedHit = threedgutProcessHitWithNormal(frameInfo, splatSetModelRayOrigin, splatSetModelRayDirection, int(splatIndex),
                                                 input.splatCol, input.splatPosition, input.splatScale, splatInvRotation,
                                                 splatSetDesc.transform, opacity, normalWorld);
 #else
   // Use resolved local splatIndex for hit processing
-  acceptedHit = particleProcessHitGut(frameInfo, splatSetModelRayOrigin, splatSetModelRayDirection, int(splatIndex),
+  acceptedHit = threedgutProcessHit(frameInfo, splatSetModelRayOrigin, splatSetModelRayDirection, int(splatIndex),
                                       input.splatCol, input.splatPosition, input.splatScale, splatInvRotation, opacity);
 #endif
 

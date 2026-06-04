@@ -141,29 +141,37 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
   // stores the global splat ID (used by raster shaders to resolve descriptor + local index)
   // Explicit 64-bit byte offset to avoid 32-bit overflow when instanceIndex * sizeof(uint32_t) >= 4 GB (~1G visible splats)
   {
-    uint64_t  byteOffset = uint64_t(instanceIndex) * uint64_t(sizeof(uint32_t));
-    uint32_t* indexPtr    = (uint32_t*)(uint64_t(assets.splatSortingIndicesAddress) + byteOffset);
-    *indexPtr             = globalSplatID;
+    uint64_t byteOffset = uint64_t(instanceIndex) * uint64_t(sizeof(uint32_t));
+    *(uint32_t*)(assets.splatSortingIndicesAddress + byteOffset) = globalSplatID;
   }
 
   // set the workgroup count for the mesh shading pipeline
   if (instanceIndex % RASTER_MESH_WORKGROUP_SIZE == 0)
   {
-      InterlockedAdd(indirectBuffer[0].groupCountX, 1);
+      // The mesh shader is dispatched as a 2D grid so large scenes stay under the per-dimension
+      // limit maxMeshWorkGroupCount[0] (= MESH_SHADER_MAX_GROUPS_X). Each visible chunk of
+      // RASTER_MESH_WORKGROUP_SIZE splats maps to one workgroup at grid position
+      // (chunk % MESH_SHADER_MAX_GROUPS_X, chunk / MESH_SHADER_MAX_GROUPS_X); InterlockedMax grows
+      // the grid extents to cover the highest chunk index, yielding
+      // groupCountX = min(totalChunks, MESH_SHADER_MAX_GROUPS_X) and
+      // groupCountY = ceil(totalChunks / MESH_SHADER_MAX_GROUPS_X) regardless of order. When all
+      // chunks fit in a single row groupCountY stays 1, i.e. identical to a 1D dispatch.
+      const uint chunk = instanceIndex / RASTER_MESH_WORKGROUP_SIZE;
+      InterlockedMax(indirectBuffer[0].groupCountX, (chunk % MESH_SHADER_MAX_GROUPS_X) + 1);
+      InterlockedMax(indirectBuffer[0].groupCountY, (chunk / MESH_SHADER_MAX_GROUPS_X) + 1);
   }
 
 #if !STOCHASTIC_SPLAT
   // stores the distance
   // Explicit 64-bit byte offset to avoid 32-bit overflow when instanceIndex * sizeof(uint32_t) >= 4 GB (~1G visible splats)
   {
-    uint64_t  byteOffset = uint64_t(instanceIndex) * uint64_t(sizeof(uint32_t));
-    uint32_t* distPtr     = (uint32_t*)(uint64_t(assets.splatSortingDistancesAddress) + byteOffset);
+    uint64_t byteOffset = uint64_t(instanceIndex) * uint64_t(sizeof(uint32_t));
     // For back-to-front (default): negate depth so ascending radix sort yields farthest-first
     // For front-to-back: use positive depth so ascending radix sort yields nearest-first
 #if FRONT_TO_BACK
-    *distPtr = encodeMinMaxFp32(depth);
+    *(uint32_t*)(assets.splatSortingDistancesAddress + byteOffset) = encodeMinMaxFp32(depth);
 #else
-    *distPtr = encodeMinMaxFp32(-depth);
+    *(uint32_t*)(assets.splatSortingDistancesAddress + byteOffset) = encodeMinMaxFp32(-depth);
 #endif
   }
 #endif

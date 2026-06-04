@@ -7,3 +7,6 @@ _benchmark*/
 _downloaded_resources/
 generated/
 site/
+
+# Python
+__pycache__/

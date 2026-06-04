@@ -1,0 +1,344 @@
+{
+    "camera": {
+        "aperture": 0.0010000000474974513,
+        "clip": [
+            2.0,
+            20000.0
+        ],
+        "ctr": [
+            -716.4083862304688,
+            -285.26123046875,
+            44.09468078613281
+        ],
+        "dofMode": 0,
+        "eye": [
+            -1175.09619140625,
+            -86.51293182373047,
+            456.80322265625
+        ],
+        "focusDist": 1.2999999523162842,
+        "fov": 60.0,
+        "model": 0,
+        "up": [
+            0.0,
+            1.0,
+            0.0
+        ]
+    },
+    "cameras": [
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                2.0,
+                20000.0
+            ],
+            "ctr": [
+                -974.7291259765625,
+                -207.53228759765625,
+                -24.791057586669922
+            ],
+            "dofMode": 0,
+            "eye": [
+                -725.2537231445313,
+                -50.07836151123047,
+                350.33453369140625
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                2.0,
+                20000.0
+            ],
+            "ctr": [
+                176.36468505859375,
+                -220.7890625,
+                -83.03726959228516
+            ],
+            "dofMode": 0,
+            "eye": [
+                920.4833374023438,
+                -78.35387420654297,
+                -22.103435516357422
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                2.0,
+                20000.0
+            ],
+            "ctr": [
+                -709.25830078125,
+                -268.5101318359375,
+                43.97439956665039
+            ],
+            "dofMode": 0,
+            "eye": [
+                -1168.6680908203125,
+                -72.80249786376953,
+                457.3325500488281
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        }
+    ],
+    "environment": {
+        "enabled": true,
+        "ibl": {
+            "file": "",
+            "intensity": 1.0,
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ]
+        },
+        "mode": 1,
+        "resolution": [
+            2048,
+            1024
+        ],
+        "skyAndSun": {
+            "groundColor": [
+                0.4000000059604645,
+                0.4000000059604645,
+                0.4000000059604645
+            ],
+            "haze": 0.10000000149011612,
+            "horizonBlur": 0.30000001192092896,
+            "horizonHeight": -0.5339999794960022,
+            "nightColor": [
+                0.0,
+                0.0,
+                0.009999999776482582
+            ],
+            "redblueshift": 0.10000000149011612,
+            "saturation": 1.0,
+            "sunDirection": [
+                -0.5032636523246765,
+                0.12053705006837845,
+                0.8556848168373108
+            ],
+            "sunDiskIntensity": 1.3079999685287476,
+            "sunDiskScale": 0.7889999747276306,
+            "sunGlowIntensity": 2.447000026702881
+        }
+    },
+    "lights": {
+        "assets": [],
+        "instances": [],
+        "nextNamingNumber": 0
+    },
+    "meshAssets": [],
+    "meshInstances": {
+        "items": [],
+        "nextNamingNumber": 0
+    },
+    "renderer": {
+        "alphaClamp": 0.9900000095367432,
+        "alphaCullThreshold": 0.003921568859368563,
+        "billboardFrustumCulling": true,
+        "colorFormat": 109,
+        "covarianceDilation": 0.30000001192092896,
+        "cpuLazySort": true,
+        "depthIsoThreshold": 0.699999988079071,
+        "depthIsoThresholdRTX": 0.699999988079071,
+        "distShaderWorkgroupSize": 256,
+        "dlssEnabled": false,
+        "dlssMinRadianceThreshold": 0.0,
+        "dlssSizeMode": 1,
+        "extentProjection": 1,
+        "fireflyClampThreshold": 13.0,
+        "fragmentBarycentric": false,
+        "frustumCulling": 1,
+        "ftbSyncMode": 0,
+        "kernelAdaptiveClamping": true,
+        "kernelDegree": 2,
+        "kernelMinResponse": 0.011300000362098217,
+        "lightingEnabled": true,
+        "maxPasses": 200,
+        "maxShDegree": 3,
+        "meshShaderWorkgroupSize": 32,
+        "minTransmittance": 0.009999999776482582,
+        "msAntialiasing": false,
+        "normalMethod": 0,
+        "opacityGaussianDisabled": false,
+        "particleDepth": 0,
+        "particleEmissiveAoEnabled": false,
+        "particleEmissiveAoRadius": 0.05000000074505806,
+        "particleEmissiveAoStrength": 1.0,
+        "particleSamplesPerPass": 18,
+        "particleShadowColorStrength": 0.0,
+        "particleShadowOffset": 0.20000000298023224,
+        "particleShadowTransmittanceThreshold": 0.800000011920929,
+        "pipeline": 2,
+        "pointCloudModeEnabled": false,
+        "quantizeMeshPayload": true,
+        "quantizeNormals": true,
+        "rtxMaxBounces": 0,
+        "rtxSecondaryRayOffset": 0.0010000000474974513,
+        "rtxTraceStrategy": 2,
+        "shadowsMode": 1,
+        "showShOnly": false,
+        "sizeCulling": 1,
+        "sizeCullingMinPixels": 1.0,
+        "sortingMethod": 3,
+        "splatScale": 1.0,
+        "splatSetCompositeTransmittance": 0.10000000149011612,
+        "temporalSamplesCount": 2000,
+        "temporalSampling": true,
+        "temporalSamplingMode": 0,
+        "thinParticleThreshold": 9.999999974752427e-07,
+        "visualize": 0,
+        "vsync": false,
+        "wireframe": false
+    },
+    "settings": {
+        "grid": {
+            "show": false
+        },
+        "lightProxies": {
+            "show": false
+        },
+        "navigation": {
+            "autoPlay": false,
+            "mode": 0,
+            "speed": 3.0,
+            "transition": 10.0
+        },
+        "summaryOverlay": {
+            "show": false
+        },
+        "transformHelpers": {
+            "show": false,
+            "snapEnabled": false,
+            "snapRotate": 15.0,
+            "snapScale": 0.10000000149011612,
+            "snapTranslate": 0.25
+        }
+    },
+    "splatSets": [
+        {
+            "id": 0,
+            "path": "data\\teleportour\\20K-Photo-103Mspats-4x2KM-Andrii_Shramko_Poland-JG.ply",
+            "rgbaFormat": 2,
+            "shFormat": 2,
+            "storage": 0
+        }
+    ],
+    "splats": [
+        {
+            "material": {
+                "baseColor": [
+                    1.0,
+                    0.9998999834060669,
+                    0.9998999834060669
+                ],
+                "clearcoatFactor": 0.0,
+                "clearcoatRoughness": 0.0,
+                "emissive": [
+                    9.999999747378752e-05,
+                    9.998999303206801e-05,
+                    9.998999303206801e-05
+                ],
+                "emissiveStrength": 1.0,
+                "ior": 1.0,
+                "maxBounces": 0,
+                "metallic": 0.0,
+                "opacity": 1.0,
+                "roughness": 1.0,
+                "specularColorFactor": [
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                "specularFactor": 0.0,
+                "transmission": 0.0
+            },
+            "name": "Splat set 0 - rii_Shramko_Poland-JG.ply",
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation": [
+                0.0,
+                -0.0,
+                0.0
+            ],
+            "scale": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "show": true,
+            "splatSetId": 0
+        }
+    ],
+    "splatsGlobals": {
+        "compressBlas": true,
+        "rgbaFormat": 2,
+        "shFormat": 2,
+        "useAABBs": false,
+        "useSpheres": false,
+        "useTlasInstances": true
+    },
+    "tonemapping": {
+        "autoExposure": 1,
+        "autoExposureSpeed": 5.0,
+        "averageMode": 1,
+        "brightness": 1.0,
+        "centerMeteringSize": 0.5,
+        "contrast": 1.0,
+        "coolColor": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "dither": 1,
+        "enableCenterMetering": 0,
+        "evMaxValue": 10.0,
+        "evMinValue": -5.0,
+        "exposure": 1.0,
+        "highlightBias": 0.0,
+        "isActive": 1,
+        "method": 2,
+        "midtoneBias": 0.0,
+        "saturation": 1.0,
+        "shadowBias": 0.0,
+        "splitBalance": 0.0,
+        "temperature": 6506.111328125,
+        "tint": 0.0032589531037956476,
+        "vibrance": 0.0,
+        "vignette": 0.0,
+        "warmColor": [
+            1.0,
+            1.0,
+            1.0
+        ]
+    },
+    "version": 7
+}

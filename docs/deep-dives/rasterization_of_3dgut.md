@@ -13,17 +13,17 @@ We implement VK3DGUT on the same infrastructure as the "Raster mesh shader 3DGS"
 
 ## Implementation Details
 
-We have added a new renderer pipeline named **"Raster mesh shader 3DGUT"** in the Renderer parameters. Although we did not create a vertex shader version, it would be straightforward to do so by starting from the VK3DGS version and making the necessary updates, similar to what we did for the mesh shader variant. The new pipeline is built using two new shader files: [threedgut_raster.mesh.slang]({{ source_base }}/shaders/threedgut_raster.mesh.slang){:target="_blank"} and [threedgut_raster.frag.slang]({{ source_base }}/shaders/threedgut_raster.frag.slang){:target="_blank"}. The projections functions functions are found in [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"} and other slang files prefixed by "threedgut".
+We have added a new renderer pipeline named **"Raster mesh shader 3DGUT"** in the Renderer parameters. Although we did not create a vertex shader version, it would be straightforward to do so by starting from the VK3DGS version and making the necessary updates, similar to what we did for the mesh shader variant. The new pipeline is built using two new shader files: [threedgut_raster.mesh.slang]({{ source_base }}/shaders/threedgut_raster.mesh.slang){:target="_blank"} and [threedgut_raster.frag.slang]({{ source_base }}/shaders/threedgut_raster.frag.slang){:target="_blank"}. The projection functions are found in [threedgut_projector.h.slang]({{ source_base }}/shaders/threedgut_projector.h.slang){:target="_blank"} and other slang files prefixed by "threedgut".
 
 ### Mesh Shader
 
 The mesh shader [threedgut_raster.mesh.slang]({{ source_base }}/shaders/threedgut_raster.mesh.slang){:target="_blank"} is based on [threedgs_raster.mesh.slang]({{ source_base }}/shaders/threedgs_raster.mesh.slang){:target="_blank"}. It replaces the EWA projection with the UT one. The projection is computed in two steps:
 
-1. We compute the covariance using the function `threedgutParticleProjection` (defined in the file [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"}).
+1. We compute the covariance using the function `threedgutParticleProjection` (defined in the file [threedgut_projector.h.slang]({{ source_base }}/shaders/threedgut_projector.h.slang){:target="_blank"}).
 
 2. We compute the rectangular 2D bounding box (the projection extent) to emit a screen-aligned quad with the proper extent:
 
-   a. If **"Projection Method > Conic"** is selected, use the function `threedgutProjectedExtentConicOpacity` (also defined in the file [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"}).
+   a. If **"Projection Method > Conic"** is selected, use the function `threedgutProjectedExtentConicOpacity` (also defined in the file [threedgut_projector.h.slang]({{ source_base }}/shaders/threedgut_projector.h.slang){:target="_blank"}).
 
    b. If **"Projection Method > Eigen"** is selected, use the function `threedgsProjectedExtentBasis` (defined in the file [threedgs.h.slang]({{ source_base }}/shaders/threedgs.h.slang){:target="_blank"}).
 
@@ -52,7 +52,7 @@ We first compute the primary ray for the given fragment according to the camera 
 
 We then apply ray perturbation if the **depth of field** effect is activated, using the `depthOfField` function (also defined in [cameras.h.slang]({{ source_base }}/shaders/cameras.h.slang){:target="_blank"}).
 
-We finally evaluate the ray/particle intersection using the function `particleProcessHitGut`, adapted from VK3DGRT (see [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}). The core of this function is similar to the VK3DGRT version (see `particleProcessHit` in the same file). We perform two adaptations for VK3DGUT:
+We finally evaluate the ray/particle intersection using the function `threedgutProcessHit` (see [threedgut.h.slang]({{ source_base }}/shaders/threedgut.h.slang){:target="_blank"}). The core of this function is similar to the VK3DGRT version (see `threedgrtProcessHit` in [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}). We perform two adaptations for VK3DGUT:
 
 * The new function only returns the evaluated opacity for the fragment instead of performing the blending with previous radiance values. The blending is handled by the alpha blending mechanism of the Vulkan rasterization pipeline (recall that splats are sorted back to front prior to rasterization).
 * Additionally, the VK3DGRT version of the function performs the particle data fetch, whereas in this new VK3DGUT version, we use the values provided by the mesh shader, passed as function parameters through triangle attributes. This approach ensures that fetches are done once per particle instead of once per fragment, which is critical for performance.

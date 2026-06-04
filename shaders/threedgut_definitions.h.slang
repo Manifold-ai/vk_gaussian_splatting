@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2023-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,7 +13,7 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -51,7 +51,7 @@ ut_require_all_sigma_points_valid : false
 #define GUT_IN_IMAGE_MARGIN_FACTOR 0.1
 #define GUT_REQUIRE_ALL_SIGMA_POINTS_VALID false
 
-#define GUT_COVARIANCE_DILATION 0.3
+#define GUT_COVARIANCE_DILATION COVARIANCE_DILATION
 #define GUT_ALPHA_THRESHOLD 0.01
 #define GUT_TIGHT_OPACITY_BOUNDING true
 #define GUT_RECT_BOUNDING true

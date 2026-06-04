@@ -1,0 +1,612 @@
+{
+    "camera": {
+        "aperture": 3.400000059627928e-05,
+        "clip": [
+            0.10000000149011612,
+            2000.0
+        ],
+        "ctr": [
+            -0.02968672104179859,
+            0.6660066843032837,
+            5.096377849578857
+        ],
+        "dofMode": 0,
+        "eye": [
+            1.5700784921646118,
+            1.081890344619751,
+            6.66282844543457
+        ],
+        "focusDist": 1.2999999523162842,
+        "fov": 60.0,
+        "model": 0,
+        "up": [
+            0.0,
+            1.0,
+            0.0
+        ]
+    },
+    "cameras": [
+        {
+            "aperture": 3.400000059627928e-05,
+            "clip": [
+                0.10000000149011612,
+                2000.0
+            ],
+            "ctr": [
+                -0.02968672104179859,
+                0.6660066843032837,
+                5.096377849578857
+            ],
+            "dofMode": 0,
+            "eye": [
+                1.5700784921646118,
+                1.081890344619751,
+                6.66282844543457
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.10000000149011612,
+                2000.0
+            ],
+            "ctr": [
+                0.3769121766090393,
+                0.886301577091217,
+                5.402513027191162
+            ],
+            "dofMode": 0,
+            "eye": [
+                1.3277853727340698,
+                1.2373976707458496,
+                4.2252421379089355
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.10000000149011612,
+                2000.0
+            ],
+            "ctr": [
+                0.1755894124507904,
+                0.8724011778831482,
+                1.807286024093628
+            ],
+            "dofMode": 0,
+            "eye": [
+                0.43890106678009033,
+                1.5703381299972534,
+                3.6100032329559326
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.10000000149011612,
+                2000.0
+            ],
+            "ctr": [
+                2.4738218784332275,
+                0.8567270040512085,
+                5.221683979034424
+            ],
+            "dofMode": 0,
+            "eye": [
+                0.2800098657608032,
+                1.3706649541854858,
+                3.6599154472351074
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.10000000149011612,
+                2000.0
+            ],
+            "ctr": [
+                2.3848493099212646,
+                1.085586428642273,
+                5.0996198654174805
+            ],
+            "dofMode": 0,
+            "eye": [
+                2.198065996170044,
+                1.4199050664901733,
+                6.216565132141113
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        }
+    ],
+    "environment": {
+        "enabled": true,
+        "ibl": {
+            "file": "",
+            "intensity": 1.0,
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ]
+        },
+        "mode": 0,
+        "resolution": [
+            2048,
+            1024
+        ],
+        "skyAndSun": {
+            "groundColor": [
+                0.4000000059604645,
+                0.4000000059604645,
+                0.4000000059604645
+            ],
+            "haze": 0.10000000149011612,
+            "horizonBlur": 0.30000001192092896,
+            "horizonHeight": 0.0,
+            "nightColor": [
+                0.0,
+                0.0,
+                0.009999999776482582
+            ],
+            "redblueshift": 0.10000000149011612,
+            "saturation": 1.0,
+            "sunDirection": [
+                -1.2341340394073086e-08,
+                0.7071068286895752,
+                0.7071067094802856
+            ],
+            "sunDiskIntensity": 1.0,
+            "sunDiskScale": 1.0,
+            "sunGlowIntensity": 2.5
+        }
+    },
+    "lights": {
+        "assets": [
+            {
+                "attenuationMode": 2,
+                "color": [
+                    0.9998999834060669,
+                    0.9999262094497681,
+                    1.0
+                ],
+                "enabled": 1,
+                "id": 0,
+                "innerConeAngle": 30.0,
+                "intensity": 0.12999999523162842,
+                "outerConeAngle": 45.0,
+                "radius": 0.029999999329447746,
+                "range": 1.600000023841858,
+                "type": 1
+            },
+            {
+                "attenuationMode": 3,
+                "color": [
+                    1.0,
+                    0.8819907903671265,
+                    0.0
+                ],
+                "enabled": 1,
+                "id": 1,
+                "innerConeAngle": 30.0,
+                "intensity": 0.07000000029802322,
+                "outerConeAngle": 45.0,
+                "radius": 0.11999999731779099,
+                "range": 1.7000000476837158,
+                "type": 1
+            },
+            {
+                "attenuationMode": 3,
+                "color": [
+                    0.6564431190490723,
+                    0.030157845467329025,
+                    0.030157845467329025
+                ],
+                "enabled": 1,
+                "id": 2,
+                "innerConeAngle": 30.0,
+                "intensity": 0.5299999713897705,
+                "outerConeAngle": 45.0,
+                "radius": 0.28999999165534973,
+                "range": 0.8999999761581421,
+                "type": 1
+            },
+            {
+                "attenuationMode": 3,
+                "color": [
+                    1.0,
+                    1.0,
+                    1.0
+                ],
+                "enabled": 1,
+                "id": 3,
+                "innerConeAngle": 30.0,
+                "intensity": 0.14000000059604645,
+                "outerConeAngle": 45.0,
+                "radius": 0.33000001311302185,
+                "range": 1.2999999523162842,
+                "type": 1
+            }
+        ],
+        "instances": [
+            {
+                "assetId": 0,
+                "name": "Light 1",
+                "rotation": [
+                    -90.0,
+                    -22.234609603881836,
+                    339.37408447265625
+                ],
+                "translation": [
+                    1.4536157846450806,
+                    1.0103837251663208,
+                    6.591813087463379
+                ]
+            },
+            {
+                "assetId": 1,
+                "name": "Light 15",
+                "rotation": [
+                    -90.0,
+                    0.0,
+                    0.0
+                ],
+                "translation": [
+                    0.8962063789367676,
+                    1.401786208152771,
+                    4.943880081176758
+                ]
+            },
+            {
+                "assetId": 2,
+                "name": "Light 16",
+                "rotation": [
+                    -90.0,
+                    0.0,
+                    0.0
+                ],
+                "translation": [
+                    2.3312113285064697,
+                    0.9072723388671875,
+                    4.873171806335449
+                ]
+            },
+            {
+                "assetId": 3,
+                "name": "Light 17",
+                "rotation": [
+                    -90.0,
+                    0.0,
+                    0.0
+                ],
+                "translation": [
+                    0.8008455038070679,
+                    1.5424671173095703,
+                    1.8565633296966553
+                ]
+            }
+        ],
+        "nextNamingNumber": 66
+    },
+    "meshAssets": [
+        {
+            "id": 0,
+            "path": "data\\horse.obj"
+        },
+        {
+            "id": 1,
+            "path": "data\\teapot.obj"
+        }
+    ],
+    "meshInstances": {
+        "items": [
+            {
+                "materials": [
+                    {
+                        "baseColor": [
+                            0.04929149150848389,
+                            1.0,
+                            0.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 3.0,
+                        "maxBounces": 3,
+                        "metallic": 0.0,
+                        "name": "Default",
+                        "opacity": 1.0,
+                        "roughness": 0.03099999949336052,
+                        "transmission": 1.0
+                    }
+                ],
+                "meshAssetId": 0,
+                "name": "Model 2 - horse.obj",
+                "position": [
+                    0.9035234451293945,
+                    1.1449459791183472,
+                    6.22136116027832
+                ],
+                "rotation": [
+                    -90.06018829345703,
+                    -92.92634582519531,
+                    -0.6804127097129822
+                ],
+                "scale": [
+                    1.4249999523162842,
+                    1.4249999523162842,
+                    1.4249999523162842
+                ],
+                "show": true
+            },
+            {
+                "materials": [
+                    {
+                        "baseColor": [
+                            1.0,
+                            0.9998999834060669,
+                            0.9998999834060669
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5809999704360962,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Default",
+                        "opacity": 1.0,
+                        "roughness": 0.0,
+                        "transmission": 0.0
+                    }
+                ],
+                "meshAssetId": 1,
+                "name": "Model 3 - teapot.obj",
+                "position": [
+                    1.0643324851989746,
+                    1.022828221321106,
+                    6.590124607086182
+                ],
+                "rotation": [
+                    0.0,
+                    108.11943054199219,
+                    0.0
+                ],
+                "scale": [
+                    0.03782328963279724,
+                    0.03782328963279724,
+                    0.03782328963279724
+                ],
+                "show": true
+            }
+        ],
+        "nextNamingNumber": 80
+    },
+    "renderer": {
+        "alphaClamp": 0.9900000095367432,
+        "alphaCullThreshold": 0.003921568859368563,
+        "billboardFrustumCulling": true,
+        "colorFormat": 109,
+        "covarianceDilation": 0.30000001192092896,
+        "cpuLazySort": true,
+        "depthIsoThreshold": 0.699999988079071,
+        "depthIsoThresholdRTX": 0.699999988079071,
+        "distShaderWorkgroupSize": 256,
+        "dlssEnabled": false,
+        "dlssMinRadianceThreshold": 0.0,
+        "dlssSizeMode": 2,
+        "extentProjection": 1,
+        "fireflyClampThreshold": 13.0,
+        "fragmentBarycentric": false,
+        "frustumCulling": 1,
+        "ftbSyncMode": 0,
+        "kernelAdaptiveClamping": true,
+        "kernelDegree": 2,
+        "kernelMinResponse": 0.011300000362098217,
+        "lightingEnabled": true,
+        "maxPasses": 200,
+        "maxShDegree": 3,
+        "meshShaderWorkgroupSize": 32,
+        "minTransmittance": 0.009999999776482582,
+        "msAntialiasing": false,
+        "normalMethod": 0,
+        "opacityGaussianDisabled": false,
+        "particleDepth": 1,
+        "particleEmissiveAoEnabled": false,
+        "particleEmissiveAoRadius": 0.05000000074505806,
+        "particleEmissiveAoStrength": 1.0,
+        "particleSamplesPerPass": 18,
+        "particleShadowColorStrength": 0.0,
+        "particleShadowOffset": 0.20000000298023224,
+        "particleShadowTransmittanceThreshold": 0.800000011920929,
+        "pipeline": 3,
+        "pointCloudModeEnabled": false,
+        "quantizeMeshPayload": true,
+        "quantizeNormals": true,
+        "rtxMaxBounces": 3,
+        "rtxSecondaryRayOffset": 0.0010000000474974513,
+        "rtxTraceStrategy": 2,
+        "shadowsMode": 2,
+        "showShOnly": false,
+        "sizeCulling": 0,
+        "sizeCullingMinPixels": 1.0,
+        "sortingMethod": 3,
+        "splatScale": 1.0,
+        "splatSetCompositeTransmittance": 0.10000000149011612,
+        "temporalSamplesCount": 20000,
+        "temporalSampling": true,
+        "temporalSamplingMode": 0,
+        "thinParticleThreshold": 9.999999974752427e-07,
+        "visualize": 0,
+        "vsync": false,
+        "wireframe": false
+    },
+    "settings": {
+        "grid": {
+            "show": false
+        },
+        "lightProxies": {
+            "show": true
+        },
+        "navigation": {
+            "autoPlay": false,
+            "mode": 2,
+            "speed": 3.0,
+            "transition": 5.0
+        },
+        "summaryOverlay": {
+            "show": false
+        },
+        "transformHelpers": {
+            "show": true,
+            "snapEnabled": false,
+            "snapRotate": 15.0,
+            "snapScale": 0.10000000149011612,
+            "snapTranslate": 0.25
+        }
+    },
+    "splatSets": [
+        {
+            "id": 0,
+            "path": "data\\teleportour\\Winter-Garden-view2.ply",
+            "rgbaFormat": 2,
+            "shFormat": 2,
+            "storage": 0
+        }
+    ],
+    "splats": [
+        {
+            "material": {
+                "baseColor": [
+                    0.7959878444671631,
+                    0.7959082126617432,
+                    0.7959082126617432
+                ],
+                "clearcoatFactor": 0.0,
+                "clearcoatRoughness": 0.0,
+                "emissive": [
+                    0.0050286054611206055,
+                    0.005028102546930313,
+                    0.005028102546930313
+                ],
+                "emissiveStrength": 2.0999999046325684,
+                "ior": 1.5,
+                "maxBounces": 0,
+                "metallic": 0.0,
+                "opacity": 1.0,
+                "roughness": 0.8164966106414795,
+                "specularColorFactor": [
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                "specularFactor": 0.0,
+                "transmission": 0.0
+            },
+            "name": "Splat set 0 - Winter-Garden-view2.ply",
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation": [
+                0.0,
+                -0.0,
+                0.0
+            ],
+            "scale": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "show": true,
+            "splatSetId": 0
+        }
+    ],
+    "splatsGlobals": {
+        "compressBlas": true,
+        "rgbaFormat": 2,
+        "shFormat": 2,
+        "useAABBs": false,
+        "useSpheres": false,
+        "useTlasInstances": false
+    },
+    "tonemapping": {
+        "autoExposure": 1,
+        "autoExposureSpeed": 5.0,
+        "averageMode": 1,
+        "brightness": 1.0,
+        "centerMeteringSize": 0.5,
+        "contrast": 1.0,
+        "coolColor": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "dither": 1,
+        "enableCenterMetering": 0,
+        "evMaxValue": 10.0,
+        "evMinValue": -5.0,
+        "exposure": 1.0,
+        "highlightBias": 0.0,
+        "isActive": 1,
+        "method": 2,
+        "midtoneBias": 0.0,
+        "saturation": 1.0,
+        "shadowBias": 0.0,
+        "splitBalance": 0.0,
+        "temperature": 6506.111328125,
+        "tint": 0.0032589531037956476,
+        "vibrance": 0.0,
+        "vignette": 0.0,
+        "warmColor": [
+            1.0,
+            1.0,
+            1.0
+        ]
+    },
+    "version": 7
+}

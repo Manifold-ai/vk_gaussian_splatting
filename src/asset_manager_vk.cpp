@@ -40,7 +40,7 @@ void AssetManagerVk::init(nvapp::Application*                                 ap
   // Initialize all asset managers
   cameras.init(cameraManip);
   lights.init(app, alloc, uploader);
-  meshes.init(app, alloc, uploader, accelStructProps);
+  meshes.init(app, alloc, uploader, sampler, accelStructProps);
   splatSets.init(app, alloc, uploader, sampler, deviceInfo, accelStructProps, profilerTimeline);
 
   // Set cross-references
@@ -171,7 +171,8 @@ void AssetManagerVk::updateAssetsBuffer()
     sceneAssets.splatSetDescriptors = reinterpret_cast<shaderio::SplatSetDesc*>(splatSets.getGPUDescriptorArrayAddress());
     // Per-TLAS-instance descriptors are used by RTX when BLAS is split (optional).
     sceneAssets.splatSetDescriptorsRtx = reinterpret_cast<shaderio::SplatSetDesc*>(splatSets.getRtxDescriptorArrayAddress());
-    sceneAssets.splatSetCount = static_cast<uint32_t>(splatSets.getInstanceCount());
+    sceneAssets.splatSetCount    = static_cast<uint32_t>(splatSets.getInstanceCount());
+    sceneAssets.splatSetRtxCount = splatSets.getRtxDescriptorCount();
 
     // Multi-TLAS array (for large scenes exceeding maxInstanceCount)
     const auto& tlasArray                 = splatSets.getTlasArray();
@@ -185,8 +186,8 @@ void AssetManagerVk::updateAssetsBuffer()
     sceneAssets.totalGlobalSplatCount           = splatSets.getTotalGlobalSplatCount();
 
     // Sorting buffer addresses (bindless access, from SplatSetManagerVk)
-    sceneAssets.splatSortingDistancesAddress = reinterpret_cast<uint32_t*>(splatSets.getSplatSortingDistancesAddress());
-    sceneAssets.splatSortingIndicesAddress   = reinterpret_cast<uint32_t*>(splatSets.getSplatSortingIndicesAddress());
+    sceneAssets.splatSortingDistancesAddress = splatSets.getSplatSortingDistancesAddress();
+    sceneAssets.splatSortingIndicesAddress   = splatSets.getSplatSortingIndicesAddress();
   }
 
   // Upload updated data to existing buffer (buffer was created in init())

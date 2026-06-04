@@ -40,21 +40,11 @@ SplatSetDesc* getRtxSplatSetDescriptors()
 [shader("intersection")]
 void main()
 {
-#if !RTX_USE_INSTANCES
-  // For non-instanced mode, InstanceID() maps directly to a descriptor index.
-  const uint   descIndex    = InstanceID();
-  SplatSetDesc splatSetDesc = getRtxSplatSetDescriptors()[descIndex];
-#endif
-  
 #if RTX_USE_INSTANCES
   // Instanced mode: allways testing the same unit particle, no data fetch inside Hit test function
   // The TLAS instance transform already accounts for particle position/rotation/scale
   const float3 canonicalRayOrigin    = ObjectRayOrigin();
   const float3 canonicalRayDirection = ObjectRayDirection();
-
-  CustomIntersectionAttributes attr;
-  attr.aabbHitT     = PAYLOAD_INF_DISTANCE;
-  attr.barycentrics = float2(0.5, 0.5);
 
 #if WIREFRAME || DISABLE_OPACITY_GAUSSIAN
   // We perform an additional ray/aabb intersection for wireframe or if showing opaque particles
@@ -63,15 +53,13 @@ void main()
   // proper gaussian gradient (no visual artefacts). However when we need to display accurate sharp boundaries
   // we need to discard outliers from approximated built-in aabb hardware test.
 
-  const float  aabbSize = 1.618033988749895;  // Golden ratio
+  const float  aabbSize = 1.0;  // Must match BLAS AABB half-extent [-1,1]^3
   const float3 aabbMin  = float3(-aabbSize);
   const float3 aabbMax  = float3(aabbSize);
 
   float aabbHitT;
   if(!rayAABBIntersection(canonicalRayOrigin, canonicalRayDirection, aabbMin, aabbMax, RayTMin(), RayTCurrent(), aabbHitT))
     return;
-
-  attr.aabbHitT = aabbHitT;
 #endif
 
   float ellipsoidHitT = PAYLOAD_INF_DISTANCE;
@@ -80,9 +68,17 @@ void main()
 
 #if !WIREFRAME
   if(hitEllipsoid)
+  {
+    BuiltInTriangleIntersectionAttributes attr;
+    attr.barycentrics = float2(0.0, 0.0);
     ReportHit(ellipsoidHitT, 0, attr);
+  }
 
 #else
+  CustomIntersectionAttributes attr;
+  attr.aabbHitT     = aabbHitT;
+  attr.barycentrics = float2(0.5, 0.5);
+
   // We will use hitKind as a bitfield.
   // Bit 4: particleHit flag (1=ellipsoid hit, 0=only AABB hit)
   uint hitKind = hitEllipsoid ? (1 << 4) : 0;
@@ -104,6 +100,8 @@ void main()
   // Attention: this non instanced AABB branch code is forced disabled by UI,
   // activating can lead to GPU freeze due to massive AABBOX overlaps (see readme).
 
+  const uint   descIndex    = InstanceID();
+  SplatSetDesc splatSetDesc = getRtxSplatSetDescriptors()[descIndex];
   const int particleId = int(splatSetDesc.splatBase) + PrimitiveIndex();
 
   // Transform ray to splat model space using splatSetDesc transforms
@@ -116,10 +114,8 @@ void main()
 
   if(particleDensityHitCustom(splatSetDesc, modelRayOrigin, modelRayDirection, particleId, RayTMin(), RayTCurrent(), 9.0F, hitT))
   {
-    CustomIntersectionAttributes attr;
-    attr.aabbHitT = PAYLOAD_INF_DISTANCE;
-    // no wireframe, never, we do not support for this branch of code that is disabled in UI.
-    attr.barycentrics = float2(0.5, 0.5);
+    BuiltInTriangleIntersectionAttributes attr;
+    attr.barycentrics = float2(0.0, 0.0);
     ReportHit(hitT, 0, attr);
   }
 #endif
@@ -180,7 +176,7 @@ bool particleDensityHitCustom(in SplatSetDesc splatSetDesc,
                               in float  maxParticleSquaredDistance,
                               out float hitDistance)
 {
-  ThreedgrtParticle particle = { splatSetDesc, particleId, true }; // fetch the PSR only 
+  ThreedgsParticle particle = { splatSetDesc, particleId, true }; // fetch the PSR only 
 
   float3 canonicalRayOrigin;
   float3 canonicalRayDirection;

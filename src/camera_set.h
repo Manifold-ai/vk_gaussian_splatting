@@ -90,11 +90,16 @@ public:
     m_cameraManip->setCamera(toNvutilCamera(camera), instantSet);
   };
 
+  // Set the home camera preset at index 0.
+  // Inserts rather than overwrites so that presets loaded earlier (e.g., INRIA camera
+  // presets loaded via --loadCameraPresets during CLI parse, before the scene triggers
+  // setHomePreset in onAttach) are shifted to index 1..N instead of being lost.
   void setHomePreset(const Camera& camera)
   {
     if(m_presets.empty())
-      m_presets.resize(1);
-    m_presets[0] = camera;
+      m_presets.push_back(camera);
+    else
+      m_presets.insert(m_presets.begin(), camera);
   }
 
   // return the number of cameras in the set
@@ -179,13 +184,15 @@ private:
   nvutils::CameraManipulator* m_cameraManip;  // camer manipulatror (navigation/animation)
 
   // preserves the additional fields of camera
+  // nvutils::CameraManipulator::Camera uses double precision; narrow explicitly to the
+  // single-precision fields used by our Camera struct.
   Camera& applyNvutilCamera(const NvutilCamera nvuCam, Camera& camera)
   {
-    camera.eye  = nvuCam.eye;
-    camera.ctr  = nvuCam.ctr;
-    camera.up   = nvuCam.up;
-    camera.fov  = nvuCam.fov;
-    camera.clip = nvuCam.nearFar;
+    camera.eye  = glm::vec3(nvuCam.eye);
+    camera.ctr  = glm::vec3(nvuCam.ctr);
+    camera.up   = glm::vec3(nvuCam.up);
+    camera.fov  = float(nvuCam.fov);
+    camera.clip = glm::vec2(nvuCam.nearFar);
     return camera;
   }
 
@@ -193,11 +200,11 @@ private:
   {
     // other fields of result are set to default
     return {
-        .eye  = nvuCam.eye,
-        .ctr  = nvuCam.ctr,
-        .up   = nvuCam.up,
-        .fov  = nvuCam.fov,
-        .clip = nvuCam.nearFar,
+        .eye  = glm::vec3(nvuCam.eye),
+        .ctr  = glm::vec3(nvuCam.ctr),
+        .up   = glm::vec3(nvuCam.up),
+        .fov  = float(nvuCam.fov),
+        .clip = glm::vec2(nvuCam.nearFar),
     };
   }
 
@@ -225,6 +232,8 @@ static bool importCamerasINRIA(std::string filename, CameraSet& cameraSet)
     std::ifstream i(filename);
     if(!i.is_open())
       return false;
+
+    LOGI("loading camera file %s\n", filename.c_str());
 
     // Parsing the file
     json data;

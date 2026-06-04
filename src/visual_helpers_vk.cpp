@@ -152,22 +152,24 @@ void VisualHelpers::render(VkCommandBuffer  cmd,
 
   const VkExtent2D viewportExtent = {static_cast<uint32_t>(viewportSize.x), static_cast<uint32_t>(viewportSize.y)};
 
-  // Step 1: Copy main color buffer to helper color buffer
+  // Step 1: Blit main color buffer to helper color buffer
+  // Using blit instead of copy to handle potential format differences (e.g. HDR vs LDR)
   // This keeps main buffer clean for temporal accumulation (helpers won't be accumulated)
   {
-    // Transition source for copy
+    // Transition source for blit
     nvvk::cmdImageMemoryBarrier(cmd, {mainColorImage, VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL});
 
-    // Transition destination for copy
+    // Transition destination for blit
     nvvk::cmdImageMemoryBarrier(cmd, {m_helperGBuffers.getColorImage(0), VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL});
 
-    VkImageCopy copyRegion{};
-    copyRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copyRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-    copyRegion.extent         = {viewportExtent.width, viewportExtent.height, 1};
+    VkImageBlit blitRegion{};
+    blitRegion.srcSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blitRegion.srcOffsets[1]  = {int32_t(viewportExtent.width), int32_t(viewportExtent.height), 1};
+    blitRegion.dstSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+    blitRegion.dstOffsets[1]  = {int32_t(viewportExtent.width), int32_t(viewportExtent.height), 1};
 
-    vkCmdCopyImage(cmd, mainColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_helperGBuffers.getColorImage(0),
-                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+    vkCmdBlitImage(cmd, mainColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, m_helperGBuffers.getColorImage(0),
+                   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &blitRegion, VK_FILTER_NEAREST);
 
     // Transition source back to general
     nvvk::cmdImageMemoryBarrier(cmd, {mainColorImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL});
@@ -186,10 +188,10 @@ void VisualHelpers::render(VkCommandBuffer  cmd,
   colorAttachment.storeOp                   = VK_ATTACHMENT_STORE_OP_STORE;
   colorAttachment.clearValue.color          = {{0.0f, 0.0f, 0.0f, 0.0f}};
 
-  // Depth attachment - use helper depth buffer (starts clear)
+  // Depth attachment - helper depth stays in GENERAL (matches GBuffer init, shared with compute/sample usage)
   VkRenderingAttachmentInfo depthAttachment = {VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO};
   depthAttachment.imageView                 = m_helperGBuffers.getDepthImageView();
-  depthAttachment.imageLayout               = VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+  depthAttachment.imageLayout               = VK_IMAGE_LAYOUT_GENERAL;
   depthAttachment.loadOp                    = VK_ATTACHMENT_LOAD_OP_CLEAR;
   depthAttachment.storeOp                   = VK_ATTACHMENT_STORE_OP_STORE;
   depthAttachment.clearValue.depthStencil   = {1.0f, 0};

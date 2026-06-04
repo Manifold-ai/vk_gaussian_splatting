@@ -47,8 +47,10 @@
 */
 
 #include "nvshaders/fwidth.h.slang"
-#include "nvshaders/wireframe.h.slang"
 #include "nvshaders/random.h.slang"
+#if WIREFRAME
+#include "nvshaders/wireframe.h.slang"
+#endif
 
 #include "shaderio.h"
 
@@ -70,6 +72,37 @@ struct VertexInput
 #endif
 };
 
+// Inputs from the mesh shader. The mesh shader emits the flat attributes (color, splat id, normal)
+// per-primitive on NVIDIA but per-vertex on every other vendor. This is NOT a driver bug: Slang
+// cannot emit the PerPrimitiveEXT decoration on these fragment inputs (Slang issue
+// shader-slang/slang#7019), so the per-primitive path only works on NVIDIA (which links by location
+// at PSO creation). The frag must read attributes from the matching frequency, so the struct
+// membership is gated to mirror the mesh shader (see threedgs_raster.mesh.slang for the full
+// explanation).
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+// Non-NVIDIA: per-primitive input is empty; flat attributes arrive per-vertex.
+struct MeshPrimitiveInput
+{
+};
+struct MeshVertexInput
+{
+  [[vk::location(0)]] nointerpolation float4 inSplatCol : COLOR0;
+#if !USE_BARYCENTRIC
+  [[vk::location(1)]] float2 inFragPos : TEXCOORD0;
+#endif
+#if STOCHASTIC_SPLAT || NEED_SURFACE_INFO
+  [[vk::location(3)]] nointerpolation uint inSplatId : SPLATID;
+#endif
+#if NEED_SURFACE_INFO
+#if QUANTIZE_NORMALS
+  // Octahedral encoding: unit normal packed into 32-bit uint (16 bits per component)
+  [[vk::location(4)]] nointerpolation uint inSplatNormalPacked : NORMAL0;
+#else
+  [[vk::location(4)]] nointerpolation float3 inSplatNormal : NORMAL0;
+#endif
+#endif
+};
+#else
 // Per-primitive input (from mesh shader)
 struct MeshPrimitiveInput
 {
@@ -94,6 +127,7 @@ struct MeshVertexInput
   [[vk::location(1)]] float2 inFragPos : TEXCOORD0;
 #endif
 };
+#endif
 
 // Fragment output
 struct FragmentOutput
@@ -142,7 +176,7 @@ FragmentOutput main(VertexInput vert
 )
 {
 #if USE_BARYCENTRIC
-  const float2 inFragPos = float(0.0);  // placeholder
+  const float2 inFragPos = float2(0.0);  // placeholder
 #else
   const float2 inFragPos = vert.inFragPos;
 #endif
@@ -185,7 +219,7 @@ FragmentOutput main_mesh(MeshVertexInput                    vert,
 )
 {
 #if USE_BARYCENTRIC
-  const float2 inFragPos = float(0.0);  // placeholder
+  const float2 inFragPos = float2(0.0);  // placeholder
 #else
   const float2 inFragPos = vert.inFragPos;
 #endif
@@ -194,23 +228,47 @@ FragmentOutput main_mesh(MeshVertexInput                    vert,
   const float3 baryCoord = float3(0.0);  // placeholder
 #endif
 
+  // Read the flat attributes from the per-vertex input on non-NVIDIA vendors (see Slang #7019) or
+  // from the per-primitive input on NVIDIA.
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+  const float4 inSplatCol = vert.inSplatCol;
+#else
+  const float4 inSplatCol = prim.inSplatCol;
+#endif
+
+#if STOCHASTIC_SPLAT || NEED_SURFACE_INFO
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+  const uint inSplatId = vert.inSplatId;
+#else
+  const uint inSplatId = prim.inSplatId;
+#endif
+#endif
+
 #if NEED_SURFACE_INFO
 #if QUANTIZE_NORMALS
   // Decode octahedral-encoded normal from packed uint
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+  const float3 inNormal = decodeNormalOctahedral(vert.inSplatNormalPacked);
+#else
   const float3 inNormal = decodeNormalOctahedral(prim.inSplatNormalPacked);
+#endif
+#else  // !QUANTIZE_NORMALS
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+  const float3 inNormal = vert.inSplatNormal;
 #else
   const float3 inNormal = prim.inSplatNormal;
 #endif
-#else
+#endif
+#else  // !NEED_SURFACE_INFO
   const float3 inNormal = float3(0.0);  // Normal will be reconstructed from depth in compute pass
 #endif
 
 #if STOCHASTIC_SPLAT
-  return processFragment(inFragPos, prim.inSplatCol, baryCoord, fragCoord, prim.inSplatId, primitiveID, inNormal);
+  return processFragment(inFragPos, inSplatCol, baryCoord, fragCoord, inSplatId, primitiveID, inNormal);
 #elif NEED_SURFACE_INFO
-  return processFragment(inFragPos, prim.inSplatCol, baryCoord, fragCoord, prim.inSplatId, 0, inNormal);
+  return processFragment(inFragPos, inSplatCol, baryCoord, fragCoord, inSplatId, 0, inNormal);
 #else
-  return processFragment(inFragPos, prim.inSplatCol, baryCoord, float4(0), 0, 0, inNormal);
+  return processFragment(inFragPos, inSplatCol, baryCoord, float4(0), 0, 0, inNormal);
 #endif
 }
 
@@ -222,7 +280,7 @@ FragmentOutput main_mesh(MeshVertexInput                    vert,
 // #if !NEED_SURFACE_INFO : inNormal is a placeholder (not used)
 FragmentOutput processFragment(float2 inFragPos, float4 inSplatCol, float3 baryCoord, float4 fragCoord, uint splatId, uint primitiveID, float3 inNormal)
 {
-  FragmentOutput output;
+  FragmentOutput output = {};
 
 #if USE_BARYCENTRIC
   // Use barycentric extension to find the position of the fragment

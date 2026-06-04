@@ -26,6 +26,8 @@ parametric intersections or using icosahedron 3D meshes with TTU intersections](
 
 **In the case of the AABB**, the intersection is computed using a programmable intersection shader that implements parametric intersection with the particle ellipsoid.
 
+For models trained with standard 3DGS rasterization, an optional **billboard** particle depth replicates the 2D projected Gaussian alpha model inside this RTX pipeline (dedicated intersection shader, 2D conic evaluation, configurable bounding volumes). See [Billboard Ray Tracing](./billboard_ray_tracing.md).
+
 ## Any Hit Based Implementation
 
 To compute the ordered set of particle intersections for a given ray, one could use a **closest hit shader** invoked multiple times by the **ray generation shader**. Starting from $tMin$, find the closest particle hit, then restart a trace from this point, and continue until the transmittance (initialized to 1.0) lowers to a given threshold $minTransmittance$. While this implementation is functional, it **comes at a very high computational cost** since the ray generator must trace as many rays per pixel as intersected particles.
@@ -45,7 +47,7 @@ The example of the above diagram is developed hereafter:
 * Each `traceRayEXT` of index $n$ will systematically go:
     * Through all the splats between $Tmin_n$ and $Tmax_n$, invoking the **any hit shader** for each intersection.
     * The [**any hit shader**]({{ source_base }}/shaders/threedgrt_raytrace.rahit.slang){:target="_blank"} handles the insertion and sorting of the $k \leq K$ closest particles within the payload buffer.
-* After each ray trace, the raygen shader (using the `particleProcessHit` function, see file [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}):
+* After each ray trace, the raygen shader (using the `threedgrtProcessHit` function, see file [threedgrt.h.slang]({{ source_base }}/shaders/threedgrt.h.slang){:target="_blank"}):
     * Computes the radiance of each intersected splat and blends the result to the pixel radiance.
     * The $transmittance$ is decreased by the opacity of the blended values.
     * $Tmin_{n+1}$ is set to the distance to the last intersected splat.

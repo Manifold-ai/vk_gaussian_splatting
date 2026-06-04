@@ -68,6 +68,8 @@ void ParticleAccelerationStructureHelperGpu::deinitAccelerationStructures()
     m_alloc->destroyLargeBuffer(m_indexBuffer);
   if(m_aabbBuffer.buffer)
     m_alloc->destroyLargeBuffer(m_aabbBuffer);
+  if(m_radiusBuffer.buffer)
+    m_alloc->destroyLargeBuffer(m_radiusBuffer);
   if(m_tlasInstancesBuffer.buffer)
     m_alloc->destroyLargeBuffer(m_tlasInstancesBuffer);
   if(m_blasScratchBuffer.buffer)
@@ -82,8 +84,20 @@ void ParticleAccelerationStructureHelperGpu::deinitAccelerationStructures()
   m_vertexBuffer        = {};
   m_indexBuffer         = {};
   m_aabbBuffer          = {};
+  m_radiusBuffer        = {};
   m_tlasInstancesBuffer = {};
   m_blasScratchBuffer   = {};
+  m_tlasScratchBuffer   = {};
+}
+
+void ParticleAccelerationStructureHelperGpu::releaseTlasBuildBuffers()
+{
+  if(m_tlasInstancesBuffer.buffer)
+    m_alloc->destroyLargeBuffer(m_tlasInstancesBuffer);
+  if(m_tlasScratchBuffer.buffer)
+    m_alloc->destroyLargeBuffer(m_tlasScratchBuffer);
+
+  m_tlasInstancesBuffer = {};
   m_tlasScratchBuffer   = {};
 }
 
@@ -270,9 +284,11 @@ VkResult ParticleAccelerationStructureHelperGpu::createBlasOnly(const BlasCreate
   temp.vertexBufferSize = info.vertexBufferSize;
   temp.indexBufferSize  = info.indexBufferSize;
   temp.aabbBufferSize   = info.aabbBufferSize;
+  temp.radiusBufferSize = info.radiusBufferSize;
   temp.vertexCount      = info.vertexCount;
   temp.indexCount       = info.indexCount;
   temp.aabbCount        = info.aabbCount;
+  temp.sphereCount      = info.sphereCount;
   temp.vertexStride     = info.vertexStride;
   temp.vertexFormat     = info.vertexFormat;
   temp.blasBuildFlags   = info.blasBuildFlags;
@@ -532,6 +548,21 @@ VkResult ParticleAccelerationStructureHelperGpu::allocateGeometryBuffers(const C
       return result;
     NVVK_DBG_NAME(m_indexBuffer.buffer);
   }
+  else if(info.geometryType == GeometryType::eSpheres)
+  {
+    if(info.vertexBufferSize == 0 || info.radiusBufferSize == 0)
+      return VK_ERROR_INITIALIZATION_FAILED;
+
+    VkResult result = m_alloc->createLargeBuffer(m_vertexBuffer, info.vertexBufferSize, usageFlags, queue);
+    if(result != VK_SUCCESS)
+      return result;
+    NVVK_DBG_NAME(m_vertexBuffer.buffer);
+
+    result = m_alloc->createLargeBuffer(m_radiusBuffer, info.radiusBufferSize, usageFlags, queue);
+    if(result != VK_SUCCESS)
+      return result;
+    NVVK_DBG_NAME(m_radiusBuffer.buffer);
+  }
   else
   {
     if(info.aabbBufferSize == 0)
@@ -622,6 +653,30 @@ nvvk::AccelerationStructureGeometryInfo ParticleAccelerationStructureHelperGpu::
     geoInfo.geometry.geometry.triangles = triangles;
 
     geoInfo.rangeInfo.primitiveCount  = info.indexCount / 3;
+    geoInfo.rangeInfo.primitiveOffset = 0;
+    geoInfo.rangeInfo.firstVertex     = 0;
+    geoInfo.rangeInfo.transformOffset = 0;
+  }
+  else if(info.geometryType == GeometryType::eSpheres)
+  {
+    m_sphereGeometryData                          = {};
+    m_sphereGeometryData.sType                    = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_SPHERES_DATA_NV;
+    m_sphereGeometryData.vertexFormat             = info.vertexFormat;
+    m_sphereGeometryData.vertexData.deviceAddress = m_vertexBuffer.address;
+    m_sphereGeometryData.vertexStride             = info.vertexStride;
+    m_sphereGeometryData.radiusFormat             = VK_FORMAT_R32_SFLOAT;
+    m_sphereGeometryData.radiusData.deviceAddress = m_radiusBuffer.address;
+    m_sphereGeometryData.radiusStride             = sizeof(float);
+    m_sphereGeometryData.indexType                = VK_INDEX_TYPE_NONE_KHR;
+    m_sphereGeometryData.indexData                = {};
+    m_sphereGeometryData.indexStride              = 0;
+
+    geoInfo.geometry.sType        = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR;
+    geoInfo.geometry.geometryType = VK_GEOMETRY_TYPE_SPHERES_NV;
+    geoInfo.geometry.flags        = VK_GEOMETRY_NO_DUPLICATE_ANY_HIT_INVOCATION_BIT_KHR;
+    geoInfo.geometry.pNext        = &m_sphereGeometryData;
+
+    geoInfo.rangeInfo.primitiveCount  = info.sphereCount;
     geoInfo.rangeInfo.primitiveOffset = 0;
     geoInfo.rangeInfo.firstVertex     = 0;
     geoInfo.rangeInfo.transformOffset = 0;

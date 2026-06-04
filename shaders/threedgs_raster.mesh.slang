@@ -46,14 +46,11 @@
 */
 
 #include "shaderio.h"
-#include "threedgs.h.slang"
+#include "threedgs.h.slang"  // provides ThreedgsParticle + computeEllipsoidNormalMaxDensityPlane
 #include "threedgs_particle_storage.h.slang"
 
-#if NEED_SURFACE_INFO
-#include "threedgrt.h.slang"  // For computeEllipsoidNormalMaxDensityPlane and ThreedgrtParticle
-#if QUANTIZE_NORMALS
+#if NEED_SURFACE_INFO && QUANTIZE_NORMALS
 #include "octahedral_normal.h.slang"
-#endif
 #endif
 
 // Parallel Processing : Each global invocation (thread) processes one splat.
@@ -64,6 +61,48 @@ static const int MAX_PRIMITIVES = 2 * RASTER_MESH_WORKGROUP_SIZE;
 
 // clang-format off
 
+// Splat attributes passed to the fragment shader.
+//
+// ROOT CAUSE (Slang issue shader-slang/slang#7019): Slang decorates per-primitive mesh *outputs*
+// with the required PerPrimitiveEXT decoration, but has no way to emit the matching PerPrimitiveEXT
+// on the fragment-shader *inputs* (verified by disassembling our SPIR-V: mesh out = PerPrimitiveEXT,
+// frag in = Flat only). NVIDIA tolerates this interface mismatch (it links per-primitive vars by
+// location at PSO creation), but every non-NVIDIA vendor (AMD, Intel, ...) reads the per-primitive
+// data at per-vertex rate, which yields garbage/missing attributes. The Vulkan validation layers now
+// also flag this mismatch (KhronosGroup/Vulkan-ValidationLayers#8398). It is NOT a driver bug
+// dropping outputs.
+//
+// WORKAROUND (gated by MESH_SHADER_PER_PRIMITIVE_ATTRIBS, see shaderio.h): on non-NVIDIA vendors, emit the
+// flat attributes (color, splat id, normal) per-vertex (duplicated across the 4 quad vertices) with
+// nointerpolation. NVIDIA keeps the per-primitive path (less output bandwidth), matching the
+// integration reference. The per-vertex quad corner (outFragPos) and position stay per-vertex in both
+// cases; the fragment shader reads everything by location/semantic.
+// TODO: when Slang #7019 lands (PerPrimitiveEXT on frag inputs), drop this gate and use per-primitive
+// everywhere (also fixes the validation warning on AMD/Intel).
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+struct PrimitiveOutput
+{
+};
+struct VertexOutput
+{
+  [[vk::location(0)]] nointerpolation float4 outSplatCol : COLOR0;
+#if !USE_BARYCENTRIC
+  [[vk::location(1)]] float2 outFragPos : TEXCOORD0;
+#endif
+  [[vk::location(2)]] float4 position : SV_Position;
+#if STOCHASTIC_SPLAT || NEED_SURFACE_INFO
+  [[vk::location(3)]] nointerpolation uint outSplatId : SPLATID;
+#endif
+#if NEED_SURFACE_INFO
+#if QUANTIZE_NORMALS
+  // Octahedral encoding: unit normal packed into 32-bit uint (16 bits per component)
+  [[vk::location(4)]] nointerpolation uint outSplatNormalPacked : NORMAL0;
+#else
+  [[vk::location(4)]] nointerpolation float3 outSplatNormal : NORMAL0;
+#endif
+#endif
+};
+#else
 // Per primitive output
 struct PrimitiveOutput
 {
@@ -89,6 +128,7 @@ struct VertexOutput
 #endif
   [[vk::location(2)]] float4 position : SV_Position;
 };
+#endif
 
 [[vk::binding(BINDING_FRAME_INFO_UBO, 0)]]  ConstantBuffer<FrameInfo> frameInfo;
 [[vk::binding(BINDING_ASSETS, 0)]] ConstantBuffer<SceneAssets> assets;
@@ -104,7 +144,10 @@ void emitDegeneratedQuad(uint localIndex, out OutputVertices<VertexOutput, MAX_V
   [unroll]
   for(uint i = 0; i < 4; ++i)
   {
-    verts[localIndex * 4 + i].position = float4(0.0, 0.0, 2.0, 1.0);
+    verts[localIndex * 4 + i].position   = float4(0.0, 0.0, 2.0, 1.0);
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+    verts[localIndex * 4 + i].outSplatCol = float4(0.0);
+#endif
   }
 }
 
@@ -118,17 +161,22 @@ void main(uint3                                             groupThreadID: SV_Gr
           OutputVertices<VertexOutput, MAX_VERTICES>        verts,
           OutputPrimitives<PrimitiveOutput, MAX_PRIMITIVES> prims)
 {
-  const uint32_t baseIndex  = dispatchThreadID.x;
-  const uint     localIndex = groupThreadID.x;
+  const uint localIndex = groupThreadID.x;
+  // Mesh tasks are dispatched as a 2D grid (X = MESH_SHADER_MAX_GROUPS_X = device
+  // maxMeshWorkGroupCount[0]) so very large scenes stay under the per-dimension limit. Recover the
+  // linear workgroup index, then the per-thread global splat slot. With groupID.y == 0 (groupCountY
+  // == 1) this is identical to a plain 1D dispatch (linearGroup == groupID.x).
+  const uint     linearGroup = groupID.y * MESH_SHADER_MAX_GROUPS_X + groupID.x;
+  const uint32_t baseIndex   = linearGroup * RASTER_MESH_WORKGROUP_SIZE + localIndex;
 
-#if FRUSTUM_CULLING_MODE == FRUSTUM_CULLING_AT_DIST
-  // if culling is already performed we use the subset of splats
+#if FRUSTUM_CULLING_MODE == FRUSTUM_CULLING_AT_DIST && USE_GPU_DIST_SORT
+  // Distance compute (GPU radix / stochastic) fills instanceCount after culling
   const uint splatCount = indirectBuffer[0].instanceCount;
 #else
-  // otherwise we use all the splats
   const uint splatCount = frameInfo.splatCount;
 #endif
-  const uint outputQuadCount = min(RASTER_MESH_WORKGROUP_SIZE, splatCount - groupID.x * RASTER_MESH_WORKGROUP_SIZE);
+  const uint groupBase       = linearGroup * RASTER_MESH_WORKGROUP_SIZE;
+  const uint outputQuadCount = groupBase < splatCount ? min(RASTER_MESH_WORKGROUP_SIZE, splatCount - groupBase) : 0;
 
   if(localIndex == 0)
   {
@@ -140,14 +188,8 @@ void main(uint3                                             groupThreadID: SV_Gr
   {
     // Access sorted indices via bindless device address
     // Explicit 64-bit byte offset to avoid 32-bit overflow at ~1G visible splats
-    uint64_t       byteOffset   = uint64_t(baseIndex) * uint64_t(sizeof(uint32_t));
-    const uint32_t globalSplatID = *(uint32_t*)(uint64_t(assets.splatSortingIndicesAddress) + byteOffset);
-   
-#if STOCHASTIC_SPLAT || NEED_SURFACE_INFO
-    // emit the splat ID for stochastic rendering or surface reconstruction
-    prims[localIndex * 2 + 0].outSplatId = globalSplatID;
-    prims[localIndex * 2 + 1].outSplatId = globalSplatID;
-#endif
+    uint64_t       byteOffset    = uint64_t(baseIndex) * uint64_t(sizeof(uint32_t));
+    const uint32_t globalSplatID = *(uint32_t*)(assets.splatSortingIndicesAddress + byteOffset);
 
     // Resolve global splat ID to correct descriptor and local index
     SplatSetDesc splatSetDesc;
@@ -157,6 +199,13 @@ void main(uint3                                             groupThreadID: SV_Gr
     // emit primitives (triangles) as soon as possible
     tris[localIndex * 2 + 0] = uint3(0, 2, 1) + localIndex * 4;
     tris[localIndex * 2 + 1] = uint3(2, 0, 3) + localIndex * 4;
+
+#if MESH_SHADER_PER_PRIMITIVE_ATTRIBS && (STOCHASTIC_SPLAT || NEED_SURFACE_INFO)
+    // NVIDIA: emit the splat ID per-primitive as soon as possible. The non-NVIDIA path emits it
+    // per-vertex at the end (see header / Slang #7019).
+    prims[localIndex * 2 + 0].outSplatId = globalSplatID;
+    prims[localIndex * 2 + 1].outSplatId = globalSplatID;
+#endif
 
     // Fetches are done as needed to allow early exit (culling)
     float4 splatColor = fetchColor(splatSetDesc, splatIndex);
@@ -192,24 +241,19 @@ void main(uint3                                             groupThreadID: SV_Gr
     // the vertices of the quad
     const float2 positions[4] = { float2(-1.0, -1.0), float2(1.0, -1.0), float2(1.0, 1.0), float2(-1.0, 1.0) };
 
-#if !USE_BARYCENTRIC
-    // emit per vertex attributes as soon as possible
-    [unroll]
-    for(uint i = 0; i < 4; ++i)
-    {
-      // Scale the fragment position data we send to the fragment shader
-      verts[localIndex * 4 + i].outFragPos = positions[i].xy * sqrt8;
-    }
-#endif
-
 #if SHOW_SH_ONLY == 1
     splatColor.rgb = float3(0.5, 0.5, 0.5);
 #endif
 
 #if NEED_SURFACE_INFO
+#if QUANTIZE_NORMALS
+    uint splatNormalPacked = 0;
+#else
+    float3 splatNormal = float3(0.0);
+#endif
     {
       // Create particle struct for normal computation (position, scale, rotation only)
-      ThreedgrtParticle particle = ThreedgrtParticle(splatSetDesc, splatIndex, true);
+      ThreedgsParticle particle = ThreedgsParticle(splatSetDesc, splatIndex, true);
 
       // Camera position in model space (inverse transform)
       const float3 modelCameraPos = mul(float4(frameInfo.cameraPosition, 1.0), splatSetDesc.transformInverse).xyz;
@@ -223,13 +267,20 @@ void main(uint3                                             groupThreadID: SV_Gr
       float3 normalWorld = normalize(mul(float4(normalModel, 0.0), splatSetDesc.transform).xyz);
 #if QUANTIZE_NORMALS
       // Pack normal using octahedral encoding (32-bit)
-      const uint packedNormal = encodeNormalOctahedral(normalWorld);
-
-      prims[localIndex * 2 + 0].outSplatNormalPacked = packedNormal;
-      prims[localIndex * 2 + 1].outSplatNormalPacked = packedNormal;
+      splatNormalPacked = encodeNormalOctahedral(normalWorld);
 #else
-      prims[localIndex * 2 + 0].outSplatNormal = normalWorld;
-      prims[localIndex * 2 + 1].outSplatNormal = normalWorld;
+      splatNormal = normalWorld;
+#endif
+
+#if MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+      // NVIDIA: emit the normal per-primitive (integration reference)
+#if QUANTIZE_NORMALS
+      prims[localIndex * 2 + 0].outSplatNormalPacked = splatNormalPacked;
+      prims[localIndex * 2 + 1].outSplatNormalPacked = splatNormalPacked;
+#else
+      prims[localIndex * 2 + 0].outSplatNormal = splatNormal;
+      prims[localIndex * 2 + 1].outSplatNormal = splatNormal;
+#endif
 #endif
     }
 #endif
@@ -242,9 +293,9 @@ void main(uint3                                             groupThreadID: SV_Gr
 
     splatColor.rgb += fetchViewDependentRadiance(splatSetDesc, frameInfo.shDegree, splatIndex, worldViewDir);
 
+#if MESH_SHADER_PER_PRIMITIVE_ATTRIBS && MS_ANTIALIASING == 0
     // emit per primitive color as early as possible for perf reasons,
     // only for original 3DGS, see later on for MipSplatting
-#if MS_ANTIALIASING == 0
     prims[localIndex * 2 + 0].outSplatCol = splatColor;
     prims[localIndex * 2 + 1].outSplatCol = splatColor;
 #endif
@@ -264,7 +315,7 @@ void main(uint3                                             groupThreadID: SV_Gr
       return;
     }
 
-#if MS_ANTIALIASING == 1
+#if MESH_SHADER_PER_PRIMITIVE_ATTRIBS && MS_ANTIALIASING == 1
     // emit the color with alpha compensation after threedgsProjectedExtentBasis modified splatColor.a
     prims[localIndex * 2 + 0].outSplatCol = splatColor;
     prims[localIndex * 2 + 1].outSplatCol = splatColor;
@@ -286,6 +337,23 @@ void main(uint3                                             groupThreadID: SV_Gr
       const float4 quadPos = float4(ndcCenter.xy + ndcOffset, ndcCenter.z, 1.0);
 
       verts[localIndex * 4 + i].position = quadPos;
+#if !USE_BARYCENTRIC
+      verts[localIndex * 4 + i].outFragPos = fragPos.xy * sqrt8;
+#endif
+#if !MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+      // Non-NVIDIA: emit the flat attributes per-vertex (duplicated); see header / Slang #7019
+      verts[localIndex * 4 + i].outSplatCol = splatColor;
+#if STOCHASTIC_SPLAT || NEED_SURFACE_INFO
+      verts[localIndex * 4 + i].outSplatId = globalSplatID;
+#endif
+#if NEED_SURFACE_INFO
+#if QUANTIZE_NORMALS
+      verts[localIndex * 4 + i].outSplatNormalPacked = splatNormalPacked;
+#else
+      verts[localIndex * 4 + i].outSplatNormal = splatNormal;
+#endif
+#endif
+#endif
     }
   }
 }

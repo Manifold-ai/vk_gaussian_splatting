@@ -36,6 +36,7 @@ public:
   {
     eTriangles = 0,
     eAabbs     = 1,
+    eSpheres   = 2,
   };
 
   struct CreateInfo
@@ -45,10 +46,12 @@ public:
     VkDeviceSize vertexBufferSize = 0;
     VkDeviceSize indexBufferSize  = 0;
     VkDeviceSize aabbBufferSize   = 0;
+    VkDeviceSize radiusBufferSize = 0;
 
     uint32_t vertexCount = 0;
     uint32_t indexCount  = 0;
     uint32_t aabbCount   = 0;
+    uint32_t sphereCount = 0;
 
     VkDeviceSize vertexStride = 0;
     VkFormat     vertexFormat = VK_FORMAT_UNDEFINED;
@@ -65,9 +68,11 @@ public:
     VkDeviceSize                         vertexBufferSize = 0;
     VkDeviceSize                         indexBufferSize  = 0;
     VkDeviceSize                         aabbBufferSize   = 0;
+    VkDeviceSize                         radiusBufferSize = 0;
     uint32_t                             vertexCount      = 0;
     uint32_t                             indexCount       = 0;
     uint32_t                             aabbCount        = 0;
+    uint32_t                             sphereCount      = 0;
     VkDeviceSize                         vertexStride     = 0;
     VkFormat                             vertexFormat     = VK_FORMAT_UNDEFINED;
     VkBuildAccelerationStructureFlagsKHR blasBuildFlags   = 0;
@@ -93,10 +98,12 @@ public:
   VkResult updateBlasAndTlas(const RecordComputeFn& recordComputeUpdate);
 
   void deinitAccelerationStructures();
+  void releaseTlasBuildBuffers();
 
   VkDeviceAddress getVertexBufferAddress() const { return m_vertexBuffer.address; }
   VkDeviceAddress getIndexBufferAddress() const { return m_indexBuffer.address; }
   VkDeviceAddress getAabbBufferAddress() const { return m_aabbBuffer.address; }
+  VkDeviceAddress getRadiusBufferAddress() const { return m_radiusBuffer.address; }
   VkDeviceAddress getInstanceBufferAddress() const { return m_tlasInstancesBuffer.address; }
   VkDeviceSize    getInstanceBufferSize() const { return m_tlasInstancesBuffer.bufferSize; }
   VkDeviceSize    getTlasScratchBufferSize() const { return m_tlasScratchBuffer.bufferSize; }
@@ -124,6 +131,7 @@ private:
   nvvk::LargeBuffer m_vertexBuffer{};
   nvvk::LargeBuffer m_indexBuffer{};
   nvvk::LargeBuffer m_aabbBuffer{};
+  nvvk::LargeBuffer m_radiusBuffer{};
 
   nvvk::LargeBuffer m_tlasInstancesBuffer{};
   nvvk::LargeBuffer m_blasScratchBuffer{};
@@ -134,6 +142,10 @@ private:
 
   nvvk::AccelerationStructureBuildData m_tlasBuildData{};
   nvvk::AccelerationStructure          m_tlas{};
+
+  // Persistent storage for sphere geometry pNext data (must outlive the BLAS build).
+  // Mutable because it is populated in makeGeometryInfo() which is const.
+  mutable VkAccelerationStructureGeometrySpheresDataNV m_sphereGeometryData{};
 
   CreateInfo m_createInfo{};
 };

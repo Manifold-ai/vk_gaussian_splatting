@@ -23,22 +23,41 @@ static const int   PAYLOAD_INVALID_ID   = -1;
 static const float PAYLOAD_INF_DISTANCE = asfloat(0x7F7FFFFF);
 
 static const bool kStochasticSort = (RTX_TRACE_STRATEGY == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
-static const bool kWireframe   = (WIREFRAME != 0);
-static const int  kPayloadSize = PAYLOAD_ARRAY_SIZE;
+static const bool kWireframe     = (WIREFRAME != 0);
 
-typedef HitPayloadGeneric<kStochasticSort, kWireframe, kPayloadSize> HitPayload;
+// Each payload array is independently sized to minimize register pressure:
+//   kDistSize: max(SPP, meshPayloadSlots) — dist[] holds mesh packed hit data (11 or 15 slots) or particle distances
+//   kIdSize:   max(SPP, 2 if meshes)      — id[] holds SPP particle IDs + mesh needs id[0]=objId, id[1]=matId
+//   kSppSize:  PARTICLES_SPP              — splatSetIdx[] is particle-only; stochastic color/normal are per-sample
+static const int kDistSize = PAYLOAD_ARRAY_SIZE;
+static const int kSppSize  = PARTICLES_SPP;
+#if RTX_HAS_MESHES && PARTICLES_SPP < 2
+static const int kIdSize   = 2;    // Mesh closest-hit needs id[0]=objId, id[1]=matId
+#else
+static const int kIdSize   = PARTICLES_SPP;
+#endif
 
-// the payload structure used for both Particle and Mesh tracing
-struct HitPayloadGeneric<let kStochasticSplat : bool = false, let kWireframe : bool = false, let kSize : int>
+typedef HitPayloadGeneric<kStochasticSort, kWireframe, kDistSize, kIdSize, kSppSize> HitPayload;
+
+// Payload structure shared by Particle and Mesh tracing.
+// Array sizes are decoupled so that mesh hit packing (which needs many dist[] slots)
+// does not inflate particle-only arrays (splatSetIdx[], stochastic color/normal).
+struct HitPayloadGeneric<let kStochasticSplat : bool = false, let kWireframe : bool = false,
+                         let kDistSize : int, let kIdSize : int = kDistSize, let kSppSize : int = kDistSize>
 {
-  int   id[kSize];
-  float dist[kSize];
-  uint  tlasInstanceOffset;  // Base offset for current TLAS (multi-TLAS support)
+  // Particle tracing: indexed by [0..SPP-1] in all three arrays.
+  // Mesh closest-hit: packs hit data into dist[0..meshSlots-1], id[0]=objId, id[1]=matId.
+  int   id[kIdSize];            // Particle: local splat ID | Mesh: objId + matId (2 entries)
+  int   splatSetIdx[kSppSize];  // Particle-only: splat set descriptor index (meshes never use this)
+  float dist[kDistSize];        // Particle: hit distances | Mesh: packed hit data (11 or 15 slots)
+  uint  currentSplatSetInstance;  // Current splat-set-instance descriptor index (RTX_USE_INSTANCES mode)
+  uint  rayBounce;                // Bounce index: 0 = primary camera ray, >0 = secondary (reflection/refraction/shadow)
 
-  // Raygen-provided seed for stochastic any-hit
+  // Stochastic any-hit: color and normal are computed in the any-hit shader and stored per sample.
+  // Sized by kSppSize (not kDistSize) since mesh hit packing does not use these.
   Conditional<uint, kStochasticSplat>   rngSeed;
-  Conditional<float4, kStochasticSplat> color[kSize];
-  Conditional<float3, kStochasticSplat> normal[kSize];
+  Conditional<float4, kStochasticSplat> color[kSppSize];
+  Conditional<float3, kStochasticSplat> normal[kSppSize];
 
   Conditional<float3, kWireframe> differentialX;
   Conditional<float3, kWireframe> differentialY;

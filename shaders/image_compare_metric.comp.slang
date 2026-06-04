@@ -24,13 +24,14 @@
  * - MSE (Mean Squared Error) and PSNR (Peak Signal-to-Noise Ratio)
  * - FLIP (Finding Least Important Pixels) - perceptual metric
  * 
- * Each thread processes one pixel and atomically accumulates normalized contributions.
- * Normalization is done in shader BEFORE fixed-point conversion to prevent uint32 overflow
- * while maintaining precision using 1e9 multiplier.
+ * MSE uses workgroup shared-memory reduction for full float precision within each
+ * 16x16 workgroup, then one atomic add per workgroup (multiplier 10000).
+ * Normalization by (W*H*3) is done on the CPU.
+ * Safe for PSNR > ~18 dB at 4K, > ~24 dB at 8K (uint32 overflow limit).
  * 
  * Result buffer layout (3 uint32 values):
- *   [0] MSE value (fixed-point * 1e9, already normalized, just denormalize on CPU)
- *   [4] Reserved (pixel counting removed for optimization)
+ *   [0] MSE sum (fixed-point * 10000, NOT normalized — divide by 10000 and W*H*3 on CPU)
+ *   [4] Reserved
  *   [8] FLIP value (fixed-point * 1e9, already normalized, just denormalize on CPU)
  *
  * ============================================================================
@@ -80,58 +81,75 @@
 // Main Compute Shader
 //==============================================================================
 
+static const uint WG_SIZE     = 256;  // 16 * 16
+static const float MSE_MULTIPLIER = 10000.0;
+
+groupshared float sharedMse[WG_SIZE];
+
 [shader("compute")]
 [numthreads(16, 16, 1)]
-void main(uint3 threadID: SV_DispatchThreadID)
+void main(uint3 threadID: SV_DispatchThreadID, uint3 localID: SV_GroupThreadID)
 {
+  uint localIdx = localID.y * 16 + localID.x;
+
   int2 captureSize = pushC.captureImgSize;
   int2 currentSize = pushC.currentImgSize;
   int2 pixelCoord  = int2(threadID.xy);
 
-  // Check bounds for capture image
-  if(pixelCoord.x >= captureSize.x || pixelCoord.y >= captureSize.y)
-    return;
+  bool   inBounds = (pixelCoord.x < captureSize.x && pixelCoord.y < captureSize.y);
+  float4 refColor = float4(0, 0, 0, 0);
+  float4 curColor = float4(0, 0, 0, 0);
+  float2 uv       = float2(0, 0);
 
-  // Sample capture image
-  float4 refColor = captureImage.Load(int3(pixelCoord, 0));
-
-  // Calculate UV for current image (may have different size)
-  float2 uv = (float2(pixelCoord) + 0.5) / float2(captureSize);
-
-  // Sample current image
-  float4 curColor;
-  if(all(currentSize == captureSize))
+  if(inBounds)
   {
-    curColor = currentImage.Load(int3(pixelCoord, 0));
-  }
-  else
-  {
-    curColor = currentImage.SampleLevel(linearSampler, uv, 0);
+    refColor = captureImage.Load(int3(pixelCoord, 0));
+    uv       = (float2(pixelCoord) + 0.5) / float2(captureSize);
+
+    if(all(currentSize == captureSize))
+    {
+      curColor = currentImage.Load(int3(pixelCoord, 0));
+    }
+    else
+    {
+      curColor = currentImage.SampleLevel(linearSampler, uv, 0);
+    }
   }
 
   //============================================================================
-  // MSE Computation (Mean Squared Error)
+  // MSE Computation — Workgroup Reduction
   //============================================================================
 
-  // Compute squared error for RGB channels
+  // Compute squared error (0 for out-of-bounds threads)
   float3 diff         = refColor.rgb - curColor.rgb;
-  float  squaredError = dot(diff, diff);  // sum of squared differences for R, G, B
+  float  squaredError = inBounds ? dot(diff, diff) : 0.0;
 
-  // Normalize by pre-calculated divider (width * height * 3) BEFORE fixed-point conversion
-  // This prevents uint32 overflow while maintaining precision with 1e9 multiplier
-  float mseContribution = squaredError / pushC.sampleDivider;
+  // Write to shared memory and reduce within workgroup (full float precision)
+  sharedMse[localIdx] = squaredError;
+  GroupMemoryBarrierWithGroupSync();
 
-  // Convert to fixed-point (multiply by 1e9 for precision)
-  // Max value per pixel after normalization: 3.0 / (N*3) = 1/N
-  // Max sum over all pixels: N * (1/N) * 1e9 = 1e9 (fits in uint32)
-  uint mseFixed = uint(mseContribution * 1000000000.0);
+  for(uint stride = WG_SIZE / 2; stride > 0; stride >>= 1)
+  {
+    if(localIdx < stride)
+      sharedMse[localIdx] += sharedMse[localIdx + stride];
+    GroupMemoryBarrierWithGroupSync();
+  }
 
-  // Atomically accumulate normalized MSE into result buffer
-  resultBuffer.InterlockedAdd(0, mseFixed);
+  // Thread 0 converts workgroup sum to fixed-point and does one atomic add.
+  // MSE_MULTIPLIER = 10000. Overflow safe for PSNR > ~18 dB at 4K, > ~24 dB at 8K.
+  // Normalization (divide by W*H*3) is done on CPU after readback.
+  if(localIdx == 0)
+  {
+    uint mseFixed = uint(sharedMse[0] * MSE_MULTIPLIER);
+    resultBuffer.InterlockedAdd(0, mseFixed);
+  }
 
   //============================================================================
   // FLIP Computation (Mode-Dependent)
   //============================================================================
+
+  if(!inBounds)
+    return;
 
   // Only compute FLIP if not disabled
   if(int(pushC.flipMode) != FLIPMode_Disabled)

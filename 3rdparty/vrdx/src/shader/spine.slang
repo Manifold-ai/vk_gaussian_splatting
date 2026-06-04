@@ -60,23 +60,32 @@ void main(uint3 groupThreadID: SV_GroupThreadID, uint3 groupId: SV_GroupID,
   }
 
   if (radix == 0) {
-    // one workgroup is responsible for global histogram prefix sum
+    // one workgroup is responsible for global histogram prefix sum.
+    //
+    // WORKGROUP_SIZE (512) > RADIX (256), so only half the workgroup has a
+    // valid global-histogram entry. The (index < RADIX) guard must wrap ONLY
+    // the memory access, never the GroupMemoryBarrierWithGroupSync() calls:
+    // a workgroup control barrier must be reached by every thread, otherwise
+    // the threads with index >= RADIX exit early and the rest deadlock. NVIDIA
+    // tolerates the divergent barrier, but it is undefined behavior and hangs
+    // on Intel iGPUs. Lanes with index >= RADIX feed 0 into the wave ops, which
+    // leaves the prefix-sum result unchanged.
+    uint value = index < RADIX ? globalHistogram[RADIX * pass + index] : 0;
+    uint excl = WavePrefixSum(value);
+    uint sum = WaveActiveSum(value);
+
+    if (WaveIsFirstLane()) {
+      intermediate[waveIndex] = sum;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
+    if (index < RADIX / laneCount) {
+      uint excl = WavePrefixSum(intermediate[index]);
+      intermediate[index] = excl;
+    }
+    GroupMemoryBarrierWithGroupSync();
+
     if (index < RADIX) {
-      uint value = globalHistogram[RADIX * pass + index];
-      uint excl = WavePrefixSum(value);
-      uint sum = WaveActiveSum(value);
-
-      if (WaveIsFirstLane()) {
-        intermediate[waveIndex] = sum;
-      }
-      GroupMemoryBarrierWithGroupSync();
-
-      if (index < RADIX / laneCount) {
-        uint excl = WavePrefixSum(intermediate[index]);
-        intermediate[index] = excl;
-      }
-      GroupMemoryBarrierWithGroupSync();
-
       excl += intermediate[waveIndex];
       globalHistogram[RADIX * pass + index] = excl;
     }

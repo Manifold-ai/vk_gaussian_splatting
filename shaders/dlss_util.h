@@ -60,28 +60,24 @@ float3 EnvBRDFApprox2(float3 SpecularColor, float alpha, float NoV)
   return mad(SpecularColor, max(0, scale), max(0, bias));
 }
 
-// Function to calculate 2D motion vectors for DLSS denoising
-inline float2 calculateMotionVector(float3   worldPos,    // Current world-space hit position
-                                    float4x4 prevMVP,     // Previous frame's Model-View-Projection matrix
-                                    float4x4 currentMVP,  // Current frame's Model-View-Projection matrix
-                                    float2   resolution)    // Render target resolution
+// Calculate 2D motion vectors for DLSS denoising.
+// Supports both camera motion (prevMVP != currentMVP) and object motion (prevWorldPos != currentWorldPos).
+inline float2 calculateMotionVector(float3   currentWorldPos,  // Current frame world-space hit position
+                                    float3   prevWorldPos,  // Previous frame world-space hit position (object motion)
+                                    float4x4 prevMVP,       // Previous frame's View-Projection matrix
+                                    float4x4 currentMVP,    // Current frame's View-Projection matrix
+                                    float2   resolution)      // Render target resolution
 {
-  // Transform current world position to clip space for current frame
-  float4 currentClipPos = mul(float4(worldPos, 1.0f), currentMVP);
+  float4 currentClipPos = mul(float4(currentWorldPos, 1.0f), currentMVP);
   currentClipPos /= currentClipPos.w;
 
-  // Transform current world position to clip space for previous frame
-  float4 prevClipPos = mul(float4(worldPos, 1.0f), prevMVP);
+  float4 prevClipPos = mul(float4(prevWorldPos, 1.0f), prevMVP);
   prevClipPos /= prevClipPos.w;
 
-  // Convert clip space coordinates to screen space (0 to 1 range)
   float2 currentScreenPos = float2(currentClipPos.xy) * 0.5f + 0.5f;
   float2 prevScreenPos    = float2(prevClipPos.xy) * 0.5f + 0.5f;
 
-  // Calculate motion vector in screen space
   float2 motionVector = prevScreenPos - currentScreenPos;
-
-  // Scale motion vector to pixel space
   motionVector *= resolution;
 
   return motionVector;

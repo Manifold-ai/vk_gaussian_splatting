@@ -60,6 +60,8 @@ $$t_{\text{hit}} = \frac{-\mathbf{o}_c \cdot \mathbf{d}_c}{\mathbf{d}_c \cdot \m
 
 where $\mathbf{o}_c$ and $\mathbf{d}_c$ are the ray origin and direction in canonical (unit-sphere) space.
 
+**Billboard particle depth (AABB or stochastic any-hit).** When **Particle depth** is set to **Billboard (3DGS/3DGUT)**, the stored distance is the ray–billboard-plane intersection instead of the max-density point. This matches rasterization depth and is required for hybrid pipelines that must align RTX primary rays with the 3DGS training objective. See [Billboard Ray Tracing](./billboard_ray_tracing.md) for the full implementation.
+
 #### 1.4.2. Rasterization mode
 
 In rasterization mode, the distance used for a single particle hit is the distance to the screen-aligned billboard that passes through the particle center. It is simply the value of the depth for the given fragment, transformed back to world coordinates. The result can thus be used to compute lighting in world coordinates and is compatible with the ray tracing pipeline in hybrid mode.
@@ -237,6 +239,22 @@ The `Particle shadow threshold` (`shadowTransmittanceThreshold`) controls how ma
 Integrating multiple samples (up to the payload size) on shadow rays also enables colored transmittance at shadow edges. This stained-glass tint effect is controlled by the `Colored shadow strength` parameter, combined with a `Particle shadow threshold` lower than 0.99.
 
 ![Ray tracing colored shadow control through the Colored Shadow Strength and Particle Shadow Threshold parameters — soft shadows with light radius 0.09](../images/threed_gaussian_raytracing_shadows_color_hard_and_soft_shadows.png)
+
+### 4.1. Ambient Occlusion for Emissive Splat Sets
+
+Splat sets are emissive by default — their radiance is baked in and does not interact with scene lighting. When a splat set is used as an environment around mesh geometry, the emissive contribution has no occlusion: meshes appear to float without contact darkening. The **Particle emissive AO** feature addresses this by attenuating the emissive radiance of splat sets when nearby meshes occlude the hemisphere above the splat surface.
+
+The algorithm works as follows. At each pixel where a splat set contributes emissive radiance, a single cosine-weighted hemisphere ray is traced from the integrated surface position along a random direction aligned with the integrated normal. The ray is traced against the mesh TLAS only — splat-to-splat occlusion is not evaluated. If the ray hits a mesh within the configured radius, the emissive contribution is darkened proportionally to the proximity of the hit.
+
+Because only one stochastic sample is taken per pixel per frame, the result is noisy on a single frame but converges quickly via temporal accumulation. This makes the feature essentially free in interactive use and produces smooth, stable AO after a few accumulated frames.
+
+Three parameters control the effect (available in **Renderer > Properties > Ray tracing** when lighting is enabled and meshes are present):
+
+*   **Particle emissive AO** (checkbox) — Enables or disables the feature. Toggling this recompiles the ray tracing shaders since it controls a compile-time macro (`PARTICLE_AO_ENABLED`).
+*   **Particle emissive AO radius** — The maximum distance of the hemisphere sampling rays. Controls how far from the surface mesh occlusion is detected. Default is 0.05.
+*   **Particle emissive AO strength** — Intensity of the darkening effect. 0 = no darkening, 1 = full occlusion at contact, values above 1 exaggerate the darkening zone further from the occluding mesh.
+
+The AO applies to the emissive term of both pure-emissive and shaded (PBR) splat sets. For shaded splat sets, the PBR lighting path already handles light occlusion via NEE shadow rays, but the emissive term — which represents the baked-in radiance — has no other occlusion mechanism.
 
 ## 5. Lighting, Shadows and Shading in the Hybrid Pipelines
 

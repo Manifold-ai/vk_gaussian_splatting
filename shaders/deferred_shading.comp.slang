@@ -21,7 +21,8 @@
 // Reads GBuffers (depth, normal, splat ID, color) and performs lighting
 
 #include "shaderio.h"
-#include "wavefront.h.slang"
+#include "color.h.slang"
+#include "shading.h.slang"
 
 // clang-format off
 [[vk::binding(BINDING_FRAME_INFO_UBO, 0)]]      ConstantBuffer<FrameInfo>   frameInfo;
@@ -88,20 +89,19 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
   // Reconstruct world position
   float3 worldPos = reconstructWorldPos(pixelF, ndcDepth, float2(viewport));
 
-  // Read base color from appropriate buffer based on temporal accumulation state
+  // Read base color from appropriate buffer based on temporal accumulation state.
+  // Splat radiance is trained against sRGB display — convert to linear for PBR shading.
   float4 baseColor = useAuxBuffer ? colorBufferAux[pixel] : colorBufferMain[pixel];
-  float3 baseRadiance = baseColor.rgb;
+  float3 baseRadiance = srgbToLinear(baseColor.rgb);
 
   // Read splat ID and get material from splat set
   uint globalSplatId = splatIdBuffer[pixel];
   
   // Default material
-  ObjMaterial mat = {};
-  mat.diffuse     = float3(0.8, 0.8, 0.8);
-  mat.ambient     = float3(0.1, 0.1, 0.1);
-  mat.specular    = float3(0.0, 0.0, 0.0);
-  mat.shininess   = 32.0;
-  mat.needShading = 1;  // Default material needs lighting
+  Material mat = {};
+  mat.baseColor   = float3(0.8, 0.8, 0.8);
+  mat.roughness   = 0.5;
+  mat.needShading = 1;
 
   // Look up material from splat set if valid
   if(globalSplatId != 0xFFFFFFFF && assets.globalIndexTableAddress != 0)
@@ -114,18 +114,15 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
       SplatSetDesc splatSetDesc = assets.splatSetDescriptors[entry.splatSetIndex];
       
       // Set up material for lighting computation (same as raygen shader)
-      mat.diffuse     = baseRadiance * splatSetDesc.material.diffuse;
-      mat.ambient     = baseRadiance * splatSetDesc.material.ambient;
-      mat.specular    = baseRadiance * splatSetDesc.material.specular;
-      mat.shininess   = splatSetDesc.material.shininess;
-      mat.emission    = baseRadiance * splatSetDesc.material.emission;
-      mat.needShading = splatSetDesc.material.needShading;
+      mat             = splatSetDesc.material;
+      mat.baseColor   = baseRadiance * splatSetDesc.material.baseColor;
+      mat.emissive    = baseRadiance * splatSetDesc.material.emissive * splatSetDesc.material.emissiveStrength;
     }
   }
   else
   {
-    // No valid splat ID - use base color as diffuse
-    mat.diffuse = baseRadiance;
+    // No valid splat ID - use base color
+    mat.baseColor = baseRadiance;
   }
 
   // Compute view direction
@@ -133,7 +130,7 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
 
 #if (LIGHTING_MODE != LIGHTING_DISABLED)
   // Initialize output color with emission
-  float3 color = mat.emission;
+  float3 color = mat.emissive;
 
   // Only apply lighting if material needs it (has diffuse, ambient, or specular)
   if((mat.needShading != 0))
@@ -141,8 +138,10 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
     // Apply lighting from each light source (no shadows in pure rasterization)
     for(uint i = 0; i < assets.lightCount; ++i)
     {
+      if(assets.lights[i].enabled == 0)
+        continue;
       bool inShadow = false;  // No shadow rays in rasterization
-      wavefrontComputeShadingDirectOnly(assets.lights[i], worldPos, normal, mat, viewDir, inShadow, double3(1.0), color);
+      wavefrontComputeShadingDirectOnly(assets.lights[i], worldPos, normal, mat, viewDir, inShadow, float3(1.0), color);
     }
 
     if(assets.lightCount == 0)
@@ -150,13 +149,13 @@ void main(uint3 dispatchThreadID : SV_DispatchThreadID)
       // No lights in scene - use headlight (camera-attached point light)
       const LightSource headlight = createHeadlight(frameInfo.cameraPosition);
       bool              inShadow  = false;
-      wavefrontComputeShadingDirectOnly(headlight, worldPos, normal, mat, viewDir, inShadow, double3(1.0), color);
+      wavefrontComputeShadingDirectOnly(headlight, worldPos, normal, mat, viewDir, inShadow, float3(1.0), color);
     }
   }
 #else
   // Shading disabled - keep raw splat color (baseRadiance contains the actual splat color)
   // Only emissive-only materials (light proxies) show emission instead
-  float3 color = (mat.needShading != 0) ? baseRadiance : mat.emission;
+  float3 color = (mat.needShading != 0) ? baseRadiance : mat.emissive;
 #endif
 
   // Output final shaded color to appropriate buffer

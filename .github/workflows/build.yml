@@ -2,8 +2,6 @@ name: Build
 
 on:
   push:
-    branches:
-      - gh-pages-test  # temporary, for testing — remove before merging
     tags:
       - '[0-9]*'
   workflow_dispatch:
@@ -12,7 +10,7 @@ permissions:
   contents: write
 
 env:
-  VULKAN_SDK_VERSION: 1.4.304.0
+  VULKAN_SDK_VERSION: 1.4.341.1
 
 jobs:
   build:
@@ -45,29 +43,48 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $url = "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/windows/VulkanSDK-${{ env.VULKAN_SDK_VERSION }}-Installer.exe"
-          Write-Host "Downloading Vulkan SDK from $url"
-          Invoke-WebRequest -Uri $url -OutFile VulkanSDK-Installer.exe
+          $versionedUrl = "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/windows/vulkansdk-windows-X64-${{ env.VULKAN_SDK_VERSION }}.exe"
+          $fallbackUrl = "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/windows/vulkan_sdk.exe"
+          $installerPath = "VulkanSDK-Installer.exe"
+
+          try {
+            Write-Host "Downloading Vulkan SDK from $versionedUrl"
+            Invoke-WebRequest -Uri $versionedUrl -OutFile $installerPath
+          }
+          catch {
+            Write-Host "Versioned Windows installer URL failed, falling back to $fallbackUrl"
+            Invoke-WebRequest -Uri $fallbackUrl -OutFile $installerPath
+          }
+
           Write-Host "Installing Vulkan SDK..."
-          Start-Process -FilePath .\VulkanSDK-Installer.exe -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait
+          Start-Process -FilePath ".\$installerPath" -ArgumentList "--accept-licenses --default-answer --confirm-command install" -Wait
           $sdkPath = "C:\VulkanSDK\${{ env.VULKAN_SDK_VERSION }}"
           echo "VULKAN_SDK=$sdkPath" >> $env:GITHUB_ENV
+          echo "Vulkan_ROOT=$sdkPath" >> $env:GITHUB_ENV
           echo "$sdkPath\Bin" >> $env:GITHUB_PATH
 
       - name: Install Vulkan SDK (Linux)
         if: runner.os == 'Linux'
         run: |
-          wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc
-          sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan-noble.list https://packages.lunarg.com/vulkan/lunarg-vulkan-noble.list
-          sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
+          curl -L "https://sdk.lunarg.com/sdk/download/${{ env.VULKAN_SDK_VERSION }}/linux/vulkan_sdk.tar.xz" -o vulkan_sdk.tar.xz
+          mkdir -p "${HOME}/vulkan-sdk"
+          tar -xf vulkan_sdk.tar.xz -C "${HOME}/vulkan-sdk"
+          sdkPath="${HOME}/vulkan-sdk/${{ env.VULKAN_SDK_VERSION }}/x86_64"
+          if [ ! -d "${sdkPath}" ]; then
+            echo "Expected Vulkan SDK path not found: ${sdkPath}"
+            exit 1
+          fi
+          echo "VULKAN_SDK=${sdkPath}" >> "$GITHUB_ENV"
+          echo "Vulkan_ROOT=${sdkPath}" >> "$GITHUB_ENV"
+          echo "${sdkPath}/bin" >> "$GITHUB_PATH"
 
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get install -y \
             libx11-dev libxcb1-dev libxcb-keysyms1-dev libxcursor-dev \
-            libxi-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libtbb-dev
+            libxi-dev libxinerama-dev libxrandr-dev libxxf86vm-dev libtbb-dev \
+            libgl1-mesa-dev
 
       - name: Configure
         run: >
@@ -75,6 +92,8 @@ jobs:
           -DCMAKE_BUILD_TYPE=Release
           -DDISABLE_DEFAULT_SCENE=ON
           -DDISABLE_MESH_ASSETS_DOWNLOAD=ON
+          -DVulkan_ROOT="${{ env.Vulkan_ROOT }}"
+          -DCMAKE_PREFIX_PATH="${{ env.Vulkan_ROOT }}"
 
       - name: Build
         run: cmake --build build --config Release --parallel

@@ -23,21 +23,24 @@
 #include "shaderio.h"
 #include "cameras.h.slang"
 #include "color.h.slang"
-#include "wavefront.h.slang"
+#include "shading.h.slang"
 #include "wireframe_extended.h.slang"
 
 #include "threedgs_particle_storage.h.slang"
 #include "threedgrt.h.slang"
 #include "threedgrt_payload.h.slang"
-
-// #DLSS - DLSS utilities
-#include "dlss_util.h"
+#if RTX_HAS_MESHES
+#include "mesh_hit_packing.h.slang"
+#endif
 
 // clang-format off
 [[vk::binding(RTX_BINDING_OUTIMAGE, 1)]] RWTexture2D<float4> image;
 [[vk::binding(RTX_BINDING_AUX1, 1)]] RWTexture2D<float4> imageAux;
 [[vk::binding(RTX_BINDING_OUTDEPTH, 1)]] RWTexture2D<float> depthBuffer;
-[[vk::binding(RTX_BINDING_DLSS_OUT_IMAGES, 1)]] RWTexture2D<float4> outImages[]; // DLSS 
+#if DLSS_ENABLED
+#include "dlss_util.h"
+[[vk::binding(RTX_BINDING_DLSS_OUT_IMAGES, 1)]] RWTexture2D<float4> outImages[];
+#endif
 
 [[vk::binding(BINDING_FRAME_INFO_UBO, 0)]] ConstantBuffer<FrameInfo> frameInfo;
 [[vk::push_constant]] ConstantBuffer<PushConstantRay> pcRay;
@@ -54,6 +57,19 @@
 
 // Bindless assets (contains lights, mesh descriptors, splat descriptors, TLAS addresses)
 [[vk::binding(BINDING_ASSETS, 0)]] ConstantBuffer<SceneAssets> assets;
+
+// Environment equirectangular texture (sky or HDR IBL)
+[[vk::binding(RTX_BINDING_SKY_TEXTURE, 1)]] Sampler2D skyTexture;
+
+#if LIGHTING_MODE != LIGHTING_DISABLED
+// HDR importance sampling acceleration buffer
+[[vk::binding(RTX_BINDING_ENV_ACCEL, 1)]] StructuredBuffer<EnvAccel> envAccelBuffer;
+#endif
+
+#if RTX_HAS_MESHES
+// Mesh material textures (base color, metallic-roughness, normal, emissive, occlusion)
+[[vk::binding(BINDING_MESH_TEXTURES, 0)]] Sampler2D meshTextures[];
+#endif
 
 // clang-format on
 
@@ -84,6 +100,9 @@ struct PixelData
   float3 meshHitWorldNrm = {};
   int    meshHitObjId    = PAYLOAD_INVALID_ID;
   int    meshHitMatId    = PAYLOAD_INVALID_ID;
+  float2 meshHitUV       = {};
+  float2 meshHitUV1      = {};
+  float4 meshHitTangent  = {};
 
 
   double3 transmittance = double3(1.0);  // mesh + particle transmittance
@@ -110,17 +129,23 @@ struct PixelData
   float3  closestParticleWeight        = float3(0.0f);
   double3 closestParticleTransmittance = float3(1.0f);
   float3  closestParticleRadiance      = float3(0.0f);  // vdp radiance for the particle, no weighting
+
+  // Mesh wireframe (saved from mesh trace before particle passes overwrite payload)
+  float meshWireframeDist  = PAYLOAD_INF_DISTANCE;
+  float meshWireframeAlpha = 0.0;
 };
 
-// Structure to accumulate DLSS guide data
+#if DLSS_ENABLED
 struct DlssGuideData
 {
-  float4 albedo          = float4(0.0, 0.0, 0.0, 1.0);  // Diffuse albedo + opacity
-  float3 specularAlbedo  = float3(0.0);                 // Specular reflectance (minimal for Gaussians)
-  float4 normalRoughness = float4(0.0, 0.0, 0.0, 0.9);  // World-space normal (xyz) + roughness (w)
-  float3 hitPosition     = float3(0.0);                 // World-space hit position for motion vectors
-  bool   isValid         = false;                       // Whether we have valid data
+  float4 albedo          = float4(0.0, 0.0, 0.0, 1.0);
+  float3 specularAlbedo  = float3(0.0);
+  float4 normalRoughness = float4(0.0, 0.0, 0.0, 0.9);
+  float3 hitPosition     = float3(0.0);
+  float3 prevHitPosition = float3(0.0);  // Previous frame's world position (for object motion vectors)
+  bool   isValid         = false;
 };
+#endif
 
 // -----------------------------------------------------------------------------
 // Trace profile collection (shader feedback extension)
@@ -169,11 +194,9 @@ void main()
 
   // center of the pixel
   float2 subPixelOffset = 0.5;
-  // Apply jitter for DLSS
-  if(pcRay.useDlss == 1)
-  {
-    subPixelOffset += pcRay.jitter;
-  }
+#if DLSS_ENABLED
+  subPixelOffset += pcRay.jitter;
+#endif
 
   // generate the ray for this pixel
 #if CAMERA_TYPE == CAMERA_PINHOLE
@@ -201,8 +224,9 @@ void main()
   // clockStart is performed by constructor
   PixelData pixel = {};
 
-  // Initialize guide data collection
+#if DLSS_ENABLED
   DlssGuideData dlssGuide = {};
+#endif
 
   // Reconstruct the state of ray tracing as if it did trace primary rays
   // We copy the information from the rasterization
@@ -227,10 +251,14 @@ void main()
   // Initialize the random number for stochastic ray marching
   uint seedRayPass = xxhash32(uint3(launchID, frameInfo.frameSampleId));
 
-  int bounce = 0;  // id of the bounce
-  int done   = 1;  // continue on next bounce or stop if done
+  int   bounce      = 0;      // id of the bounce
+  int   done        = 1;      // continue on next bounce or stop if done
+  float lastBrdfPdf = DIRAC;  // BRDF sampling PDF from last bounce (for env miss MIS)
 
   const bool isFeedbackPixel = all(launchID == frameInfo.cursor);
+#if DLSS_ENABLED
+  const float3 cameraOrigin = rayOrigin;  // Save before bounce loop modifies rayOrigin
+#endif
 
   // Reset trace profile buffer for the feedback pixel (cursor)
 #if TRACE_PROFILE
@@ -243,16 +271,16 @@ void main()
   // bounce loop
   while(true)
   {
-    // each new bounce reinits Tmin/Tmax
-    float tMin               = 0.001;
-    float tMax               = 10000.0;
+    float tMin               = (bounce == 0) ? frameInfo.nearFar.x : frameInfo.rtxSecondaryRayOffset;
+    float tMax               = frameInfo.nearFar.y;
     float rayLastHitDistance = max(0.0f, tMin - epsT);
 
+#if RTX_HAS_MESHES
     // trace the mesh with one closest hit if needed
     if(assets.meshCount > 0)
     {
       // if mesh hit, will modify Tmax, so splat tracing if any will be on reduced range later on
-      traceBounceRayMeshes(bounce, tMin, tMax, rayOrigin, rayDirection, pcRay.meshDepthOnly, payload, dlssGuide, pixel);
+      traceBounceRayMeshes(bounce, tMin, tMax, rayOrigin, rayDirection, pcRay.meshDepthOnly, payload, pixel);
 
 #if HYBRID_ENABLED
       // Early return if meshDepthOnly pre-pass
@@ -279,7 +307,9 @@ void main()
       }
 #endif
     }
+#endif  // RTX_HAS_MESHES
 
+#if RTX_HAS_PARTICLES
     // when hybrid is enabled, we trace the particles only for secondary rays
 #if HYBRID_ENABLED
     const float3 radianceBeforeParticles = (bounce > 0) ? pixel.radiance : float3(0.0);
@@ -288,22 +318,37 @@ void main()
 #else
     const float3 radianceBeforeParticles = pixel.radiance;
 #endif
-      // Check if we have any splat instances to trace
       if(assets.totalGlobalSplatCount > 0)
       {
-        // trace the gaussians with multi-pass any hit
-        traceBounceRayParticles(bounce, tMin, tMax, rayOrigin, rayDirection, seedRayPass, payload, dlssGuide, pixel, isFeedbackPixel);
+        traceBounceRayParticles(bounce, tMin, tMax, rayOrigin, rayDirection, seedRayPass, payload, pixel, isFeedbackPixel);
       }
 
 #if HYBRID_ENABLED
     }  // End bounce 0 skip
 #endif
+#else
+    const float3 radianceBeforeParticles = pixel.radiance;
+#endif  // RTX_HAS_PARTICLES
 
-    evaluateLightingAndShadingForBounce(bounce, pixel, done, rayOrigin, rayDirection, seedRayPass, payload, radianceBeforeParticles);
+    evaluateLightingAndShadingForBounce(bounce, pixel, done, rayOrigin, rayDirection, seedRayPass, payload,
+                                        radianceBeforeParticles, lastBrdfPdf);
+
+    // Mesh wireframe overlay — applied after mesh shading so we blend with the shaded mesh color.
+    // Particle wireframe is handled separately inside the particle pass loop (before this point).
+    // Only show mesh wireframe when the mesh is in front of (or there is no) particle surface.
+#if WIREFRAME
+    if(bounce == 0 && pixel.meshWireframeAlpha > 0.0 && (pixel.isoSurfDepth <= 0.0 || pixel.meshHitDist <= pixel.isoSurfDepth))
+    {
+      pixel.radiance      = lerp(pixel.radiance, float3(1.0, 0.0, 0.0), pixel.meshWireframeAlpha);
+      pixel.transmittance = double3(0.0);
+    }
+#endif
 
     if(bounce == 0)
     {
-      populateDlssGuides(pixel, dlssGuide);
+#if DLSS_ENABLED
+      populateDlssGuides(pixel, cameraOrigin, dlssGuide);
+#endif
 
       // shader feedback (TODO rename attributes for better coherence)
       if(all(launchID == frameInfo.cursor))
@@ -313,7 +358,7 @@ void main()
         indirectBuffer[0].splatSetId                   = pixel.closestSplatSetId;        // Splat set index
         indirectBuffer[0].particleHitCount             = pixel.hitCount;
         indirectBuffer[0].particleRadiance             = pixel.radiance;
-        indirectBuffer[0].particleTransmittance        = pixel.transmittance;
+        indirectBuffer[0].particleTransmittance        = float3(pixel.transmittance);
         indirectBuffer[0].particleDist                 = pixel.closestParticleDist;
         indirectBuffer[0].particleNormal               = pixel.closestParticleNormal;
         indirectBuffer[0].particleIntegratedDist       = pixel.isoSurfDepth;
@@ -329,21 +374,75 @@ void main()
     if(done == 1 || bounce > frameInfo.rtxMaxBounces)
       break;
 
+    // Russian roulette: probabilistically terminate low-energy paths after minimum depth
+    if(bounce >= 2)
+    {
+      float rrThroughput = float(maxComponent(pixel.transmittance));
+      float rrProb       = min(rrThroughput + 0.001, 0.95);
+      if(rand(seedRayPass) >= rrProb)
+        break;
+      pixel.transmittance /= double(rrProb);
+    }
+
     // prepare for next iteration
-    // new rayOrigin and direction was set by evaluateLightingAndShadingForBounce
-    // Next iteration will stop if a reflective/refractive material isn't hit
     done = 1;
 
   }  // while(true) - end bounce loop
 
+  // Add environment background contribution through remaining transmittance.
+  // Covers both full miss and partial transparency from semi-transparent splats.
+  // When the last bounce used BSDF sampling, apply MIS weight to avoid
+  // double-counting with the NEE environment sample from that bounce.
+  if(frameInfo.envMode != ENV_MODE_NONE && maxComponent(pixel.transmittance) > double(frameInfo.minSplatSetCompositeTransmittance))
+  {
+    float3 envDir = rayDirection;
+    if(frameInfo.envMode == ENV_MODE_HDR)
+      envDir = applyEnvRotation(envDir, frameInfo.envRotation);
+
+    float2 skyUV = (frameInfo.envMode == ENV_MODE_HDR) ? directionToHdrEquirectUV(envDir) : directionToEquirectUV(envDir);
+    float3 skyColor = skyTexture.SampleLevel(skyUV, 0).rgb;
+    if(frameInfo.envMode == ENV_MODE_HDR)
+      skyColor *= frameInfo.envIntensity;
+
+    float misWeight   = 1.0;
+    bool  envLighting = (frameInfo.envEnabled != 0);
+    if(envLighting && lastBrdfPdf > 0.0)
+    {
+      float envPdf = 0.0;
+      if(frameInfo.envMode == ENV_MODE_SKY)
+      {
+        float3 dirZUp = float3(rayDirection.x, rayDirection.z, rayDirection.y);
+        envPdf        = samplePhysicalSkyPDF(frameInfo.skyParams, dirZUp);
+      }
+      else
+      {
+        // PDF is stored in alpha channel of the HDR texture by HdrIbl
+        float4 texVal = skyTexture.SampleLevel(skyUV, 0.0);
+        envPdf        = texVal.a;
+      }
+      misWeight = lastBrdfPdf / (lastBrdfPdf + envPdf);
+    }
+
+    pixel.radiance += float3(pixel.transmittance) * skyColor * misWeight;
+  }
+
+#if DLSS_ENABLED
   writeToGBuffers<VISUALIZE, HYBRID_ENABLED>(frameInfo, launchSizeFloat, launchID, pixel, depthBuffer, image, imageAux,
-                                             pcRay.useDlss, dlssGuide, outImages);
+                                             dlssGuide, outImages);
+#else
+  writeToGBuffers<VISUALIZE, HYBRID_ENABLED>(frameInfo, launchSizeFloat, launchID, pixel, depthBuffer, image, imageAux);
+#endif
 }
 
 #if HYBRID_ENABLED
 // Initialize RTX state from rasterization pass results
 // Reconstructs pixel state as if primary rays were traced
-void initRtxStateFromRasterPass(inout PixelData pixel, in uint2 launchID, in float2 launchIdFloat, in float2 launchSizeFloat, in float3 rayOrigin, in float3 rayDirection)
+void initRtxStateFromRasterPass(inout PixelData pixel,
+                                in uint2        launchID,
+                                in float2       launchIdFloat,
+                                in float2       launchSizeFloat,
+                                in float3       rayOrigin,
+                                in float3       rayDirection)
 {
   // Initialize isoSurfDepth to infinity - will be set to actual value if valid splat data exists
   // This ensures mesh-only pixels correctly fall through to mesh path in comparisons
@@ -356,6 +455,7 @@ void initRtxStateFromRasterPass(inout PixelData pixel, in uint2 launchID, in flo
     rasterPassPixel = imageAux[launchID];
   pixel.radiance      = rasterPassPixel.xyz;
   pixel.transmittance = double3(1.0 - rasterPassPixel.w);
+  pixel.unlitAlbedo   = rasterPassPixel.xyz;  // SH-evaluated color serves as albedo for DLSS guides
 
   // --- Init depth related fields ---
   // Read NDC depth from appropriate buffer and reconstruct world position
@@ -406,11 +506,11 @@ void initRtxStateFromRasterPass(inout PixelData pixel, in uint2 launchID, in flo
     float3 rayDirView = mul(float4(rayDirection, 0), frameInfo.viewMatrix).xyz;
 
     // Picked depth
-    float4 clipPosPicked  = float4(0, 0, ndcDepthPicked, 1.0);
-    float4 viewPosPicked  = mul(clipPosPicked, frameInfo.projInverse);
-    float  viewZPicked    = viewPosPicked.z / viewPosPicked.w;
-    float  linearDist     = viewZPicked / rayDirView.z;
-    float3 worldPos       = rayOrigin + linearDist * rayDirection;
+    float4 clipPosPicked = float4(0, 0, ndcDepthPicked, 1.0);
+    float4 viewPosPicked = mul(clipPosPicked, frameInfo.projInverse);
+    float  viewZPicked   = viewPosPicked.z / viewPosPicked.w;
+    float  linearDist    = viewZPicked / rayDirView.z;
+    float3 worldPos      = rayOrigin + linearDist * rayDirection;
 
     pixel.isoSurfDepth         = linearDist;
     pixel.isoSurfPos           = worldPos;
@@ -435,14 +535,14 @@ void initRtxStateFromRasterPass(inout PixelData pixel, in uint2 launchID, in flo
   {
     // Use the global index table to resolve to splat set and local index
     // 64-bit byte offset to prevent overflow when globalSplatId > ~537M (buffer > 4 GB)
-    uint64_t byteOffset = uint64_t(globalSplatId) * uint64_t(sizeof(GlobalSplatIndexEntry));
-    GlobalSplatIndexEntry entry   = *(GlobalSplatIndexEntry*)(assets.globalIndexTableAddress + byteOffset);
-    pixel.isoSurfSplatSetId       = int(entry.splatSetIndex);
-    pixel.isoSurfSplatId          = int(entry.splatIndex);
-    pixel.closestParticleFound    = true;
-    pixel.closestParticleGlobalId = int(globalSplatId);
-    pixel.closestParticleId       = int(entry.splatIndex);
-    pixel.closestSplatSetId       = int(entry.splatSetIndex);
+    uint64_t              byteOffset = uint64_t(globalSplatId) * uint64_t(sizeof(GlobalSplatIndexEntry));
+    GlobalSplatIndexEntry entry      = *(GlobalSplatIndexEntry*)(assets.globalIndexTableAddress + byteOffset);
+    pixel.isoSurfSplatSetId          = int(entry.splatSetIndex);
+    pixel.isoSurfSplatId             = int(entry.splatIndex);
+    pixel.closestParticleFound       = true;
+    pixel.closestParticleGlobalId    = int(globalSplatId);
+    pixel.closestParticleId          = int(entry.splatIndex);
+    pixel.closestSplatSetId          = int(entry.splatSetIndex);
   }
 
   float4 rasterNormal = rasterNormalBuffer[launchID];
@@ -492,15 +592,15 @@ void discardSplatContribution(inout PixelData pixel)
 
 #endif
 
-void traceBounceRayMeshes(in int              bounce,
-                          in float            tMin,
-                          inout float         tMax,
-                          in float3           rayOrigin,
-                          in float3           rayDirection,
-                          in bool             meshDepthOnly,
-                          inout HitPayload    payload,
-                          inout DlssGuideData dlssGuide,
-                          inout PixelData     pixel)
+#if RTX_HAS_MESHES
+void traceBounceRayMeshes(in int           bounce,
+                          in float         tMin,
+                          inout float      tMax,
+                          in float3        rayOrigin,
+                          in float3        rayDirection,
+                          in bool          meshDepthOnly,
+                          inout HitPayload payload,
+                          inout PixelData  pixel)
 {
   if(bounce > 0)
   {
@@ -509,11 +609,19 @@ void traceBounceRayMeshes(in int              bounce,
     pixel.meshHitWorldNrm = {};
     pixel.meshHitObjId    = PAYLOAD_INVALID_ID;
     pixel.meshHitMatId    = PAYLOAD_INVALID_ID;
+    pixel.meshHitUV       = {};
+    pixel.meshHitTangent  = {};
   }
 
   payload.dist[0] = PAYLOAD_INF_DISTANCE;
   payload.id[0]   = PAYLOAD_INVALID_ID;
   payload.id[1]   = PAYLOAD_INVALID_ID;
+
+  // Init wireframe fields before mesh trace (rchit will write them if it hits an edge)
+#if WIREFRAME
+  payload.wireframeDist.set(PAYLOAD_INF_DISTANCE);
+  payload.wireframeAlpha.set(0.0);
+#endif
 
   RayDesc rayMesh;
   rayMesh.Origin    = rayOrigin;
@@ -533,17 +641,28 @@ void traceBounceRayMeshes(in int              bounce,
 
   pixel.meshHitDist = payload.dist[0];
 
+  // Save mesh wireframe before particle passes overwrite the payload fields
+#if WIREFRAME
+  pixel.meshWireframeDist  = payload.wireframeDist.get().value;
+  pixel.meshWireframeAlpha = payload.wireframeAlpha.get().value;
+#endif
+
   // store hit results
   if(pixel.meshHitDist < PAYLOAD_INF_DISTANCE)
   {
-    tMax = pixel.meshHitDist;
-    // collect info to compute shading and potential new ray later on
+    int         objId, matId;
+    MeshHitData hit = unpackMeshHitFromPayload(payload.dist, payload.id, objId, matId);
+
+    tMax                  = hit.hitT;
     pixel.meshHit         = true;
-    pixel.meshHitObjId    = payload.id[0];
-    pixel.meshHitMatId    = payload.id[1];
-    pixel.meshHitWorldPos = float3(payload.dist[1], payload.dist[2], payload.dist[3]);
-    pixel.meshHitWorldNrm = float3(payload.dist[4], payload.dist[5], payload.dist[6]);
-    //
+    pixel.meshHitObjId    = objId;
+    pixel.meshHitMatId    = matId;
+    pixel.meshHitWorldPos = hit.worldPos;
+    pixel.meshHitWorldNrm = hit.worldNrm;
+    pixel.meshHitUV       = hit.uv0;
+    pixel.meshHitTangent  = float4(hit.tangentDir, hit.tangentW);
+    pixel.meshHitUV1      = hit.uv1;
+
     if(bounce == 0)
     {
       pixel.primaryHitDist = tMax;
@@ -551,17 +670,18 @@ void traceBounceRayMeshes(in int              bounce,
     }
   }
 }
+#endif  // RTX_HAS_MESHES
 
-void traceBounceRayParticles(in int              bounce,
-                             in float            tMin,
-                             in float            tMax,
-                             in float3           rayOrigin,
-                             in float3           rayDirection,
-                             inout uint          seedRayPass,
-                             inout HitPayload    payload,
-                             inout DlssGuideData dlssGuide,
-                             inout PixelData     pixel,
-                             in bool             isFeedbackPixel)
+#if RTX_HAS_PARTICLES
+void traceBounceRayParticles(in int           bounce,
+                             in float         tMin,
+                             in float         tMax,
+                             in float3        rayOrigin,
+                             in float3        rayDirection,
+                             inout uint       seedRayPass,
+                             inout HitPayload payload,
+                             inout PixelData  pixel,
+                             in bool          isFeedbackPixel)
 {
 
   // For bounce > 0, reset integration tracking (primary depth is saved in PixelData for final write)
@@ -607,7 +727,8 @@ void traceRayParticles<let kStochasticSort : bool, let kStochasticPass : bool>(i
   else
 #endif
   {
-    traceRayParticlesInsertionSort<kStochasticPass>(bounce, tMin, tMax, rayOrigin, rayDirection, seedRayPass, payload, pixel, isFeedbackPixel);
+    traceRayParticlesInsertionSort<kStochasticPass>(bounce, tMin, tMax, rayOrigin, rayDirection, seedRayPass, payload,
+                                                    pixel, isFeedbackPixel);
   }
 };
 
@@ -638,8 +759,9 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
     [[unroll]]
     for(int i = 0; i < PARTICLES_SPP; ++i)
     {
-      payload.id[i]   = PAYLOAD_INVALID_ID;
-      payload.dist[i] = PAYLOAD_INF_DISTANCE;
+      payload.id[i]          = PAYLOAD_INVALID_ID;
+      payload.splatSetIdx[i] = PAYLOAD_INVALID_ID;
+      payload.dist[i]        = PAYLOAD_INF_DISTANCE;
     }
 
 #if WIREFRAME
@@ -656,13 +778,30 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
     raySplat.TMax      = tMax + epsT;
 
     // Trace against all splat TLAS structures (multi-TLAS support for large scenes)
-    traceRayAllSplatTlas(raySplat, rayFlags, payload);
+    payload.rayBounce = uint(bounce);
+#if RTX_PARTICLE_DEPTH == PARTICLE_DEPTH_BILLBOARD && RTX_USE_AABBS
+    const uint particleSbtOffset = (bounce == 0) ? 1 : 0;
+#else
+    const uint particleSbtOffset = 0;
+#endif
+    traceRayAllSplatTlas(raySplat, rayFlags, payload, particleSbtOffset);
 
     const int firstId = payload.id[0];
 
-    // no more hits found
+    // no particle hits found
     if(firstId == PAYLOAD_INVALID_ID)
     {
+#if WIREFRAME
+      // In AABB billboard mode many rays hit only the AABB edge (for wireframe) but not the
+      // particle acceptance test. Those rays still carry a valid wireframe alpha from any-hit.
+      // Blend it before leaving the pass; otherwise only rays with particle hits show edges.
+      if(bounce == 0 && !wireframeDone && payload.wireframeAlpha.get().value > 0.0)
+      {
+        pixel.radiance      = lerp(pixel.radiance, float3(1.0, 0.0, 0.0), payload.wireframeAlpha.get().value);
+        pixel.transmittance = double3(0.0);  // opaque
+        wireframeDone       = true;
+      }
+#endif
       break;
     }
 
@@ -673,49 +812,71 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
 #endif
 
     // evaluate the sorted hits
+    SplatSetDesc* rtxDescs = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+
     [[unroll]]
     for(int i = 0; i < PARTICLES_SPP; ++i)
     {
-      const uint  globalSplatID = payload.id[i];
-      const float dist          = payload.dist[i];
+      const int   localSplatID = payload.id[i];
+      const int   descIdx      = payload.splatSetIdx[i];
+      const float dist         = payload.dist[i];
 
-      if((globalSplatID != PAYLOAD_INVALID_ID) && (maxComponent(pixel.transmittance) > double(frameInfo.minTransmittance)))
+      if((localSplatID != PAYLOAD_INVALID_ID) && (maxComponent(pixel.transmittance) > double(frameInfo.minTransmittance)))
       {
 #if RTX_TRACE_STRATEGY == RTX_TRACE_STRATEGY_PASS_STOCHASTIC
         // Track the farthest valid payload slot seen so far.
         lastValidHitIdx = i;
 #endif
 
-        // 64-bit byte offset to prevent overflow when globalSplatID > ~537M (buffer > 4 GB)
-        uint64_t              gitByteOffset    = uint64_t(globalSplatID) * uint64_t(sizeof(GlobalSplatIndexEntry));
-        GlobalSplatIndexEntry entry            = *(GlobalSplatIndexEntry*)(assets.globalIndexTableAddress + gitByteOffset);
-        SplatSetDesc          hitSplatSetDesc = assets.splatSetDescriptors[entry.splatSetIndex];
-        const int             splatId         = int(entry.splatIndex);
+        SplatSetDesc hitSplatSetDesc = rtxDescs[descIdx];
+        const int    splatId         = localSplatID;
 
         // rays are in world space
-        // We need to transform to the splat set's model space for particleProcessHit
+        // We need to transform to the splat set's model space for threedgrtProcessHit
+        // Direction is intentionally NOT normalized: with D_local = M_inv_3x3 * D_world,
+        // the parametric t from billboard mode directly equals world-space distance,
+        // keeping hits from differently-transformed sets directly comparable.
         const float3 hitSplatSetModelRayOrigin = mul(float4(rayOrigin, 1.0), hitSplatSetDesc.transformInverse).xyz;
-        const float3 hitSplatSetModelRayDirection = normalize(mul(rayDirection, hitSplatSetDesc.transformRotScaleInverse));
+        const float3 hitSplatSetModelRayDirection = mul(rayDirection, hitSplatSetDesc.transformRotScaleInverse);
 
         float3 normalWorld;
         float  alpha            = 0.0;
         float3 weight           = float3(0.0);
         float3 particleRadiance = float3(0.0);
 
-        const bool acceptedHit =
-            particleProcessHit<(NEED_SURFACE_INFO != 0)>(frameInfo, hitSplatSetDesc, hitSplatSetModelRayOrigin,
-                                                         hitSplatSetModelRayDirection, hitSplatSetDesc.transformRotScaleInverse,
-                                                         splatId, dist, alpha, particleRadiance, normalWorld);
+        bool acceptedHit;
+#if RTX_PARTICLE_DEPTH == PARTICLE_DEPTH_BILLBOARD
+        if(bounce == 0)
+        {
+          acceptedHit = threedgsProcessHit<(NEED_SURFACE_INFO != 0)>(frameInfo, hitSplatSetDesc, hitSplatSetModelRayOrigin,
+                                                                     hitSplatSetModelRayDirection,
+                                                                     hitSplatSetDesc.transformRotScaleInverse, splatId,
+                                                                     dist, alpha, particleRadiance, normalWorld);
+        }
+        else
+#endif
+        {
+          acceptedHit = threedgrtProcessHit<(NEED_SURFACE_INFO != 0)>(frameInfo, hitSplatSetDesc, hitSplatSetModelRayOrigin,
+                                                                      hitSplatSetModelRayDirection,
+                                                                      hitSplatSetDesc.transformRotScaleInverse, splatId,
+                                                                      alpha, particleRadiance, normalWorld);
+        }
 
         if(acceptedHit)
         {
-          particleIntegrate(alpha, particleRadiance, pixel.transmittance, pixel.radiance, weight);
+          threedgrtIntegrate(alpha, particleRadiance, pixel.transmittance, pixel.radiance, weight);
           pixel.hitCount++;
 
 #if TRACE_PROFILE
           if(isFeedbackPixel)
           {
-            collectHitProfile(globalSplatID, dist, alpha, particleRadiance, pixel.transmittance, float3(pixel.radiance));
+#if RTX_USE_INSTANCES
+            collectHitProfile(uint(int(hitSplatSetDesc.globalSplatBase) + splatId), dist, alpha, particleRadiance,
+                              pixel.transmittance, float3(pixel.radiance));
+#else
+            collectHitProfile(uint(int(hitSplatSetDesc.globalSplatBase) + splatId - int(hitSplatSetDesc.splatBase)),
+                              dist, alpha, particleRadiance, pixel.transmittance, float3(pixel.radiance));
+#endif
           }
 #endif
 
@@ -729,7 +890,7 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
           bool shouldUpdateDepth = (pixel.isoSurfDepth == 0.0 && pixel.transmittance.x < double(frameInfo.depthIsoThresholdRTX));
           if(shouldUpdateDepth)
           {
-            pixel.isoSurfSplatSetId = entry.splatSetIndex;
+            pixel.isoSurfSplatSetId = descIdx;
             pixel.isoSurfSplatId    = splatId;
             pixel.isoSurfDepth      = dist;
             pixel.isoSurfPos        = rayOrigin + dist * rayDirection;
@@ -743,11 +904,15 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
           //
           if(bounce == 0 && !pixel.closestParticleFound)
           {
-            // store info for debug feedback and alternative visualizations
-            pixel.closestParticleFound         = true;
-            pixel.closestParticleGlobalId      = globalSplatID;        // Global ID
-            pixel.closestParticleId            = splatId;              // Local ID (entry.splatIndex)
-            pixel.closestSplatSetId            = entry.splatSetIndex;  // Splat set index
+            pixel.closestParticleFound = true;
+#if RTX_USE_INSTANCES
+            pixel.closestParticleGlobalId = int(hitSplatSetDesc.globalSplatBase) + splatId;
+#else
+            // Per-model chunks: globalSplatBase already includes splatBase, so subtract to avoid double-counting
+            pixel.closestParticleGlobalId = int(hitSplatSetDesc.globalSplatBase) + splatId - int(hitSplatSetDesc.splatBase);
+#endif
+            pixel.closestParticleId            = splatId;
+            pixel.closestSplatSetId            = descIdx;
             pixel.closestParticleDist          = dist;
             pixel.closestParticleNormal        = normalWorld;
             pixel.closestParticleAlpha         = alpha;
@@ -768,20 +933,16 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
       if(rand(seedRayPass) < opacity)
       {
         pixel.radiance = pixel.radiance / opacity;
-        // if iso density surface not found we use farthest point, we do refetch the entry, not optimal
+        // if iso density surface not found we use farthest point
         if(pixel.isoSurfDepth == 0.0)
         {
-          const uint            globalSplatID = payload.id[lastValidHitIdx];
-          const float           dist          = payload.dist[lastValidHitIdx];
-          // 64-bit byte offset to prevent overflow when globalSplatID > ~537M (buffer > 4 GB)
-          uint64_t              gitByteOffset = uint64_t(globalSplatID) * uint64_t(sizeof(GlobalSplatIndexEntry));
-          GlobalSplatIndexEntry entry         = *(GlobalSplatIndexEntry*)(assets.globalIndexTableAddress + gitByteOffset);
-          SplatSetDesc          hitSplatSetDesc = assets.splatSetDescriptors[entry.splatSetIndex];
-          const int             splatId         = int(entry.splatIndex);
-          pixel.isoSurfSplatSetId               = entry.splatSetIndex;
-          pixel.isoSurfSplatId                  = splatId;
-          pixel.isoSurfDepth                    = dist;
-          pixel.isoSurfPos                      = rayOrigin + dist * rayDirection;
+          const int   lastDescIdx = payload.splatSetIdx[lastValidHitIdx];
+          const int   lastSplatId = payload.id[lastValidHitIdx];
+          const float dist        = payload.dist[lastValidHitIdx];
+          pixel.isoSurfSplatSetId = lastDescIdx;
+          pixel.isoSurfSplatId    = lastSplatId;
+          pixel.isoSurfDepth      = dist;
+          pixel.isoSurfPos        = rayOrigin + dist * rayDirection;
           if((bounce == 0) && (dist < pixel.primaryHitDist))
           {
             pixel.primaryHitDist = dist;
@@ -801,6 +962,8 @@ void traceRayParticlesInsertionSort<let kStochasticPass : bool>(in int          
 #endif
 
 #if WIREFRAME
+    // Particle wireframe overlay (blends with accumulated particle radiance)
+    // Mesh wireframe is handled separately after mesh shading in the bounce loop.
     if(bounce == 0 && !wireframeDone
 #if DISABLE_OPACITY_GAUSSIAN
        && payload.wireframeDist.get().value <= pixel.closestParticleDist
@@ -838,8 +1001,9 @@ void traceRayParticlesStochasticSort(in int           bounce,
   [[unroll]]
   for(int i = 0; i < PARTICLES_SPP; ++i)
   {
-    payload.id[i]   = PAYLOAD_INVALID_ID;
-    payload.dist[i] = PAYLOAD_INF_DISTANCE;
+    payload.id[i]          = PAYLOAD_INVALID_ID;
+    payload.splatSetIdx[i] = PAYLOAD_INVALID_ID;
+    payload.dist[i]        = PAYLOAD_INF_DISTANCE;
     payload.color[i].set(float4(0.0f));
     payload.normal[i].set(float3(0.0f));
   }
@@ -855,27 +1019,33 @@ void traceRayParticlesStochasticSort(in int           bounce,
   raySplat.TMax      = tMax + epsT;
 
   // Trace against all splat TLAS structures (multi-TLAS support for large scenes)
-  traceRayAllSplatTlas(raySplat, rayFlags, payload);
+  payload.rayBounce = uint(bounce);
+#if RTX_PARTICLE_DEPTH == PARTICLE_DEPTH_BILLBOARD && RTX_USE_AABBS
+  const uint particleSbtOffset = (bounce == 0) ? 1 : 0;
+#else
+  const uint particleSbtOffset = 0;
+#endif
+  traceRayAllSplatTlas(raySplat, rayFlags, payload, particleSbtOffset);
 
   float3 passRadianceSum = float3(0.0);
   float3 passNormalSum   = float3(0.0);
   float  passAlphaSum    = 0.0f;
   int    passSampleCount = 0;
 
-  float  closestDist          = PAYLOAD_INF_DISTANCE;
-  int    closestGlobalSplatId = PAYLOAD_INVALID_ID;
-  float3 closestNormal        = float3(0.0);
-  float3 closestPos           = float3(0.0);
-  float3 closestUnlit         = float3(0.0);
+  float  closestDist    = PAYLOAD_INF_DISTANCE;
+  int    closestDescIdx = PAYLOAD_INVALID_ID;
+  int    closestLocalId = PAYLOAD_INVALID_ID;
+  float3 closestNormal  = float3(0.0);
+  float3 closestPos     = float3(0.0);
+  float3 closestUnlit   = float3(0.0);
 
   [[unroll]]
   for(int i = 0; i < PARTICLES_SPP; ++i)
   {
-    const int   globalSplatID = payload.id[i];
-    const float dist          = payload.dist[i];
+    const int   localSplatID = payload.id[i];
+    const float dist         = payload.dist[i];
 
-    // This would never occur
-    if(globalSplatID == PAYLOAD_INVALID_ID)
+    if(localSplatID == PAYLOAD_INVALID_ID)
     {
       continue;
     }
@@ -898,11 +1068,12 @@ void traceRayParticlesStochasticSort(in int           bounce,
 
     if(dist < closestDist)
     {
-      closestDist          = dist;
-      closestGlobalSplatId = globalSplatID;
-      closestNormal        = sampleNormal;
-      closestPos           = rayOrigin + dist * rayDirection;
-      closestUnlit         = sampleRadiance;
+      closestDist    = dist;
+      closestDescIdx = payload.splatSetIdx[i];
+      closestLocalId = localSplatID;
+      closestNormal  = sampleNormal;
+      closestPos     = rayOrigin + dist * rayDirection;
+      closestUnlit   = sampleRadiance;
     }
   }
 
@@ -914,18 +1085,14 @@ void traceRayParticlesStochasticSort(in int           bounce,
     totalSampleCount += passSampleCount;
   }
 
-  if(closestGlobalSplatId != PAYLOAD_INVALID_ID)
+  if(closestDescIdx != PAYLOAD_INVALID_ID)
   {
-    // Note: this re-fetches GlobalSplatIndexEntry that was already fetched in the anyhit.
-    // We accept this single cached buffer load per pixel rather than enlarging the payload
-    // with extra fields (which would increase register pressure for all rays including shadows).
-    // 64-bit byte offset to prevent overflow when closestGlobalSplatId > ~537M (buffer > 4 GB)
-    uint64_t              closestByteOffset = uint64_t(closestGlobalSplatId) * uint64_t(sizeof(GlobalSplatIndexEntry));
-    GlobalSplatIndexEntry closestEntry      = *(GlobalSplatIndexEntry*)(assets.globalIndexTableAddress + closestByteOffset);
-    pixel.isoSurfSplatSetId            = closestEntry.splatSetIndex;
-    pixel.isoSurfSplatId               = int(closestEntry.splatIndex);
-    pixel.isoSurfDepth                 = closestDist;
-    pixel.isoSurfPos                   = closestPos;
+    SplatSetDesc* rtxDescs = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+
+    pixel.isoSurfSplatSetId = closestDescIdx;
+    pixel.isoSurfSplatId    = closestLocalId;
+    pixel.isoSurfDepth      = closestDist;
+    pixel.isoSurfPos        = closestPos;
 
     if((bounce == 0) && (closestDist < pixel.primaryHitDist))
     {
@@ -935,10 +1102,15 @@ void traceRayParticlesStochasticSort(in int           bounce,
 
     if(bounce == 0)
     {
-      pixel.closestParticleFound         = true;
-      pixel.closestParticleGlobalId      = closestGlobalSplatId;
-      pixel.closestParticleId            = pixel.isoSurfSplatId;
-      pixel.closestSplatSetId            = pixel.isoSurfSplatSetId;
+      pixel.closestParticleFound = true;
+#if RTX_USE_INSTANCES
+      pixel.closestParticleGlobalId = int(rtxDescs[closestDescIdx].globalSplatBase) + closestLocalId;
+#else
+      pixel.closestParticleGlobalId =
+          int(rtxDescs[closestDescIdx].globalSplatBase) + closestLocalId - int(rtxDescs[closestDescIdx].splatBase);
+#endif
+      pixel.closestParticleId            = closestLocalId;
+      pixel.closestSplatSetId            = closestDescIdx;
       pixel.closestParticleDist          = closestDist;
       pixel.closestParticleNormal        = closestNormal;
       pixel.closestParticleAlpha         = 1.0f;
@@ -952,9 +1124,9 @@ void traceRayParticlesStochasticSort(in int           bounce,
   {
     const float3 stochasticRadiance = totalRadianceSum / float(totalSampleCount);
     const float  avgAlpha           = totalAlphaSum / float(totalSampleCount);
-    pixel.radiance      += float3(pixel.transmittance) * stochasticRadiance;
+    pixel.radiance += float3(pixel.transmittance) * stochasticRadiance;
     pixel.transmittance *= double3(1.0 - avgAlpha);
-    pixel.unlitAlbedo    = stochasticRadiance;
+    pixel.unlitAlbedo      = stochasticRadiance;
     const float3 avgNormal = totalNormalSum / float(totalSampleCount);
     pixel.integratedNormal = (length(avgNormal) > 0.0) ? normalize(avgNormal) : float3(0.0);
   }
@@ -963,25 +1135,55 @@ void traceRayParticlesStochasticSort(in int           bounce,
 
 // Helper to trace against all splat TLAS in the array (multi-TLAS support for large scenes)
 // Traces against all TLAS structures until payload is full or all TLAS have been checked
-void traceRayAllSplatTlas(in RayDesc ray, in uint rayFlags, inout HitPayload payload)
+void traceRayAllSplatTlas(in RayDesc ray, in uint rayFlags, inout HitPayload payload, uint sbtRecordOffset = 0)
 {
-  // Get TLAS address and offset arrays
-  uint64_t* tlasAddresses = (uint64_t*)assets.splatSetTlasArrayAddress;
-  uint32_t* tlasOffsets   = (uint32_t*)assets.splatSetTlasOffsetAddress;
+#if RTX_USE_INSTANCES
+  // Per-particle instanced mode: iterate over per-chunk descriptors (one per instance × TLAS chunk).
+  // Each descriptor carries per-instance transform + per-chunk TLAS address.
+  // One shared TLAS per unique asset; the per-instance global transform is applied to the ray.
+  SplatSetDesc* rtxDescs = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+  uint rtxCount = (assets.splatSetRtxCount > 0) ? assets.splatSetRtxCount : assets.splatSetCount;
+  for(uint instIdx = 0; instIdx < rtxCount; ++instIdx)
+  {
+    SplatSetDesc desc = rtxDescs[instIdx];
+    if(desc.blasAddress == 0 || desc.show == 0)
+      continue;
 
-  // Trace against each TLAS in the array
-  // Note: instanceCustomIndex is limited to 24 bits, so we use offsets for large scenes
+    // Transform ray into this instance's local space.
+    // The direction is intentionally NOT normalized: with D_local = M_inv_3x3 * D_world,
+    // the parametric ray equation P_local = O_local + t * D_local yields t = t_world,
+    // i.e. the parametric value directly equals the world-space distance regardless of
+    // scale in the instance transform. This means:
+    //   - RayTCurrent() returns world-space distances, making hits from differently-scaled
+    //     instances directly comparable in the payload's insertion sort.
+    //   - TMin/TMax remain in world-space units with no per-instance adaptation needed.
+    //   - The intersection shader (.rint) and any-hit already normalize the direction
+    //     internally before particle evaluation (see particleDensityHitInstance and
+    //     the modelRayDir normalization in the stochastic any-hit path).
+    // Supports rotation, translation, and uniform/non-uniform scale.
+    RayDesc localRay;
+    localRay.Origin    = mul(float4(ray.Origin, 1.0), desc.transformInverse).xyz;
+    localRay.Direction = mul(ray.Direction, desc.transformRotScaleInverse);
+    localRay.TMin      = ray.TMin;
+    localRay.TMax      = ray.TMax;
+
+    payload.currentSplatSetInstance = instIdx;
+
+    RaytracingAccelerationStructure tlas = (RaytracingAccelerationStructure)desc.blasAddress;
+    TraceRay(tlas, rayFlags, 0xFF, sbtRecordOffset, 0, 0, localRay, payload);
+  }
+#else
+  // Non-instanced (large BLAS) mode: trace against multi-TLAS array.
+  // Per-instance visibility is handled via TLAS instance masks (mask=0x00 for hidden),
+  // set by the particle_as_build compute shader from desc.show.
+  uint64_t* tlasAddresses = (uint64_t*)assets.splatSetTlasArrayAddress;
+
   for(uint tlasIdx = 0; tlasIdx < assets.splatSetTlasCount; ++tlasIdx)
   {
     RaytracingAccelerationStructure currentTlas = (RaytracingAccelerationStructure)tlasAddresses[tlasIdx];
-
-    // Set the base offset for this TLAS
-    // Any-hit shader will add this to InstanceIndex() to get global splat ID
-    payload.tlasInstanceOffset = tlasOffsets[tlasIdx];
-
-    // Trace against this TLAS
-    TraceRay(currentTlas, rayFlags, 0xFF, 0, 0, 0, ray, payload);
+    TraceRay(currentTlas, rayFlags, 0xFF, sbtRecordOffset, 0, 0, ray, payload);
   }
+#endif
 }
 
 #if NEED_SURFACE_INFO
@@ -1007,32 +1209,119 @@ void surfaceFinalFiltering(inout PixelData pixel, in float3 rayDirection)
     discardSplatContribution(pixel);
   }
 }
-#endif
+#endif  // RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT
+#endif  // RTX_HAS_PARTICLES
 
-void populateDlssGuides(in PixelData pixel, inout DlssGuideData dlssGuide)
+#if DLSS_ENABLED
+void populateDlssGuides(in PixelData pixel, in float3 rayOrigin, inout DlssGuideData dlssGuide)
 {
+  // isoSurfDepth == 0.0 means no splat was hit (default init value in pure RTX mode)
   // In hybrid mode, isoSurfDepth is initialized to INFINITY if no valid splat
   // So this comparison correctly handles: splat closer, mesh closer, or no hit cases
-  if(pixel.isoSurfDepth < pixel.meshHitDist)
+#if RTX_HAS_PARTICLES && RTX_HAS_MESHES
+  if(pixel.isoSurfDepth > 0.0 && pixel.isoSurfDepth < pixel.meshHitDist)
   {
     dlssGuide.isValid     = true;
     dlssGuide.hitPosition = pixel.isoSurfPos;
 
+    // Compute previous world position for object motion vectors
+    SplatSetDesc* splatDescs    = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+    SplatSetDesc  splatDesc     = splatDescs[pixel.isoSurfSplatSetId];
+    float3        localPos      = mul(float4(pixel.isoSurfPos, 1.0), splatDesc.transformInverse).xyz;
+    dlssGuide.prevHitPosition   = mul(float4(localPos, 1.0), splatDesc.prevTransform).xyz;
+
     dlssGuide.specularAlbedo  = {};
+#if VISUALIZE == VISUALIZE_CLAY
+    dlssGuide.albedo          = float4(frameInfo.clayColor.xyz, 1.0);
+#else
     dlssGuide.albedo          = float4(pixel.unlitAlbedo, 1.0);
-    dlssGuide.normalRoughness = float4(pixel.integratedNormal, 0.9);
+#endif
+    dlssGuide.normalRoughness = float4(pixel.integratedNormal, 1.0);
   }
   else if(pixel.meshHitDist < PAYLOAD_INF_DISTANCE)
   {
     dlssGuide.isValid     = true;
     dlssGuide.hitPosition = pixel.meshHitWorldPos;
 
-    const ObjMaterial meshMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
-    dlssGuide.albedo               = float4(meshMaterial.diffuse.xyz, 1.0);
-    dlssGuide.specularAlbedo       = meshMaterial.specular.xyz;
-    dlssGuide.normalRoughness      = float4(pixel.meshHitWorldNrm, 1.0 - meshMaterial.shininess / 255.0);
+    // Compute previous world position for object motion vectors
+    MeshDesc meshDescForMotion    = assets.meshes[pixel.meshHitObjId];
+    float3   localPos             = mul(float4(pixel.meshHitWorldPos, 1.0), meshDescForMotion.transformInverse).xyz;
+    dlssGuide.prevHitPosition     = mul(float4(localPos, 1.0), meshDescForMotion.prevTransform).xyz;
+
+    Material meshMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
+    float3   dlssNrm      = pixel.meshHitWorldNrm;
+    applyMaterialTextures(meshMaterial, meshTextures, pixel.meshHitUV, pixel.meshHitUV1, dlssNrm, pixel.meshHitTangent);
+
+#if VISUALIZE == VISUALIZE_CLAY
+    dlssGuide.albedo          = float4(frameInfo.clayColor.xyz, 1.0);
+    dlssGuide.normalRoughness = float4(dlssNrm, 1.0);
+    dlssGuide.specularAlbedo  = {};
+#else
+    dlssGuide.albedo          = float4(meshMaterial.baseColor.xyz, 1.0);
+    dlssGuide.normalRoughness = float4(dlssNrm, meshMaterial.roughness);
+
+    float  f0_from_ior          = pow((meshMaterial.ior - 1.0) / (meshMaterial.ior + 1.0), 2.0);
+    float3 specularColorClamped = min(f0_from_ior * meshMaterial.specularColorFactor, float3(1.0));
+    float  alpha                = meshMaterial.roughness * meshMaterial.roughness;
+    float3 viewDir              = normalize(pixel.meshHitWorldPos - rayOrigin);
+    float  NoV                  = dot(dlssNrm, -viewDir);
+    dlssGuide.specularAlbedo    = EnvBRDFApprox2(specularColorClamped, alpha, NoV);
+#endif
   }
+#elif RTX_HAS_PARTICLES
+  if(pixel.isoSurfDepth > 0.0 && pixel.isoSurfDepth < pixel.meshHitDist)
+  {
+    dlssGuide.isValid     = true;
+    dlssGuide.hitPosition = pixel.isoSurfPos;
+
+    // Compute previous world position for object motion vectors
+    SplatSetDesc* splatDescs    = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+    SplatSetDesc  splatDesc     = splatDescs[pixel.isoSurfSplatSetId];
+    float3        localPos      = mul(float4(pixel.isoSurfPos, 1.0), splatDesc.transformInverse).xyz;
+    dlssGuide.prevHitPosition   = mul(float4(localPos, 1.0), splatDesc.prevTransform).xyz;
+
+    dlssGuide.specularAlbedo  = {};
+#if VISUALIZE == VISUALIZE_CLAY
+    dlssGuide.albedo          = float4(frameInfo.clayColor.xyz, 1.0);
+#else
+    dlssGuide.albedo          = float4(pixel.unlitAlbedo, 1.0);
+#endif
+    dlssGuide.normalRoughness = float4(pixel.integratedNormal, 1.0);
+  }
+#elif RTX_HAS_MESHES
+  if(pixel.meshHitDist < PAYLOAD_INF_DISTANCE)
+  {
+    dlssGuide.isValid     = true;
+    dlssGuide.hitPosition = pixel.meshHitWorldPos;
+
+    // Compute previous world position for object motion vectors
+    MeshDesc meshDescForMotion    = assets.meshes[pixel.meshHitObjId];
+    float3   localPos             = mul(float4(pixel.meshHitWorldPos, 1.0), meshDescForMotion.transformInverse).xyz;
+    dlssGuide.prevHitPosition     = mul(float4(localPos, 1.0), meshDescForMotion.prevTransform).xyz;
+
+    Material meshMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
+    float3   dlssNrm      = pixel.meshHitWorldNrm;
+    applyMaterialTextures(meshMaterial, meshTextures, pixel.meshHitUV, pixel.meshHitUV1, dlssNrm, pixel.meshHitTangent);
+
+#if VISUALIZE == VISUALIZE_CLAY
+    dlssGuide.albedo          = float4(frameInfo.clayColor.xyz, 1.0);
+    dlssGuide.normalRoughness = float4(dlssNrm, 1.0);
+    dlssGuide.specularAlbedo  = {};
+#else
+    dlssGuide.albedo          = float4(meshMaterial.baseColor.xyz, 1.0);
+    dlssGuide.normalRoughness = float4(dlssNrm, meshMaterial.roughness);
+
+    float  f0_from_ior          = pow((meshMaterial.ior - 1.0) / (meshMaterial.ior + 1.0), 2.0);
+    float3 specularColorClamped = min(f0_from_ior * meshMaterial.specularColorFactor, float3(1.0));
+    float  alpha                = meshMaterial.roughness * meshMaterial.roughness;
+    float3 viewDir              = normalize(pixel.meshHitWorldPos - rayOrigin);
+    float  NoV                  = dot(dlssNrm, -viewDir);
+    dlssGuide.specularAlbedo    = EnvBRDFApprox2(specularColorClamped, alpha, NoV);
+#endif
+  }
+#endif
 }
+#endif  // DLSS_ENABLED
 
 void evaluateLightingAndShadingForBounce(in int           bounce,
                                          inout PixelData  pixel,
@@ -1041,222 +1330,354 @@ void evaluateLightingAndShadingForBounce(in int           bounce,
                                          inout float3     rayDirection,
                                          inout uint       seedRayPass,
                                          inout HitPayload payload,
-                                         in float3        radianceBeforeParticles)
+                                         in float3        radianceBeforeParticles,
+                                         inout float      lastBrdfPdf)
 {
 #if LIGHTING_MODE != LIGHTING_DISABLED
-  const bool splatIsClosest = (pixel.isoSurfDepth > 0.0) && (pixel.isoSurfDepth < pixel.meshHitDist);
 
+#if RTX_HAS_MESHES && RTX_HAS_PARTICLES
+  const bool splatIsClosest = (pixel.isoSurfDepth > 0.0) && (pixel.isoSurfDepth < pixel.meshHitDist);
+#elif RTX_HAS_PARTICLES
+  const bool splatIsClosest = true;
+#else
+  const bool splatIsClosest = false;
+#endif
+
+#if RTX_HAS_PARTICLES
   if(splatIsClosest && pixel.isoSurfSplatSetId != PAYLOAD_INVALID_ID)
   {
-    // Isolate particle-only radiance: remove contributions from previous bounces
-    // so evaluateLightingAndShadingParticles sees only the particle color as base
     pixel.radiance -= radianceBeforeParticles;
-    evaluateLightingAndShadingParticles(pixel, rayOrigin, rayDirection, seedRayPass, payload);
+    evaluateLightingAndShadingParticles(bounce, pixel, done, rayOrigin, rayDirection, seedRayPass, payload, lastBrdfPdf);
     pixel.radiance += radianceBeforeParticles;
   }
+#endif
 
+#if RTX_HAS_MESHES
   if((pixel.meshHitDist < PAYLOAD_INF_DISTANCE)
-     && (maxComponent(pixel.transmittance) > double(frameInfo.minMeshCompositeTransmittance)))
+     && (maxComponent(pixel.transmittance) > double(frameInfo.minSplatSetCompositeTransmittance)) && (done != 0 || !splatIsClosest))
   {
-    evaluateLightingAndShadingMeshes(pixel, done, rayOrigin, rayDirection, seedRayPass, payload);
-  }
-#else
-  // Lighting disabled - process mesh shading if needed
-  if((pixel.meshHitDist < PAYLOAD_INF_DISTANCE)
-     && (maxComponent(pixel.transmittance) > double(frameInfo.minMeshCompositeTransmittance)))
-  {
-    // Regular mesh - retrieve the material for this hit
-    ObjMaterial meshHitMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
-
-    // Display unlit material color (emission + ambient + diffuse)
-    // Apply current transmittance so splats in front correctly occlude meshes
-    const float3 meshColor = meshHitMaterial.emission + meshHitMaterial.ambient + meshHitMaterial.diffuse;
-    pixel.radiance += float3(pixel.transmittance) * meshColor;
+    evaluateLightingAndShadingMeshes(bounce, pixel, done, rayOrigin, rayDirection, seedRayPass, payload, lastBrdfPdf);
   }
 #endif
+
+#else  // LIGHTING_DISABLED
+
+#if RTX_HAS_MESHES
+  // Lighting disabled - process mesh shading if needed
+  if((pixel.meshHitDist < PAYLOAD_INF_DISTANCE)
+     && (maxComponent(pixel.transmittance) > double(frameInfo.minSplatSetCompositeTransmittance)))
+  {
+    Material meshHitMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
+
+    float3 unlitNrm = pixel.meshHitWorldNrm;
+    applyMaterialTextures(meshHitMaterial, meshTextures, pixel.meshHitUV, pixel.meshHitUV1, unlitNrm, pixel.meshHitTangent);
+
+    const float3 meshColor = meshHitMaterial.emissive * meshHitMaterial.emissiveStrength + meshHitMaterial.baseColor;
+    pixel.radiance += float3(pixel.transmittance) * meshColor;
+    pixel.transmittance = double3(0.0);
+  }
+#endif
+
+#endif  // LIGHTING_MODE
 }
 
-#if LIGHTING_MODE != LIGHTING_DISABLED
+#if LIGHTING_MODE != LIGHTING_DISABLED && RTX_HAS_PARTICLES
 // Evaluate lighting and shading for particles (splats)
-// Uses global loop over lights with inline shadow tracing
-void evaluateLightingAndShadingParticles(inout PixelData pixel, in float3 rayOrigin, in float3 rayDirection, inout uint seedRayPass, inout HitPayload payload)
+void evaluateLightingAndShadingParticles(in int           bounce,
+                                         inout PixelData  pixel,
+                                         inout int        done,
+                                         inout float3     rayOrigin,
+                                         inout float3     rayDirection,
+                                         inout uint       seedRayPass,
+                                         inout HitPayload payload,
+                                         inout float      lastBrdfPdf)
 {
-  SplatSetDesc splatSetDesc = assets.splatSetDescriptors[pixel.isoSurfSplatSetId];
+  SplatSetDesc* descs = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+  SplatSetDesc splatSetDesc = descs[pixel.isoSurfSplatSetId];
 
-  // Start with particle radiance modulated by material emission
-  float3 emissiveContribution = pixel.radiance * splatSetDesc.material.emission;
-  //pixel.unlitAlbedo = pixel.radiance;
+  // Splat radiance is trained against sRGB display — convert to linear for PBR shading
+  // and correct light source intensity when used by bounce rays.
+  const float3 baseRadiance = srgbToLinear(pixel.radiance);
+
+  // Emissive contribution in linear space.
+  // On bounce 0 (direct display), emissiveStrength is not applied — the trained
+  // radiance is the ground truth. On secondary bounces (light source for other
+  // surfaces), emissiveStrength scales the emitted energy.
+  float  strength             = (bounce == 0) ? 1.0 : splatSetDesc.material.emissiveStrength;
+  float3 emissiveContribution = baseRadiance * splatSetDesc.material.emissive * strength;
+
+  // Save volumetric transmittance from splat tracing before overriding for shading
+  double3 savedTransmittance = pixel.transmittance;
+
+  // AO for splat emissive: attenuate emissive contribution by mesh proximity.
+  // Applies to both pure emissive and shaded splat sets — the PBR path handles
+  // light occlusion via NEE shadow rays, but the emissive term has no other occlusion.
+#if PARTICLE_AO_ENABLED
+  {
+    float aoFactor = computeSplatEmissiveAO(pixel.isoSurfPos, pixel.integratedNormal,
+                                            frameInfo.particleEmissiveAoRadius, seedRayPass, payload);
+    emissiveContribution *= aoFactor;
+  }
+#endif
 
   // Early exit for pure emissive materials - no lighting interaction
+  // No clay mode in pure emissive
   if(splatSetDesc.material.needShading != 1)
   {
-    pixel.radiance = emissiveContribution;
+    pixel.radiance      = emissiveContribution;
+    pixel.transmittance = savedTransmittance;
     return;
   }
 
-  // Modulate particle radiance by diffuse material
-  const float3 baseRadiance = pixel.radiance;
-
   // Set up material for lighting computation
-  ObjMaterial mat = {};
-  mat.diffuse     = baseRadiance * splatSetDesc.material.diffuse;
-  mat.ambient     = baseRadiance * splatSetDesc.material.ambient;
-  mat.specular    = baseRadiance * splatSetDesc.material.specular;
-  mat.shininess   = splatSetDesc.material.shininess;
+  Material mat = splatSetDesc.material;
 
+  // Clay mode: override material with uniform matte clay
+#if VISUALIZE == VISUALIZE_CLAY
+  mat.baseColor       = frameInfo.clayColor;
+  mat.metallic        = 0.0;
+  mat.roughness       = 1.0;
+  mat.ior             = 1.0;
+  mat.specularFactor  = 0;
+  mat.clearcoatFactor = 0.0;
+  pixel.radiance      = float3(0.0);
+#else
+  mat.baseColor = baseRadiance * splatSetDesc.material.baseColor;
   // Reset radiance to only emissive, lighting will add on top
   pixel.radiance = emissiveContribution;
+#endif
 
   float3 shadowOrigin = rayOrigin + pixel.isoSurfDepth * rayDirection;
 
-  // Global loop over lights with inline shadow tracing
-  for(int i = 0; i < assets.lightCount; ++i)
+  // Splat color (baseRadiance) already encodes Gaussian blending, so lighting uses
+  // unit transmittance — not the volumetric compositing transmittance from splat tracing.
+  pixel.transmittance = double3(1.0);
+
+  // Path tracing with NEE + BSDF MIS (GGX)
+  PbrMaterial pbr = toPbrMaterial(mat, pixel.integratedNormal, pixel.integratedNormal);
+
+  // 1. NEE: sample one light (punctual or environment)
+  bool      envLighting = (frameInfo.envMode != ENV_MODE_NONE && frameInfo.envEnabled != 0);
+  NEESample nee = sampleOneLightNEE(pixel.isoSurfPos, assets.lightCount, assets.lights, envLighting, frameInfo.envMode,
+                                    frameInfo.skyParams, skyTexture, envAccelBuffer, frameInfo.envRotation,
+                                    frameInfo.envIntensity, seedRayPass);
+  float3    neeContribution = float3(0.0);
+  bool      neeValid        = (nee.pdf != 0.0);
+  bool      neeFrontFace    = dot(nee.direction, pixel.integratedNormal) > 0.0;
+  if(!neeFrontFace && mat.transmission == 0.0)
+    neeValid = false;
+
+  if(neeValid)
   {
-    LightSource light = assets.lights[i];
+    BsdfEvaluateData evalData;
+    evalData.k1 = -rayDirection;
+    evalData.k2 = nee.direction;
+    evalData.xi = float3(rand(seedRayPass), rand(seedRayPass), rand(seedRayPass));
+    bsdfEvaluate(evalData, pbr);
 
-    // Compute light-to-surface vector, check if light is in range
-    float3 lightDir;
-    float  lightDist;
-    if(!computeLightToSurfaceVector(light, pixel.isoSurfPos, seedRayPass, lightDir, lightDist))
-      continue;  // Light culled (out of range)
+    if(evalData.pdf > 0.0)
+    {
+      float misWeight = (nee.pdf == DIRAC) ? 1.0 : nee.pdf / (nee.pdf + evalData.pdf);
+      neeContribution = nee.radianceOverPdf * misWeight * (evalData.bsdf_diffuse + evalData.bsdf_glossy);
+    }
+  }
 
+  // 2. Shadow ray for NEE
+  if(neeValid && luminance(neeContribution) > 0.001)
+  {
 #if SHADOWS_MODE != SHADOWS_DISABLED
-    // Trace shadow ray inline for this light
-    ShadowInfo shadow = traceShadowRayForLight(frameInfo, assets, shadowOrigin, lightDir, lightDist, payload);
-    light.color *= shadow.transmittance;
-    bool inShadow = (maxComponent(shadow.transmittance) < 0.001);
-#else
-    bool inShadow = false;
+    ShadowInfo shadow = traceShadowRayForLight(frameInfo, assets, shadowOrigin, nee.direction, nee.distance, payload);
+    neeContribution *= shadow.transmittance;
 #endif
-
-    wavefrontComputeShadingDirectOnly(light, pixel.isoSurfPos, pixel.integratedNormal, mat, rayDirection, inShadow,
-                                      double3(1.0), pixel.radiance);
   }
+  pixel.radiance += float3(pixel.transmittance) * neeContribution;
 
-  // Headlight fallback when no lights in scene
-  if(assets.lightCount == 0)
+  // 3. BSDF sample for bounce direction (gated by per-material maxBounces)
+  if(bounce < mat.maxBounces)
   {
-    const LightSource headlight = createHeadlight(frameInfo.cameraPosition);
-    bool              inShadow  = false;
-    wavefrontComputeShadingDirectOnly(headlight, pixel.isoSurfPos, pixel.integratedNormal, mat, rayDirection, inShadow,
-                                      double3(1.0), pixel.radiance);
-  }
-}
+    BsdfSampleData sampleData;
+    sampleData.k1 = -rayDirection;
+    sampleData.xi = float3(rand(seedRayPass), rand(seedRayPass), rand(seedRayPass));
+    bsdfSample(sampleData, pbr);
 
+    if(sampleData.event_type != BSDF_EVENT_ABSORB && luminance(sampleData.bsdf_over_pdf) > 0.001)
+    {
+      done                = 0;
+      rayOrigin           = pixel.isoSurfPos;
+      rayDirection        = sampleData.k2;
+      pixel.transmittance = double3(sampleData.bsdf_over_pdf);
+      lastBrdfPdf         = sampleData.pdf;
+    }
+  }
+
+  // For opaque splats (no bounce), restore the volumetric transmittance so
+  // the mesh behind can still composite through semi-transparent splats.
+  if(done != 0)
+    pixel.transmittance = savedTransmittance;
+}
+#endif  // LIGHTING_MODE && RTX_HAS_PARTICLES
+
+#if LIGHTING_MODE != LIGHTING_DISABLED && RTX_HAS_MESHES
 // Evaluate lighting and shading for meshes
-// Uses global loop over lights with inline shadow tracing
-void evaluateLightingAndShadingMeshes(inout PixelData  pixel,
+void evaluateLightingAndShadingMeshes(in int           bounce,
+                                      inout PixelData  pixel,
                                       inout int        done,
                                       inout float3     rayOrigin,
                                       inout float3     rayDirection,
                                       inout uint       seedRayPass,
-                                      inout HitPayload payload)
+                                      inout HitPayload payload,
+                                      inout float      lastBrdfPdf)
 {
   // Regular mesh - retrieve the material for this hit
-  ObjMaterial meshMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
+  Material meshMaterial = assets.meshes[pixel.meshHitObjId].materialAddress[pixel.meshHitMatId];
 
-  // Add emissive contribution first (for light proxies and other emissive materials)
-  pixel.radiance += meshMaterial.emission;
+  // Apply material textures (modifies material properties and normal in-place)
+  float3 meshShadingNrm = pixel.meshHitWorldNrm;
+  applyMaterialTextures(meshMaterial, meshTextures, pixel.meshHitUV, pixel.meshHitUV1, meshShadingNrm, pixel.meshHitTangent);
+  pixel.meshHitWorldNrm = meshShadingNrm;
+
+  // Clay mode: override material with uniform matte clay
+#if VISUALIZE == VISUALIZE_CLAY
+  meshMaterial.baseColor       = frameInfo.clayColor;
+  meshMaterial.metallic        = 0.0;
+  meshMaterial.roughness       = 1.0;
+  meshMaterial.transmission    = 0.0;
+  meshMaterial.ior             = 1.0;
+  meshMaterial.specularFactor  = 0;
+  meshMaterial.clearcoatFactor = 0.0;
+
+  //meshMaterial.emissive         = float3(0);
+  //meshMaterial.emissiveStrength = 0.0;
+#endif
+
+  // Add emissive contribution (weighted by path throughput for secondary bounces)
+  pixel.radiance += float3(pixel.transmittance) * meshMaterial.emissive * meshMaterial.emissiveStrength;
 
   // Early exit for pure emissive materials (light proxies) - no lighting interaction
   if(meshMaterial.needShading != 1)
   {
+    pixel.transmittance = double3(0.0);
     return;
   }
 
   float3 shadowOrigin = pixel.meshHitWorldPos;
 
-#if LIGHTING_MODE == LIGHTING_INDIRECT
-  // Indirect mode: full path tracing with state save/restore per light and secondary bounces
+  // Path tracing with NEE + BSDF MIS (GGX)
+  PbrMaterial pbr = toPbrMaterial(meshMaterial, pixel.meshHitWorldNrm, pixel.meshHitWorldNrm);
 
-  // Save initial state before light loop (wavefrontComputeShading modifies these)
-  double3 initialTransmittance = pixel.transmittance;
-  float3  initialRayOrigin     = rayOrigin;
-  float3  initialRayDirection  = rayDirection;
-  int     initialDone          = done;
+  // 1. NEE: sample one light (punctual or environment)
+  bool      envLighting     = (frameInfo.envMode != ENV_MODE_NONE && frameInfo.envEnabled != 0);
+  NEESample nee             = sampleOneLightNEE(pixel.meshHitWorldPos, assets.lightCount, assets.lights, envLighting,
+                                                frameInfo.envMode, frameInfo.skyParams, skyTexture, envAccelBuffer,
+                                                frameInfo.envRotation, frameInfo.envIntensity, seedRayPass);
+  float3    neeContribution = float3(0.0);
+  bool      neeValid        = (nee.pdf != 0.0);
+  bool      neeFrontFace    = dot(nee.direction, pixel.meshHitWorldNrm) > 0.0;
+  if(!neeFrontFace && meshMaterial.transmission == 0.0)
+    neeValid = false;
 
-  // Global loop over lights with inline shadow tracing
-  for(int i = 0; i < assets.lightCount; ++i)
+  if(neeValid)
   {
-    LightSource light = assets.lights[i];
+    BsdfEvaluateData evalData;
+    evalData.k1 = -rayDirection;
+    evalData.k2 = nee.direction;
+    evalData.xi = float3(rand(seedRayPass), rand(seedRayPass), rand(seedRayPass));
+    bsdfEvaluate(evalData, pbr);
 
-    // Compute light-to-surface vector, check if light is in range
-    float3 lightDir;
-    float  lightDist;
-    if(!computeLightToSurfaceVector(light, pixel.meshHitWorldPos, seedRayPass, lightDir, lightDist))
-      continue;  // Light culled (out of range)
-
-    // Restore state for this light (except first iteration)
-    // Last light keeps modifications for secondary rays
-    if(i > 0)
+    if(evalData.pdf > 0.0)
     {
-      pixel.transmittance = initialTransmittance;
-      rayOrigin           = initialRayOrigin;
-      rayDirection        = initialRayDirection;
-      done                = initialDone;
+      float misWeight = (nee.pdf == DIRAC) ? 1.0 : nee.pdf / (nee.pdf + evalData.pdf);
+      neeContribution = nee.radianceOverPdf * misWeight * (evalData.bsdf_diffuse + evalData.bsdf_glossy);
     }
+  }
 
+  // 2. Shadow ray for NEE
+  if(neeValid && luminance(neeContribution) > 0.001)
+  {
 #if SHADOWS_MODE != SHADOWS_DISABLED
-    // Trace shadow ray inline for this light
-    ShadowInfo shadow = traceShadowRayForLight(frameInfo, assets, shadowOrigin, lightDir, lightDist, payload);
-    light.color *= shadow.transmittance;
-    bool inShadow = (maxComponent(shadow.transmittance) < 0.001);
-#else
-    bool inShadow = false;
+    ShadowInfo shadow = traceShadowRayForLight(frameInfo, assets, shadowOrigin, nee.direction, nee.distance, payload);
+    neeContribution *= shadow.transmittance;
 #endif
-
-    wavefrontComputeShading(light, pixel.meshHitWorldPos, pixel.meshHitWorldNrm, meshMaterial, rayDirection, inShadow,
-                            pixel.transmittance, pixel.radiance, done, rayOrigin, rayDirection);
   }
+  pixel.radiance += float3(pixel.transmittance) * neeContribution;
 
-  // Headlight fallback when no lights in scene
-  if(assets.lightCount == 0)
+  // 3. BSDF sample for bounce direction (gated by per-material maxBounces)
+  if(bounce < meshMaterial.maxBounces)
   {
-    const LightSource headlight = createHeadlight(frameInfo.cameraPosition);
-    bool              inShadow  = false;
-    wavefrontComputeShading(headlight, pixel.meshHitWorldPos, pixel.meshHitWorldNrm, meshMaterial, rayDirection,
-                            inShadow, pixel.transmittance, pixel.radiance, done, rayOrigin, rayDirection);
+    BsdfSampleData sampleData;
+    sampleData.k1 = -rayDirection;
+    sampleData.xi = float3(rand(seedRayPass), rand(seedRayPass), rand(seedRayPass));
+    bsdfSample(sampleData, pbr);
+
+    if(sampleData.event_type != BSDF_EVENT_ABSORB && luminance(sampleData.bsdf_over_pdf) > 0.001)
+    {
+      done         = 0;
+      rayOrigin    = pixel.meshHitWorldPos;
+      rayDirection = sampleData.k2;
+      pixel.transmittance *= double3(sampleData.bsdf_over_pdf);
+      lastBrdfPdf = sampleData.pdf;
+      return;
+    }
   }
 
-#else
-  // Direct mode: simple lighting loop, no secondary bounces, no state management
-
-  for(int i = 0; i < assets.lightCount; ++i)
-  {
-    LightSource light = assets.lights[i];
-
-    float3 lightDir;
-    float  lightDist;
-    if(!computeLightToSurfaceVector(light, pixel.meshHitWorldPos, seedRayPass, lightDir, lightDist))
-      continue;
-
-#if SHADOWS_MODE != SHADOWS_DISABLED
-    ShadowInfo shadow = traceShadowRayForLight(frameInfo, assets, shadowOrigin, lightDir, lightDist, payload);
-    light.color *= shadow.transmittance;
-    bool inShadow = (maxComponent(shadow.transmittance) < 0.001);
-#else
-    bool inShadow = false;
-#endif
-
-    wavefrontComputeShadingDirectOnly(light, pixel.meshHitWorldPos, pixel.meshHitWorldNrm, meshMaterial, rayDirection,
-                                      inShadow, pixel.transmittance, pixel.radiance);
-  }
-
-  // Headlight fallback when no lights in scene
-  if(assets.lightCount == 0)
-  {
-    const LightSource headlight = createHeadlight(frameInfo.cameraPosition);
-    bool              inShadow  = false;
-    wavefrontComputeShadingDirectOnly(headlight, pixel.meshHitWorldPos, pixel.meshHitWorldNrm, meshMaterial,
-                                      rayDirection, inShadow, pixel.transmittance, pixel.radiance);
-  }
-
-  // No bounces — stop tracing
+  // No bounce continuation — opaque surface blocks the environment
   pixel.transmittance = double3(0.0);
-
-#endif  // LIGHTING_MODE == LIGHTING_INDIRECT
 }
-#endif  // LIGHTING_MODE != LIGHTING_DISABLED
+#endif  // LIGHTING_MODE && RTX_HAS_MESHES
+
+// Compute ambient occlusion for emissive splat sets against mesh geometry only.
+// Returns 1.0 (unoccluded) or <1.0 (occluded) for a single stochastic hemisphere sample.
+// Converges via temporal accumulation over multiple frames.
+#if PARTICLE_AO_ENABLED
+float computeSplatEmissiveAO(in float3 surfacePos, in float3 surfaceNormal, in float aoRadius, inout uint seed, inout HitPayload payload)
+{
+  float3 N = normalize(surfaceNormal);
+
+  // Frisvad orthonormal basis
+  float3 T, B;
+  if(N.z < -0.9999999f)
+  {
+    T = float3(0.0f, -1.0f, 0.0f);
+    B = float3(-1.0f, 0.0f, 0.0f);
+  }
+  else
+  {
+    float a = 1.0f / (1.0f + N.z);
+    float b = -N.x * N.y * a;
+    T       = float3(1.0f - N.x * N.x * a, b, -N.x);
+    B       = float3(b, 1.0f - N.y * N.y * a, -N.y);
+  }
+
+  // Cosine-weighted hemisphere sample (Malley's method)
+  float  r1    = rand(seed);
+  float  r2    = rand(seed);
+  float  sq    = sqrt(r1);
+  float  phi   = M_TWO_PI * r2;
+  float3 aoDir = normalize(T * cos(phi) * sq + B * sin(phi) * sq + N * sqrt(1.0 - r1));
+
+  // Trace AO ray against mesh TLAS only (excludes light proxies via mask 0xFE)
+  payload.dist[0] = PAYLOAD_INF_DISTANCE;
+  payload.id[0]   = PAYLOAD_INVALID_ID;
+
+  RayDesc aoRay;
+  aoRay.Origin    = surfacePos + N * frameInfo.rtxSecondaryRayOffset;
+  aoRay.Direction = aoDir;
+  aoRay.TMin      = 0.0;
+  aoRay.TMax      = aoRadius;
+
+  const uint aoRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
+
+  TraceRay((RaytracingAccelerationStructure)assets.meshTlasAddress, aoRayFlags, 0xFE, 0, 0, 0, aoRay, payload);
+
+  if(payload.dist[0] < aoRadius && payload.id[0] != PAYLOAD_INVALID_ID)
+  {
+    // here we allow negative values to overamplify the effect over temporal accumulation
+    // so instead of emitting, a value < 0 will absorb energy
+    return 1.0 - frameInfo.particleEmissiveAoStrength;
+  }
+  return 1.0;
+}
+#endif  // PARTICLE_AO_ENABLED
 
 // Trace shadow ray for a single light and compute transmission
 ShadowInfo traceShadowRayForLight(in FrameInfo     frameInfo,
@@ -1272,30 +1693,34 @@ ShadowInfo traceShadowRayForLight(in FrameInfo     frameInfo,
   // Trace through meshes first (typically fewer, faster to reject)
   ShadowInfo meshShadow;
   meshShadow.transmittance = float3(1.0);
+#if RTX_HAS_MESHES
   if(assets.meshCount > 0)
   {
     meshShadow = traceShadowRayMesh(assets, shadowOrigin, lightDir, lightDist, payload);
   }
+#endif
 
   // Trace through particles (only if mesh didn't fully occlude)
   // Skip for stochastic anyhit: alpha=1 in anyhit makes shadow transmittance always 0
   ShadowInfo particleShadow;
   particleShadow.transmittance = float3(1.0);
-
+#if RTX_HAS_PARTICLES
   if(maxComponent(meshShadow.transmittance) > 0.001 && assets.totalGlobalSplatCount > 0)
   {
     particleShadow = traceShadowRayParticle(frameInfo, assets, shadowOrigin, lightDir, lightDist, payload);
   }
+#endif
   result.transmittance = meshShadow.transmittance * particleShadow.transmittance;
 
   return result;
 }
 
+#if RTX_HAS_MESHES
 // Test if a shadow ray hits a mesh and compute shadow transmission (soft shadows with colored transmission)
 ShadowInfo traceShadowRayMesh(in SceneAssets assets, in float3 shadowOrigin, in float3 shadowDir, in float lightDist, inout HitPayload payload)
 {
   ShadowInfo result;
-  result.transmittance = float3(1.0);  // Start fully transmissive (white)
+  result.transmittance = float3(1.0);
 
   payload.dist[0] = PAYLOAD_INF_DISTANCE;
   payload.id[0]   = PAYLOAD_INVALID_ID;
@@ -1304,42 +1729,34 @@ ShadowInfo traceShadowRayMesh(in SceneAssets assets, in float3 shadowOrigin, in 
   RayDesc shadowRay;
   shadowRay.Origin    = shadowOrigin;
   shadowRay.Direction = shadowDir;
-  shadowRay.TMin      = 0.001;
-  shadowRay.TMax      = lightDist - 0.001;
+  shadowRay.TMin      = frameInfo.rtxSecondaryRayOffset;
+  shadowRay.TMax      = lightDist - frameInfo.rtxSecondaryRayOffset;
 
-  // Shadow ray flags: terminate on first hit (single transmissive surface)
   const uint shadowRayFlags = RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH | RAY_FLAG_CULL_BACK_FACING_TRIANGLES;
 
-  // Trace with cull mask 0xFE (excludes light proxies with mask 0x01)
-  TraceRay((RaytracingAccelerationStructure)assets.meshTlasAddress, shadowRayFlags,
-           0xFE,  // Cull mask: only hit regular meshes
-           0, 0, 0, shadowRay, payload);
+  TraceRay((RaytracingAccelerationStructure)assets.meshTlasAddress, shadowRayFlags, 0xFE, 0, 0, 0, shadowRay, payload);
 
-  // Check if mesh hit
   if(payload.dist[0] < lightDist && payload.id[0] != PAYLOAD_INVALID_ID)
   {
-    // Lookup mesh material to get transmittance (for colored shadows)
     int meshId = payload.id[0];
     int matId  = payload.id[1];
 
     if(matId != PAYLOAD_INVALID_ID)
     {
-      // Get material from mesh descriptor
-      ObjMaterial material = assets.meshes[meshId].materialAddress[matId];
-
-      // Apply material transmittance (colored shadows from glass, etc.)
-      result.transmittance = material.transmittance;
+      Material material    = assets.meshes[meshId].materialAddress[matId];
+      result.transmittance = material.transmission > 0.0 ? material.baseColor : float3(0.0);
     }
     else
     {
-      // No material ID - assume opaque
       result.transmittance = float3(0.0);
     }
   }
 
   return result;
 }
+#endif  // RTX_HAS_MESHES
 
+#if RTX_HAS_PARTICLES
 // Test if a shadow ray hits particles and compute shadow transmission (soft shadows with colored transmission)
 ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
                                   in SceneAssets   assets,
@@ -1359,8 +1776,9 @@ ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
   [[unroll]]
   for(int j = 0; j < PARTICLES_SPP; ++j)
   {
-    payload.id[j]   = PAYLOAD_INVALID_ID;
-    payload.dist[j] = PAYLOAD_INF_DISTANCE;
+    payload.id[j]          = PAYLOAD_INVALID_ID;
+    payload.splatSetIdx[j] = PAYLOAD_INVALID_ID;
+    payload.dist[j]        = PAYLOAD_INF_DISTANCE;
 #if RTX_TRACE_STRATEGY == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT
     payload.color[j].set(float4(0.0f));
     payload.normal[j].set(float3(0.0f));
@@ -1377,6 +1795,7 @@ ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
   const uint splatShadowRayFlags = RAY_FLAG_CULL_BACK_FACING_TRIANGLES | RAY_FLAG_SKIP_CLOSEST_HIT_SHADER;
 
   // Trace against all particle TLAS structures (multi-TLAS support for large scenes)
+  payload.rayBounce = 1;  // non-zero: shadow rays always use 3DGRT kernel
   traceRayAllSplatTlas(splatShadowRay, splatShadowRayFlags, payload);
 
 #if RTX_TRACE_STRATEGY == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT
@@ -1389,10 +1808,10 @@ ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
   [[unroll]]
   for(int j = 0; j < PARTICLES_SPP; ++j)
   {
-    const int   globalSplatID = payload.id[j];
-    const float dist          = payload.dist[j];
+    const int   localSplatID = payload.id[j];
+    const float dist         = payload.dist[j];
 
-    if(globalSplatID == PAYLOAD_INVALID_ID || dist >= lightDist)
+    if(localSplatID == PAYLOAD_INVALID_ID || dist >= lightDist)
       continue;
 
     float4 precomputed = payload.color[j].get().value;
@@ -1413,20 +1832,20 @@ ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
   const double TRANSMITTANCE_THRESHOLD = double(frameInfo.particleShadowTransmittanceThreshold);
   const float  coloredShadowStrength   = frameInfo.particleShadowColorStrength;
 
+  SplatSetDesc* shadowRtxDescs = (assets.splatSetDescriptorsRtx != nullptr) ? assets.splatSetDescriptorsRtx : assets.splatSetDescriptors;
+
   [[unroll]]
   for(int j = 0; j < PARTICLES_SPP; ++j)
   {
-    const int   globalSplatID = payload.id[j];
-    const float dist          = payload.dist[j];
+    const int   localSplatID = payload.id[j];
+    const int   descIdx      = payload.splatSetIdx[j];
+    const float dist         = payload.dist[j];
 
-    if(globalSplatID == PAYLOAD_INVALID_ID || dist >= lightDist)
+    if(localSplatID == PAYLOAD_INVALID_ID || dist >= lightDist)
       continue;
 
-    // 64-bit byte offset to prevent overflow when globalSplatID > ~537M (buffer > 4 GB)
-    uint64_t              gitByteOffset = uint64_t(globalSplatID) * uint64_t(sizeof(GlobalSplatIndexEntry));
-    GlobalSplatIndexEntry entry         = *(GlobalSplatIndexEntry*)(assets.globalIndexTableAddress + gitByteOffset);
-    SplatSetDesc          shadowHitDesc = assets.splatSetDescriptors[entry.splatSetIndex];
-    const int             splatId       = int(entry.splatIndex);
+    SplatSetDesc shadowHitDesc = shadowRtxDescs[descIdx];
+    const int    splatId       = localSplatID;
 
     const float3 splatModelShadowOrigin = mul(float4(offsetShadowOrigin, 1.0), shadowHitDesc.transformInverse).xyz;
     const float3 splatModelShadowDir    = normalize(mul(shadowDir, shadowHitDesc.transformRotScaleInverse));
@@ -1434,11 +1853,11 @@ ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
     float3 weight, particleRad;
     float  alpha;
 
-    bool hit = particleProcessHit<false>(frameInfo, shadowHitDesc, splatModelShadowOrigin, splatModelShadowDir,
-                                         shadowHitDesc.transformRotScaleInverse, splatId, dist, alpha, particleRad, dummyNormal);
+    bool hit = threedgrtProcessHit<false>(frameInfo, shadowHitDesc, splatModelShadowOrigin, splatModelShadowDir,
+                                          shadowHitDesc.transformRotScaleInverse, splatId, alpha, particleRad, dummyNormal);
     if(hit)
     {
-      particleIntegrate(alpha, particleRad, shadowTransmittance, shadowRadiance, weight);
+      threedgrtIntegrate(alpha, particleRad, shadowTransmittance, shadowRadiance, weight);
     }
 
     if(maxComponent(shadowTransmittance) < TRANSMITTANCE_THRESHOLD)
@@ -1462,6 +1881,7 @@ ShadowInfo traceShadowRayParticle(in FrameInfo     frameInfo,
 
   return result;
 }
+#endif  // RTX_HAS_PARTICLES
 
 void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in FrameInfo frameInfo,
                                                                            in float2    resolution,
@@ -1469,10 +1889,12 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
                                                                            in PixelData pixel,
                                                                            in RWTexture2D<float> depthBuffer,
                                                                            in RWTexture2D<float4> image,
-                                                                           in RWTexture2D<float4> imageAux,
-                                                                           in int                 useDlss,
-                                                                           in DlssGuideData       dlssGuide,
-                                                                           in RWTexture2D<float4> outImages[])
+                                                                           in RWTexture2D<float4> imageAux
+#if DLSS_ENABLED
+                                                                           , in DlssGuideData       dlssGuide,
+                                                                           in RWTexture2D<float4> outImages[]
+#endif
+                                                                           )
 {
 
 //#define SHOW_MISS_AS_RED  // uncomment for debug
@@ -1505,10 +1927,26 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
   //
   switch(kVisualizeMode)
   {
+    case VISUALIZE_CLAY:
+#if DLSS_ENABLED
     case VISUALIZE_DLSS_INPUT:
+#endif
     case VISUALIZE_FINAL:
       // the final pixel color is the integrated radiance
+#if DLSS_ENABLED
+      pixelColor = max(float3(frameInfo.dlssMinRadianceThreshold), pixel.radiance);
+#else
       pixelColor = pixel.radiance;
+#endif
+
+      // Firefly clamp: suppress stochastic outliers that cause temporal streaks
+      if(frameInfo.rtxFireflyClampThreshold > 0.0)
+      {
+        float lum = dot(pixelColor, float3(1.0 / 3.0));
+        if(lum > frameInfo.rtxFireflyClampThreshold)
+          pixelColor *= frameInfo.rtxFireflyClampThreshold / lum;
+      }
+
       if(kHybridEnabled == 1)
       {
         const bool generateSurface = (NEED_SURFACE_INFO != 0);
@@ -1519,21 +1957,21 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
           else
             imageAux[pixelId] = float4(pixelColor, 1.0);
         }
-        // For hybrid mode without DLSS, early return (DLSS output is handled below)
-        if(useDlss == 0)
-          return;
+#if !DLSS_ENABLED
+        return;
+#endif
       }
       else
       {
-        // Perform temporal accumulation temporal sampling is enabled
-        // DLSS handles its own temporal accumulation, so we do not accumulate for DLSS
-        if(frameInfo.frameSampleId > 0 && pcRay.useDlss == 0)
+#if !DLSS_ENABLED
+        // Temporal accumulation (DLSS handles its own when enabled)
+        if(frameInfo.frameSampleId > 0)
         {
-          // Do accumulation over time (only when DLSS is disabled)
           const float  a        = 1.0F / float(frameInfo.frameSampleId + 1);
           const float4 oldColor = image[pixelId];
           pixelColor            = lerp(oldColor, float4(pixelColor, 1.0), a).xyz;
         }
+#endif
       }
       break;
     case VISUALIZE_CLOCK:
@@ -1555,14 +1993,16 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
         pixelColor = computeVisualizationColor(pixel.isoSurfDepth, frameInfo.visuMinMax, frameInfo.visuShift, true);
       }
       break;
+#if DLSS_ENABLED
     case VISUALIZE_DEPTH_FOR_DLSS:
       if(dlssGuide.isValid)
       {
         const float4 posView     = mul(float4(dlssGuide.hitPosition, 1.0), frameInfo.viewMatrix);
-        const float  linearDepth = -posView.z;  // Actual distance from camera
+        const float  linearDepth = -posView.z;
         pixelColor = computeVisualizationColor(linearDepth, frameInfo.visuMinMax, frameInfo.visuShift, true);
       }
       break;
+#endif
     case VISUALIZE_NORMAL:
       if(pixel.closestParticleFound)
       {
@@ -1577,6 +2017,7 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
         pixelColor          = float3(normal.x * 0.5f + 0.5f, normal.y * 0.5f + 0.5f, normal.z * 0.5f + 0.5f);
       }
       break;
+#if DLSS_ENABLED
     case VISUALIZE_NORMAL_FOR_DLSS:
       if(dlssGuide.isValid)
       {
@@ -1585,6 +2026,7 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
           pixelColor = float3(normal.x * 0.5f + 0.5f, normal.y * 0.5f + 0.5f, normal.z * 0.5f + 0.5f);
       }
       break;
+#endif
     case VISUALIZE_SPLAT_ID:
       // Harlequin/false color visualization of splat ID
       if(pixel.isoSurfSplatId != PAYLOAD_INVALID_ID)
@@ -1620,49 +2062,46 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
 
   // Write to GBuffers
 
-  if(useDlss == 0)
+#if DLSS_ENABLED
+  // Write rendered image to DLSS input (eResultImage in DLSS G-buffers)
+  outImages[int(DlssImages::eDlssInputImage)][pixelId] = float4(pixelColor, 1.0);
+
+  // Write guide images if we have valid first hit data
+  const float4x4 viewProjMatrix = mul(frameInfo.viewMatrix, frameInfo.projectionMatrix);
+  if(dlssGuide.isValid)
   {
-    // Normal rendering without DLSS - write to appropriate buffer based on temporal accumulation state
-    // For hybrid mode, must match the buffer selection used by rasterization
-    if(kHybridEnabled == 1 && frameInfo.frameSampleId > 0)
-      imageAux[pixelId] = float4(pixelColor, 1.0);
-    else
-      image[pixelId] = float4(pixelColor, 1.0);
+    const float4 posClip    = mul(float4(dlssGuide.hitPosition, 1.0), viewProjMatrix);
+    const float4 depthValue = float4(posClip.z / posClip.w, 0.0, 0.0, 0.0);
+
+    const float2 motion = calculateMotionVector(dlssGuide.hitPosition, dlssGuide.prevHitPosition, frameInfo.prevViewProjMatrix, viewProjMatrix, resolution);
+
+    outImages[int(DlssImages::eDlssAlbedo)][pixelId]          = dlssGuide.albedo;
+    outImages[int(DlssImages::eDlssSpecAlbedo)][pixelId]      = float4(dlssGuide.specularAlbedo, 1.0);
+    outImages[int(DlssImages::eDlssNormalRoughness)][pixelId] = dlssGuide.normalRoughness;
+    outImages[int(DlssImages::eDlssMotion)][pixelId]          = float4(motion, 0.0, 0.0);
+    outImages[int(DlssImages::eDlssDepth)][pixelId]           = depthValue;
   }
   else
   {
-    // Write rendered image (to upscale or denoise) to DLSS input (eResultImage in DLSS G-buffers)
-    outImages[int(DlssImages::eDlssInputImage)][pixelId] = float4(pixelColor, 1.0);
+    float2 ndc_xy     = (float2(pixelId) + 0.5) / resolution * 2.0 - 1.0;
+    float4 farViewPos = mul(float4(ndc_xy, 1.0, 1.0), frameInfo.projInverse);
+    farViewPos /= farViewPos.w;
+    float3 farWorldPos = mul(farViewPos, frameInfo.viewInverse).xyz;
 
-    // Write guide images if we have valid first hit data
-    if(dlssGuide.isValid)
-    {
-      // Calculate view-space depth
-      const float4x4 viewProjMatrix = mul(frameInfo.viewMatrix, frameInfo.projectionMatrix);
-      const float4   posClip        = mul(float4(dlssGuide.hitPosition, 1.0), viewProjMatrix);
-      const float    viewZ          = posClip.z / posClip.w;
-      const float4   depthValue     = float4(abs(viewZ), 0.0, 0.0, 0.0);
+    const float2 missMotion = calculateMotionVector(farWorldPos, farWorldPos, frameInfo.prevViewProjMatrix, viewProjMatrix, resolution);
 
-      // Calculate motion vectors
-      const float2 motion = calculateMotionVector(dlssGuide.hitPosition, frameInfo.prevViewProjMatrix, viewProjMatrix, resolution);
-
-      // Write to DLSS guide images
-      outImages[int(DlssImages::eDlssAlbedo)][pixelId]          = dlssGuide.albedo;
-      outImages[int(DlssImages::eDlssSpecAlbedo)][pixelId]      = float4(dlssGuide.specularAlbedo, 1.0);
-      outImages[int(DlssImages::eDlssNormalRoughness)][pixelId] = dlssGuide.normalRoughness;
-      outImages[int(DlssImages::eDlssMotion)][pixelId]          = float4(motion, 0.0, 0.0);
-      outImages[int(DlssImages::eDlssDepth)][pixelId]           = depthValue;
-    }
-    else
-    {
-      // No hit - write default/background values for guide images
-      outImages[int(DlssImages::eDlssAlbedo)][pixelId]          = float4(0.0, 0.0, 0.0, 0.0);
-      outImages[int(DlssImages::eDlssSpecAlbedo)][pixelId]      = float4(0.0, 0.0, 0.0, 0.0);
-      outImages[int(DlssImages::eDlssNormalRoughness)][pixelId] = float4(0.0, 0.0, 0.0, 0.0);
-      outImages[int(DlssImages::eDlssMotion)][pixelId]          = float4(0.0, 0.0, 0.0, 0.0);
-      outImages[int(DlssImages::eDlssDepth)][pixelId]           = float4(0.0, 0.0, 0.0, 0.0);
-    }
+    outImages[int(DlssImages::eDlssAlbedo)][pixelId]          = float4(0.0, 0.0, 0.0, 0.0);
+    outImages[int(DlssImages::eDlssSpecAlbedo)][pixelId]      = float4(0.0, 0.0, 0.0, 0.0);
+    outImages[int(DlssImages::eDlssNormalRoughness)][pixelId] = float4(0.0, 0.0, 0.0, 0.0);
+    outImages[int(DlssImages::eDlssMotion)][pixelId]          = float4(missMotion, 0.0, 0.0);
+    outImages[int(DlssImages::eDlssDepth)][pixelId]           = float4(1.0, 0.0, 0.0, 0.0);
   }
+#else
+  if(kHybridEnabled == 1 && frameInfo.frameSampleId > 0)
+    imageAux[pixelId] = float4(pixelColor, 1.0);
+  else
+    image[pixelId] = float4(pixelColor, 1.0);
+#endif
 }
 
 float3 computeVisualizationColor(in float value, in float2 minMax, in float shift, bool flip)

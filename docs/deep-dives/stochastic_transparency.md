@@ -64,7 +64,7 @@ The ray tracing or a hybrid pipeline must be active (in the second case it only 
 
 This strategy (`RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT`, defined in [shaders/shaderio.h]({{ source_base }}/shaders/shaderio.h){:target="_blank"}) adapts the stochastic transparency concept from [Section 1](#1-rasterization-stochastic-splat-kheradmand2025) directly into the any-hit shader, replacing the bubble-sort hit insertion with Monte Carlo sample picking. The key difference from the baseline any-hit pipeline ([Section 2](#2-ray-tracing-deterministic-termination-baseline)) is that **sorting is entirely eliminated**: instead of collecting and sorting multiple candidate hits per pass, each hit is immediately evaluated and stochastically accepted or rejected in the any-hit stage. This reduces the ray generation shader to a **single `traceRay` call per pixel per frame** (with `PARTICLES_SPP = 1`), producing one opaque sample whose noisy results are converged by temporal accumulation — exactly as for stochastic rasterization.
 
-**Any-hit shader** ([shaders/threedgrt_raytrace.rahit.slang]({{ source_base }}/shaders/threedgrt_raytrace.rahit.slang){:target="_blank"}): Unlike the baseline path where the any-hit shader only performs insertion sort and defers particle evaluation to the ray generation shader, the stochastic any-hit shader must evaluate the full particle response (radiance and opacity) on the spot via `particleProcessHit`. For each candidate intersection closer than the current payload slot, a per-hit random number is drawn and compared against the evaluated opacity `alpha`. If accepted (`randomVal < alpha`), the hit replaces the payload entry with its precomputed color and normal; otherwise the hit is discarded. The explicit depth comparison (`splatDist < payload.dist[i]`) serves as the analog of the hardware depth test used in the rasterization path, ensuring only the closest accepted sample survives.
+**Any-hit shader** ([shaders/threedgrt_raytrace.rahit.slang]({{ source_base }}/shaders/threedgrt_raytrace.rahit.slang){:target="_blank"}): Unlike the baseline path where the any-hit shader only performs insertion sort and defers particle evaluation to the ray generation shader, the stochastic any-hit shader must evaluate the full particle response (radiance and opacity) on the spot via `threedgrtProcessHit`. For each candidate intersection closer than the current payload slot, a per-hit random number is drawn and compared against the evaluated opacity `alpha`. If accepted (`randomVal < alpha`), the hit replaces the payload entry with its precomputed color and normal; otherwise the hit is discarded. The explicit depth comparison (`splatDist < payload.dist[i]`) serves as the analog of the hardware depth test used in the rasterization path, ensuring only the closest accepted sample survives.
 
 The following excerpt from [threedgrt_raytrace.rahit.slang]({{ source_base }}/shaders/threedgrt_raytrace.rahit.slang){:target="_blank"} shows the Monte Carlo sample picking (simplified):
 
@@ -73,7 +73,7 @@ The following excerpt from [threedgrt_raytrace.rahit.slang]({{ source_base }}/sh
 float      alpha = 0.0;
 float3     particleRad;
 float3     normalWorld;
-const bool acceptedHit = particleProcessHit<true>(..., splatId, splatDist,
+const bool acceptedHit = threedgrtProcessHit<true>(..., splatId, splatDist,
                                                   alpha, particleRad, normalWorld);
 if(acceptedHit)
 {
@@ -144,8 +144,8 @@ while(!abortedTracing
   // evaluate sorted hits and integrate them into `pixel`
   for(int i = 0; i < PARTICLES_SPP; ++i)
   {
-    // ... particleProcessHit(...)
-    // ... particleIntegrate(alpha, particleRadiance, pixel.transmittance, pixel.radiance, weight)
+    // ... threedgrtProcessHit(...)
+    // ... threedgrtIntegrate(alpha, particleRadiance, pixel.transmittance, pixel.radiance, weight)
     // ... advance tMin ...
   }
 

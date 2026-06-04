@@ -1,5 +1,80 @@
 # Release Notes
 
+## Version 2026.2
+
+### Rendering & materials (PBR / meshes / lighting)
+
+- Migrated materials from Phong to **GGX PBR** (metallic-roughness).
+- Added **glTF/GLB mesh loading** (tinygltf) with full PBR textures, emissive strength, sRGB formats, `KHR_texture_transform`, multi-UV sets, and scene-graph flattening at import.
+- Integrated **tone mapping and auto-exposure** from nvpro_core2; CLIP tonemapping default; tonemapping parameters in project save/load.
+- Added **IBL environment maps** and physical **sky background** with equirectangular bake; sky specular/reflection; NEE + BRDF path tracing with MIS; removed legacy illumination modes (always path trace with per-material max bounces).
+- **Indirect lighting** for splat sets; splat radiance converted from sRGB to linear for PBR.
+- Extended glTF shading: specular/clearcoat, legacy specular-glossiness workflow.
+- **Particle emissive ambient occlusion** for mesh proximity attenuation.
+
+### Ray tracing — particles & acceleration
+
+- **Shared TLAS** for per-particle RTX; VRAM lifecycle improvements (release covariance in pure RTX, skip global index table, fewer BLAS/TLAS rebuilds).
+- **Particle depth modes** for ray-traced Gaussians, including **billboard depth**.
+- **Sphere primitive mode** via `VK_NV_ray_tracing_linear_swept_spheres` (plus silhouette wireframe).
+- **Billboard frustum culling**; quantizable mesh hit payload; `RTX_HAS_MESHES` / `RTX_HAS_PARTICLES` compile-time shader guards; any-hit refactor and stochastic early-out fixes (billboard holes fix).
+- Other: **Clay** visualization mode; configurable secondary ray offset; in-memory **VkPipelineCache**.
+
+### Billboard ray tracing
+
+- Full **billboard RT** path: intersection shaders, AABB geometry, and [billboard ray tracing deep dive](deep-dives/billboard_ray_tracing.md).
+- **Bounding modes** for TLAS instance scale: Uniform (½, ⅓, ¼), Fitted, Optimal (per-particle), AABB max opacity, icosahedron ellipsoid; default bounding mode is now Uniform ½ (adaptive bounding modes were removed after evaluation).
+- **RTX_SHORTEN_RAY** option for stochastic any-hit early termination; billboard depth available for all trace strategies.
+- Other RTX Fixes: multi–splat-set compositing, light leak, depth incompatibilities, large BLAS build path for bounding modes.
+
+### DLSS / denoising
+
+- DLSS guide improvements: motion vectors (meshes and splat sets), hardware depth, firefly clamp, min radiance, `DLSS_ENABLED` compile-time macro.
+- Skip DLSS for debug visualization modes; fixes for clay mode, splat roughness, and negative radiance clamp on DLSS input.
+
+### Rasterization & hybrid
+
+- Pipeline-aware temporal accumulation.
+- Hybrid unlit albedo fix.
+- MipSplatting: decouple 2D covariance dilation from opacity compensation.
+
+### User interface
+
+- Renderer UI rework: **Denoising**, **Rasterization**, and **Raytracing** tabs, collapsible groups, tooltips, pipeline selector in menu bar.
+- **View** menu: fullscreen, footer bar, window visibility; playback button (replaces keyboard shortcuts); navigation toolbar icons.
+- DLSS controls moved into denoising tab; tone mapping UI rework.
+- Per-instance **show/hide** for splat sets and meshes; profiler and NVML monitor owned by main UI.
+
+### Projects, assets & samples
+
+- **Save / Save As** projects; renderer settings and tonemapping in project files; project name in title bar.
+- Asset tree: **Settings**, **Recent Meshes**, mesh import modal.
+- **Samples** folder with build script for downloading external assets; new and updated [sample projects](sample-projects/index.md) (large city with sky, chessboard winter house, greenhouse on stove scene, and others).
+- Mesh asset download moved from CMake to the samples build script.
+
+### Documentation & CI
+
+- Documentation website (this site), getting started and datasets pages.
+- [Sample projects](sample-projects/index.md) documentation with image comparison sliders; deep dive links on home page; billboard benchmark documentation.
+
+### Benchmarking & headless
+
+- Billboard benchmark suite: HDR/PNG capture, PSNR, multi-camera, charts, `--skip-exec`, `--saveImage`, G-buffer and DLSS guide export.
+- **Headless mode** for benchmarks; expanded CLI (camera presets, `colorBufferFormat`, `lightingEnabled`, and more). See [benchmarking](benchmarking.md).
+
+### Platform & compatibility
+
+- **HardwareSupport** capability registry; optional ray tracing, mesh shader, and LSS sphere extensions with guarded code paths.
+- **Intel Arc** support fixes; Linux build fixes.
+- Upgraded **nvpro_core2**.
+
+### Stability & bug fixes
+
+- RTX build failure → raster fallback: device lost, shader rebuild, mesh-shader fallback stuck state.
+- Texture mode in RTX: device lost fixes.
+- Vulkan validation: pipeline / G-buffer color format mismatch.
+- Image comparator format mismatch when tonemapping and visual helpers are both active.
+
 ## Version 2026.1.7
 
 - **Pre-built binaries** available on GitHub Releases page

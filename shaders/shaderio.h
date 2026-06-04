@@ -57,6 +57,48 @@ enum class SplatDegree
   eSh3 = 3
 };
 
+// GPU vendor identifier. Shared by host code (HardwareSupport::gpuVendor holds one of
+// these values) and shaders (the GPU_VENDOR compile macro is set to one of them), so a
+// vendor-specific path can be gated with "#if GPU_VENDOR == GPU_VENDOR_INTEL".
+#define GPU_VENDOR_OTHER 0
+#define GPU_VENDOR_NVIDIA 1
+#define GPU_VENDOR_AMD 2
+#define GPU_VENDOR_INTEL 3
+
+// Fallback when the host does not provide the macro (e.g. tooling / IDE). Defaults to
+// GPU_VENDOR_OTHER, which selects the portable per-vertex attribute path (see below).
+#ifndef GPU_VENDOR
+#define GPU_VENDOR GPU_VENDOR_OTHER
+#endif
+
+// Per-primitive mesh-shader outputs only link to fragment per-primitive inputs on NVIDIA. On every
+// other vendor Slang cannot emit the matching PerPrimitiveEXT decoration on the fragment inputs
+// (Slang issue shader-slang/slang#7019), so per-primitive attributes are read at the wrong rate and
+// produce garbage (confirmed on AMD and Intel; the Vulkan validation layers now flag it too -
+// KhronosGroup/Vulkan-ValidationLayers#8398). Those vendors must instead receive the flat attributes
+// as per-vertex outputs (duplicated across the quad vertices, with nointerpolation). The mesh/frag
+// shaders gate their per-primitive attribute paths on this macro; unknown vendors take the safe
+// per-vertex path.
+//
+// The host owns this policy (HardwareSupport::meshShaderPerPrimitiveAttribute) and provides the macro
+// at shader-compile time; the fallback below only applies to standalone tooling/IDE builds.
+// TODO: drop this split and emit per-primitive everywhere once Slang #7019 ships.
+#ifndef MESH_SHADER_PER_PRIMITIVE_ATTRIBS
+#define MESH_SHADER_PER_PRIMITIVE_ATTRIBS (GPU_VENDOR == GPU_VENDOR_NVIDIA)
+#endif
+
+// Grid width (number of mesh-task workgroups along X) used when dispatching the splat raster
+// mesh shaders. The shaders always dispatch a 2D grid (X = MESH_SHADER_MAX_GROUPS_X,
+// Y = ceil(totalGroups / MESH_SHADER_MAX_GROUPS_X)) and linearize the workgroup id as
+// (groupID.y * MESH_SHADER_MAX_GROUPS_X + groupID.x); with Y == 1 this is identical to a plain
+// 1D dispatch. The value is the device's queried VkPhysicalDeviceMeshShaderPropertiesEXT::
+// maxMeshWorkGroupCount[0] (see HardwareSupport::maxMeshWorkGroupCountX), provided to shaders as
+// the MESH_SHADER_MAX_GROUPS_X compile macro. The host always sees a value here; in shader builds
+// it comes from the compile macro.
+#ifndef MESH_SHADER_MAX_GROUPS_X
+#define MESH_SHADER_MAX_GROUPS_X 65535
+#endif
+
 // type of pipeline used
 #define PIPELINE_VERT 0
 #define PIPELINE_MESH 1
@@ -82,6 +124,7 @@ enum class SplatDegree
 #define VISUALIZE_DLSS_MOTION 13       // show raw buffer values
 #define VISUALIZE_DLSS_DEPTH 14        // show raw buffer values
 #define VISUALIZE_SPLAT_ID 15          // splat ID as harlequin/false color
+#define VISUALIZE_CLAY 16              // clay material override: uniform matte shading with user-defined color
 
 // type of frustum culling
 #define FRUSTUM_CULLING_NONE 0
@@ -105,10 +148,11 @@ enum class SplatDegree
 #define FTB_SYNC_INTERLOCK 1  // Use fragment shader interlock (correct, slower)
 
 // particle format (PF), RTX
-// not used in shaders (using RTX_USE_AABBS compiler defined instead)
+// not used in shaders (using RTX_USE_AABBS/RTX_USE_SPHERES compiler defines instead)
 // used only by UI but here to be easier to find
 #define PARTICLE_FORMAT_ICOSAHEDRON 0
 #define PARTICLE_FORMAT_PARAMETRIC 1
+#define PARTICLE_FORMAT_SPHERE 2
 
 // degree of the splat kernel, RTX
 #define KERNEL_DEGREE_QUINTIC 5
@@ -129,13 +173,17 @@ enum class SplatDegree
 
 // Lighting mode (used as compile-time macro LIGHTING_MODE in shaders)
 #define LIGHTING_DISABLED 0  // No lighting computed
-#define LIGHTING_DIRECT 1    // Direct lighting only (one bounce, no reflections/refractions)
-#define LIGHTING_INDIRECT 2  // Full lighting with bounces, reflections, refractions
+#define LIGHTING_ENABLED 1   // Path-traced lighting (NEE + BSDF, per-material maxBounces)
 
 // Depth of Field mode (used as compile-time macro DOF_MODE in shaders)
 #define DOF_DISABLED 0     // No depth of field
 #define DOF_FIXED_FOCUS 1  // Fixed focus distance (manual)
 #define DOF_AUTO_FOCUS 2   // Auto focus using surface distance at cursor position
+
+// Particle depth mode (used as compile-time macro RTX_PARTICLE_DEPTH in shaders)
+#define PARTICLE_DEPTH_BILLBOARD 0          // Billboard plane depth (3DGS/3DGUT): perpendicular to view direction
+#define PARTICLE_DEPTH_ELLIPSOID 1          // Ellipsoid surface depth (3DGRT): actual ray-ellipsoid hit T
+#define PARTICLE_DEPTH_MAX_DENSITY_PLANE 2  // Max density plane depth (StochasticSplat)
 
 // Shadows mode (used as compile-time macro SHADOWS_MODE in shaders)
 #define SHADOWS_DISABLED 0  // No shadow rays traced
@@ -170,6 +218,21 @@ enum class SplatDegree
 // Bindless texture array for STORAGE_TEXTURES mode
 #define BINDING_SPLAT_TEXTURES 23  // Unbounded array: Sampler2D allSplatTextures[]
 
+// Texture slot indices within a splat set's bindless texture group.
+// Order must match descriptor writes in updateBindingSplatTextures() and initDataTextures().
+enum class SplatTexIndex : uint32_t
+{
+  eSplatTexCenters           = 0,
+  eSplatTexScales            = 1,
+  eSplatTexRotations         = 2,
+  eSplatTexColors            = 3,
+  eSplatTexSH                = 4,
+  eSplatTexCovariances       = 5,  // Must be last: omitted from descriptor writes when released (pure RTX mode)
+  eSplatTexCount             = 6,  // Total textures per splat set (when all present)
+  eSplatTexCountNoCovariance = 5,  // Textures per splat set without covariance
+};
+#define BINDING_MESH_TEXTURES 31  // Unbounded array: Sampler2D allMeshTextures[]
+
 // Rasterization surface reconstruction buffers (set 0)
 #define BINDING_RASTER_NORMAL 24        // Rasterization: integrated normals output (RGB16F)
 #define BINDING_RASTER_DEPTH 25         // Rasterization: integrated depth (R) + transmittance (G)
@@ -188,6 +251,13 @@ enum class SplatDegree
 #define RTX_BINDING_OUTDEPTH 5  // depth buffer
 // Array of DLSS output images (albedo, specular, normal/roughness, motion, depth)
 #define RTX_BINDING_DLSS_OUT_IMAGES 6
+#define RTX_BINDING_SKY_TEXTURE 7  // Equirectangular sky/HDR texture (sampler2D)
+#define RTX_BINDING_ENV_ACCEL 8    // HDR importance sampling acceleration buffer (StructuredBuffer<EnvAccel>)
+
+// Environment mode (usable from both C++ and Slang shaders)
+#define ENV_MODE_NONE 0
+#define ENV_MODE_SKY 1
+#define ENV_MODE_HDR 2
 
 // Temporal sampling mode
 #define TEMPORAL_SAMPLING_AUTO 0  // Detects automatically if TS is needed for best visual results (e.g. if DoF is on)
@@ -205,16 +275,29 @@ enum class SplatDegree
 // used for mesh rasterization
 #define ATTRIBUTE_LOC_MESH_POSITION 0
 #define ATTRIBUTE_LOC_MESH_NORMAL 1
+#define ATTRIBUTE_LOC_MESH_TEXCOORD 2
+#define ATTRIBUTE_LOC_MESH_TEXCOORD1 3
+#define ATTRIBUTE_LOC_MESH_TANGENT 4
 
 #ifdef __cplusplus
 #include "nvshaders/slang_types.h"
 using double3 = glm::dvec3;
-#include "wavefront.h"
+#include "shading.h"
+#include "nvshaders/sky_io.h.slang"
 namespace shaderio {
 #else
 // we are in Slang here
-#include "wavefront.h"
+#include "shading.h"
+#include "nvshaders/sky_io.h.slang"
 #endif
+
+// Environment mode (C++ enum mirrors the #defines above)
+enum EnvironmentMode
+{
+  eNone = ENV_MODE_NONE,
+  eSky  = ENV_MODE_SKY,
+  eHDR  = ENV_MODE_HDR,
+};
 
 // Enums to dereference DLSS Images
 enum class DlssImages
@@ -271,18 +354,21 @@ struct FrameInfo
   float alphaClamp = 0.99f;        // 0.99 in original paper
   float minTransmittance = 0.01f;  // 0.1  in original paper ? transmittance value under which particle marching loop stops
   int32_t rtxMaxBounces = 3;
+  float   rtxSecondaryRayOffset = 0.001f;
 
   int32_t frameSampleId  = 0;    // the frame sample index since last frame sampling reset
-  int32_t frameSampleMax = 200;  // maximum number of frame after which we stop accumulating frames samples
+  int32_t frameSampleMax = 1000;  // maximum number of frame after which we stop accumulating frames samples
 
   float focusDist = 1.3f;    // focus distance to compute depth of field
   float aperture  = 0.001f;  // aperture distance to compute depth of field, 0 does no DOF effect
 
   // threshold under which meshes are not composited in RTX pipelines,
   // prevents to see meshes through semi transparent splat sets
-  // this threshold generaly needs to be raised when using stochastic
-  // pass since transmittance is not fully evaluated for some paths
-  float minMeshCompositeTransmittance = 0.0;
+  // Minimum transmittance for compositing meshes and environment behind splats.
+  // Below this threshold, splats fully occlude everything behind them.
+  // Generally needs to be raised when using stochastic pass since
+  // transmittance is not fully evaluated for some paths.
+  float minSplatSetCompositeTransmittance = 0.1;
 
   // DLSS - Previous frame's view-projection matrix for motion vectors (uses unjittered projection)
   float4x4 prevViewProjMatrix;
@@ -306,6 +392,10 @@ struct FrameInfo
   float particleShadowTransmittanceThreshold = 0.8f;  // Transmittance threshold for particle shadows
   float particleShadowColorStrength = 0.0f;  // Per-channel absorption from particle color [0=mono, 1=fully colored]
 
+  // Ambient occlusion for emissive splat sets (mesh proximity attenuation)
+  float particleEmissiveAoRadius   = 0.05f;  // AO hemisphere sampling radius
+  float particleEmissiveAoStrength = 1.0f;   // AO darkening intensity (0 = no effect, 1 = full, >1 = exaggerated)
+
   // Depth iso threshold: transmittance threshold for depth picking
   // Depth is picked when transmittance drops below this threshold
   float depthIsoThreshold    = 0.7f;  // For rasterization
@@ -314,6 +404,23 @@ struct FrameInfo
   // Thin particle threshold: scale below which a particle axis is considered degenerate
   // Used by normal computation to detect flat (disk) or line/point particles
   float thinParticleThreshold = 1e-6f;
+
+  // Firefly clamp: luminance threshold to suppress stochastic outliers (0 = disabled)
+  float rtxFireflyClampThreshold = 0.0f;
+
+  // DLSS minimum radiance: clamp radiance floor to avoid negative-value artifacts in DLSS denoiser
+  float dlssMinRadianceThreshold = 0.0f;
+
+  int32_t envMode    = 0;  // EnvironmentMode: 0=eNone, 1=eSky, 2=eHDR
+  int32_t envEnabled = 0;  // Whether environment contributes to lighting
+
+  SkyPhysicalParameters skyParams;  // Sky parameters for importance sampling in lighting (eSky mode)
+
+  float3 envRotation  = float3(0.0f);  // Environment rotation (Euler degrees)
+  float  envIntensity = 1.0f;          // HDR intensity multiplier (eHDR mode)
+
+  // Clay visualization: uniform matte color replacing material properties
+  float3 clayColor = float3(0.5f);
 };
 
 // Push constant for raster
@@ -364,7 +471,10 @@ struct IndirectParams
   float   particleIntegratedDist   = 0.0;  // Will be set by the dist to the nearest splat on the ray path
   float3  particleIntegratedNormal = float3(0.0);
   float3  particleRadiance         = float3(0.0);
-  double3 particleTransmittance    = double3(0.0);
+  // Stored as float3 (downcast from the path tracer's double3 transmittance)
+  // so that this struct does not require Float64 capability when bound by
+  // raster / compute shaders that never write this field.
+  float3 particleTransmittance = float3(0.0);
 
   float closestParticleAlpha = 0.0;
   //float3 closestParticleNormal      = float3(0.0); // see patrticleNormal
@@ -409,29 +519,41 @@ struct PushConstantRay
 
   // set to true will raytrace the mesh depth as a pre-pass
   bool meshDepthOnly;
-  // #DLSS - DLSS related fields
-  int32_t useDlss = 0;                   // Use DLSS (0: no, 1: yes)
-  float2  jitter  = float2(0.0f, 0.0f);  // Camera jitter for DLSS
+  // DLSS jitter (applied when DLSS_ENABLED shader macro is set)
+  float2 jitter = float2(0.0f, 0.0f);
 };
 
 // ============================================================================
 // Bindless Architecture Structures
 // ============================================================================
 
-// MeshDesc: Per-instance mesh descriptor (similar to ObjDesc but with per-instance data)
-// Note: This will eventually replace ObjDesc in the bindless architecture
+// NOTE: BLAS builder depends on pos being the first member
+struct Vertex
+{
+  float3 pos;
+  float3 nrm;
+  float2 texCoord;   // TEXCOORD_0
+  float2 texCoord1;  // TEXCOORD_1 (KHR_texture_transform may select this)
+  float4 tangent;    // xyz = tangent direction, w = handedness (+1 or -1)
+};
+
+// MeshDesc: Per-instance mesh descriptor
 struct MeshDesc
 {
   // Geometry buffer addresses (shared across instances)
-  ObjVertex*   vertexAddress;         // Address of the Vertex buffer
-  uint32_t*    indexAddress;          // Address of the index buffer
-  ObjMaterial* materialAddress;       // Address of the material buffer
-  uint32_t*    materialIndexAddress;  // Address of the triangle material index buffer
+  Vertex*   vertexAddress;         // Address of the Vertex buffer
+  uint32_t* indexAddress;          // Address of the index buffer
+  Material* materialAddress;       // Address of the material buffer
+  uint32_t* materialIndexAddress;  // Address of the triangle material index buffer
+
+  uint32_t show;      // 1 = visible, 0 = hidden (user visibility toggle)
+  uint32_t _padShow;  // Padding for float4x4 alignment
 
   // Per-instance transform
   float4x4 transform;
   float4x4 transformInverse;
   float3x3 transformRotScaleInverse;
+  float4x4 prevTransform;  // Previous frame's transform (for DLSS object motion vectors)
 };
 
 // SplatSetDesc: Per-instance Gaussian splat set descriptor
@@ -468,14 +590,16 @@ struct SplatSetDesc
   uint32_t storage;     // STORAGE_BUFFERS or STORAGE_TEXTURES
   uint32_t format;      // FORMAT_FLOAT32, FORMAT_FLOAT16, FORMAT_UINT8 (for SH)
   uint32_t rgbaFormat;  // FORMAT_FLOAT32, FORMAT_FLOAT16, FORMAT_UINT8 (for RGBA colors)
+  uint32_t show;        // 1 = visible, 0 = hidden (user visibility toggle)
 
   // Per-instance transform
   float4x4 transform;
   float4x4 transformInverse;
   float3x3 transformRotScaleInverse;
+  float4x4 prevTransform;  // Previous frame's transform (for DLSS object motion vectors)
 
   // Per-instance material (each splat instance has its own material)
-  ObjMaterial material;
+  Material material;
 };
 
 // SceneAssets: Unified bindless asset structure (single binding point)
@@ -500,7 +624,7 @@ struct SceneAssets
   SplatSetDesc* splatSetDescriptors       = nullptr;
   SplatSetDesc* splatSetDescriptorsRtx    = nullptr;
   uint32_t      splatSetCount             = 0;
-  uint32_t      _pad2                     = 0;
+  uint32_t      splatSetRtxCount          = 0;  // Number of entries in splatSetDescriptorsRtx (0 if not used)
   uint64_t      splatSetTlasArrayAddress  = 0;  // Address of array of TLAS addresses (uint64_t[])
   uint64_t      splatSetTlasOffsetAddress = 0;  // Address of array of instance offsets (uint32_t[])
   uint32_t      splatSetTlasCount         = 0;  // Number of TLAS in the array
@@ -514,8 +638,8 @@ struct SceneAssets
   uint32_t _pad4                           = 0;
 
   // Sorting buffer device addresses (bindless, replaces BINDING_DISTANCES_BUFFER and BINDING_INDICES_BUFFER)
-  uint32_t* splatSortingDistancesAddress = nullptr;  // Device address to distances buffer (RW)
-  uint32_t* splatSortingIndicesAddress   = nullptr;  // Device address to sorted indices buffer (RW)
+  uint64_t splatSortingDistancesAddress = 0;  // Device address to distances buffer (RW)
+  uint64_t splatSortingIndicesAddress   = 0;  // Device address to sorted indices buffer (RW)
 };
 
 // GlobalSplatIndexEntry: Maps global splat index to (splatSetIndex, splatIndex)
@@ -536,21 +660,32 @@ struct ParticleAsBuildPushConstants
   uint64_t blasAddress               = 0;  // BLAS device address for instances
   uint64_t vertexBufferAddress       = 0;  // float3[]
   uint64_t indexBufferAddress        = 0;  // uint32[]
+  uint64_t radiusBufferAddress       = 0;  // float[] (sphere radii)
   uint32_t instanceCount             = 0;
   uint32_t instanceBaseIndex         = 0;
   uint32_t splatBaseIndex            = 0;  // Base splat index for geometry generation
-  uint32_t geometryType              = 0;  // 0=triangles, 1=aabbs
+  uint32_t geometryType              = 0;  // 0=triangles, 1=aabbs, 2=spheres
   uint32_t writeGeometry             = 0;  // 0/1
   uint32_t geometryMode              = 0;  // 0=unit, 1=per-splat (global), 2=per-splat-set
   uint32_t kernelDegree              = 0;
   float    kernelMinResponse         = 0.0f;
   uint32_t kernelAdaptiveClamping    = 0;
-  uint32_t instanceMode              = 0;  // 0=per-splat, 1=per-splat-set instance
-  uint32_t _pad0                     = 0;
+  uint32_t instanceMode = 0;  // 0=per-splat, 1=per-splat-set instance, 2=per-splat shared TLAS (local transform only)
+  uint32_t splatSetDescIndex     = 0;  // Descriptor index for buffer addresses (used by instanceMode==2)
+  uint32_t billboardBoundingMode = 0;  // 0=fitted, 1=uniform, 2-6=uniform fractions, 7=optimal
 };
 
 
 #ifdef __cplusplus
+// Verify struct layout matches between C++ and Slang (field offsets must be identical)
+static_assert(offsetof(SplatSetDesc, show) == offsetof(SplatSetDesc, rgbaFormat) + sizeof(uint32_t),
+              "SplatSetDesc::show must follow rgbaFormat without padding");
+static_assert(offsetof(SplatSetDesc, transform) == offsetof(SplatSetDesc, show) + sizeof(uint32_t),
+              "SplatSetDesc::transform must follow show without padding");
+static_assert(offsetof(MeshDesc, show) == offsetof(MeshDesc, materialIndexAddress) + sizeof(uint32_t*),
+              "MeshDesc::show must follow materialIndexAddress without padding");
+static_assert(offsetof(MeshDesc, transform) == offsetof(MeshDesc, show) + 2 * sizeof(uint32_t),
+              "MeshDesc::transform must follow show + _padShow");
 }  // namespace shaderio
 #endif
 

@@ -18,19 +18,26 @@
  */
 
 #include "shaderio.h"
-#include "wavefront.h.slang"
+#include "shading.h.slang"
+#if WIREFRAME
+#include "nvshaders/wireframe.h.slang"
+#include "nvshaders/fwidth.h.slang"
+#endif
 
 // clang-format off
 [[vk::push_constant]]                      ConstantBuffer<PushConstant>  pcRaster;
 [[vk::binding(BINDING_FRAME_INFO_UBO, 0)]] ConstantBuffer<FrameInfo>     frameInfo;
 [[vk::binding(BINDING_ASSETS, 0)]]         ConstantBuffer<SceneAssets>   assets;
+[[vk::binding(BINDING_MESH_TEXTURES, 0)]]  Sampler2D                    meshTextures[];
 
 struct FragmentInput
 {
-  [[vk::location(1)]] float3 worldPos : TEXCOORD1;
-  [[vk::location(2)]] float3 worldNrm : TEXCOORD2;
-  [[vk::location(3)]] float3 viewDir : TEXCOORD3;
-  // This was missing in GLSL version (there was a bug), added to get the source triangle ID.
+  [[vk::location(1)]] float3 worldPos : POSITION_WS;
+  [[vk::location(2)]] float3 worldNrm : NORMAL_WS;
+  [[vk::location(3)]] float3 viewDir : VIEW_DIR;
+  [[vk::location(4)]] float2 texCoord : TEXCOORD0;
+  [[vk::location(5)]] float2 texCoord1 : TEXCOORD1;
+  [[vk::location(6)]] float4 worldTangent : TANGENT_WS;
   uint primitiveID : SV_PrimitiveID; 
 };
 
@@ -41,7 +48,11 @@ struct FragmentOutput
 // clang-format on
 
 [shader("fragment")]
-FragmentOutput main(FragmentInput input)
+FragmentOutput main(FragmentInput input
+#if WIREFRAME
+                    , float3 baryCoord : SV_Barycentrics
+#endif
+)
 {
   FragmentOutput output;
 
@@ -68,13 +79,17 @@ FragmentOutput main(FragmentInput input)
   MeshDesc meshDesc = assets.meshes[pcRaster.objIndex];
 
   // Retrieve material for this triangle
-  ObjMaterial material = meshDesc.materialAddress[meshDesc.materialIndexAddress[input.primitiveID]];
+  Material material = meshDesc.materialAddress[meshDesc.materialIndexAddress[input.primitiveID]];
+
+  // Apply material textures (modifies material properties and normal in-place)
+  float3 shadingNrm = input.worldNrm;
+  applyMaterialTextures(material, meshTextures, input.texCoord, input.texCoord1, shadingNrm, input.worldTangent);
 
 #if (LIGHTING_MODE != LIGHTING_DISABLED)
   float3 color = float3(0.0, 0.0, 0.0);  // Start with black
 
   // Add emissive contribution first (for light proxies and other emissive materials)
-  color += material.emission;
+  color += material.emissive * material.emissiveStrength;
 
   // Only apply lighting if material needs it
   if(material.needShading == 1)
@@ -82,8 +97,10 @@ FragmentOutput main(FragmentInput input)
     // Apply lighting from each light source (using bindless lights)
     for(int i = 0; i < assets.lightCount; ++i)
     {
+      if(assets.lights[i].enabled == 0)
+        continue;
       bool inShadow = false;  // Rasterization doesn't have shadow rays (yet)
-      wavefrontComputeShadingDirectOnly(assets.lights[i], input.worldPos, input.worldNrm, material, input.viewDir, inShadow, double3(1.0), color);
+      wavefrontComputeShadingDirectOnly(assets.lights[i], input.worldPos, shadingNrm, material, input.viewDir, inShadow, float3(1.0), color);
     }
 
     if(assets.lightCount == 0)
@@ -91,16 +108,22 @@ FragmentOutput main(FragmentInput input)
       // No lights in scene - use headlight (camera-attached point light with no attenuation)
       const LightSource headlight = createHeadlight(frameInfo.cameraPosition);
       bool              inShadow  = false;
-      wavefrontComputeShadingDirectOnly(headlight, input.worldPos, input.worldNrm, material, input.viewDir, inShadow, double3(1.0), color);
+      wavefrontComputeShadingDirectOnly(headlight, input.worldPos, shadingNrm, material, input.viewDir, inShadow, float3(1.0), color);
     }
   }
   // else: Pure emissive material (light proxy) - no lighting interaction
 #else
-  // Shading disabled - display unlit material color (emission + ambient + diffuse)
-  float3 color = material.emission + material.ambient + material.diffuse;
+  // Shading disabled - display unlit material color
+  float3 color = material.emissive * material.emissiveStrength + material.baseColor;
 #endif
 
   output.color = float4(color, 1);
+
+  // Wireframe overlay: blend mesh triangle edges in red
+#if WIREFRAME
+  const float wireframeAlpha = processWireframe(wireframeDefaultSettings(), baryCoord, fwidth(baryCoord));
+  output.color               = lerp(output.color, float4(1.0, 0.0, 0.0, 1.0), wireframeAlpha);
+#endif
 
 #endif
 

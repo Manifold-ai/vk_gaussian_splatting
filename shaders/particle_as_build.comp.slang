@@ -45,8 +45,10 @@ struct AabbPositions
 
 static const float kIcosasVrtScale = 1.0704662767622;  // Compensated: original 0.6615845 * phi, since verts scaled by 1/phi to fit [-1,1]^3
 static const float kAabbVrtScale   = 1.0; // AABB geometry is already [-1,1]^3, keep original scale
+static const float kSphereVrtScale = 1.0; // Sphere primitive: unit sphere radius = 1.0
 static const uint  kGeometryTriangles = 0;
 static const uint  kGeometryAabbs     = 1;
+static const uint  kGeometrySpheres   = 2;
 
 // Unit icosahedron scaled by 1/phi so max extent fits in [-1,1]^3 (coherent with AABB mode)
 static const float3 kIcosaVerts[12] = {
@@ -86,6 +88,31 @@ float kernelScale(float density, float modulatedMinResponse, float kernelDegree,
   return pow(log(minResponse) / a, 1.0f / b);
 }
 
+
+float3 applyBillboardBounding(float3 scale, uint mode)
+{
+  if(mode == 1)
+  {
+    float maxS = max(max(scale.x, scale.y), scale.z);
+    return float3(maxS, maxS, maxS);
+  }
+  else if(mode >= 2 && mode <= 6)
+  {
+    float maxS = max(max(scale.x, scale.y), scale.z);
+    float fraction = (mode == 2) ? 0.75f :
+                     (mode == 3) ? (2.0f / 3.0f) :
+                     (mode == 4) ? 0.5f :
+                     (mode == 5) ? (1.0f / 3.0f) : 0.25f;
+    float minS = maxS * fraction;
+    return float3(max(scale.x, minS), max(scale.y, minS), max(scale.z, minS));
+  }
+  else if(mode == 7)
+  {
+    float maxS = max(max(scale.x, scale.y), scale.z);
+    return float3((maxS + scale.x) * 0.5f, (maxS + scale.y) * 0.5f, (maxS + scale.z) * 0.5f);
+  }
+  return scale;
+}
 
 AccelInstance makeInstance(float4x4 world, uint customIndex, uint mask, uint sbtOffset, uint flags, uint64_t blasAddress)
 {
@@ -127,6 +154,22 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
           aabb[0].maxZ = 1.0f;
         }
       }
+      else if(pc.geometryType == kGeometrySpheres)
+      {
+        if(globalId == 0)
+        {
+          if(pc.vertexBufferAddress != 0)
+          {
+            float3* centers = (float3*)pc.vertexBufferAddress;
+            centers[0] = float3(0.0f, 0.0f, 0.0f);
+          }
+          if(pc.radiusBufferAddress != 0)
+          {
+            float* radii = (float*)pc.radiusBufferAddress;
+            radii[0] = 1.0f;
+          }
+        }
+      }
       else if(pc.geometryType == kGeometryTriangles)
       {
         if(pc.vertexBufferAddress != 0 && globalId < 12)
@@ -155,6 +198,10 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
       const uint totalVerts = splatCount * 12;
       const uint totalInds  = splatCount * 60;
 
+      // NOTE: The AABB and Sphere branches below are never reached in practice.
+      // The UI forces useTlasInstances=true when useAABBs or useSpheres is enabled,
+      // which routes to the shared unit BLAS path (geometryMode==0) + per-particle
+      // instances (instanceMode==2). Kept here for reference only.
       if(pc.geometryType == kGeometryAabbs)
       {
         if(pc.aabbBufferAddress != 0 && globalId < splatCount)
@@ -164,8 +211,9 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
           float3 scale    = exp(fetchScale(desc, splatId));
           quat   rotation = normalize(vec4toQuat(fetchRotation(desc, splatId)));
           float  density  = fetchColor(desc, splatId).w;
+          scale = applyBillboardBounding(scale, pc.billboardBoundingMode);
           float kerScale = kernelScale(density, pc.kernelMinResponse, float(pc.kernelDegree), pc.kernelAdaptiveClamping != 0);
-          float3 totalScale = scale * kIcosasVrtScale * kerScale;
+          float3 totalScale = scale * kAabbVrtScale * kerScale;
           float3x3 rot = quatToMat3(rotation);
           float3x3 scaledRot = float3x3(rot[0] * totalScale.x, rot[1] * totalScale.y, rot[2] * totalScale.z);
           float4x4 local = float4x4(
@@ -175,11 +223,13 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
               0.0f,           0.0f,           0.0f,           1.0f);
           float4x4 world = mul(transpose(desc.transform), local);
 
+          // Compute world-space AABB from the 8 corners of canonical [-1,1]^3
           float3 minV = float3(1e30f, 1e30f, 1e30f);
           float3 maxV = float3(-1e30f, -1e30f, -1e30f);
-          for(uint v = 0; v < 12; ++v)
+          for(uint i = 0; i < 8; ++i)
           {
-            float3 p = mul(world, float4(kIcosaVerts[v], 1.0f)).xyz;
+            float3 corner = float3((i & 1) != 0 ? 1.0f : -1.0f, (i & 2) != 0 ? 1.0f : -1.0f, (i & 4) != 0 ? 1.0f : -1.0f);
+            float3 p = mul(world, float4(corner, 1.0f)).xyz;
             minV = min(minV, p);
             maxV = max(maxV, p);
           }
@@ -192,6 +242,43 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
           aabb[globalId].maxZ = maxV.z;
         }
       }
+      else if(pc.geometryType == kGeometrySpheres)
+      {
+        if(globalId < splatCount)
+        {
+          uint splatId = pc.splatBaseIndex + globalId;
+          float3 position = fetchCenter(desc, splatId);
+          float3 scale    = exp(fetchScale(desc, splatId));
+          quat   rotation = normalize(vec4toQuat(fetchRotation(desc, splatId)));
+          float  density  = fetchColor(desc, splatId).w;
+          scale = applyBillboardBounding(scale, pc.billboardBoundingMode);
+          float kerScale = kernelScale(density, pc.kernelMinResponse, float(pc.kernelDegree), pc.kernelAdaptiveClamping != 0);
+          float3 totalScale = scale * kSphereVrtScale * kerScale;
+          float3x3 rot = quatToMat3(rotation);
+          float3x3 scaledRot = float3x3(rot[0] * totalScale.x, rot[1] * totalScale.y, rot[2] * totalScale.z);
+          float4x4 local = float4x4(
+              scaledRot[0].x, scaledRot[1].x, scaledRot[2].x, position.x,
+              scaledRot[0].y, scaledRot[1].y, scaledRot[2].y, position.y,
+              scaledRot[0].z, scaledRot[1].z, scaledRot[2].z, position.z,
+              0.0f,           0.0f,           0.0f,           1.0f);
+          float4x4 world = mul(transpose(desc.transform), local);
+
+          float3 worldCenter = mul(world, float4(0.0f, 0.0f, 0.0f, 1.0f)).xyz;
+          float  maxScale    = max(max(totalScale.x, totalScale.y), totalScale.z);
+
+          if(pc.vertexBufferAddress != 0)
+          {
+            float3* centers = (float3*)pc.vertexBufferAddress;
+            centers[globalId] = worldCenter;
+          }
+          if(pc.radiusBufferAddress != 0)
+          {
+            float* radii = (float*)pc.radiusBufferAddress;
+            radii[globalId] = maxScale;
+          }
+        }
+      }
+      // Per-splat-set icosahedron: the only active branch for geometryMode==2
       else if(pc.geometryType == kGeometryTriangles)
       {
         if(pc.vertexBufferAddress != 0 && globalId < totalVerts)
@@ -203,6 +290,7 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
           float3 scale    = exp(fetchScale(desc, splatId));
           quat   rotation = normalize(vec4toQuat(fetchRotation(desc, splatId)));
           float  density  = fetchColor(desc, splatId).w;
+          scale = applyBillboardBounding(scale, pc.billboardBoundingMode);
           float kerScale = kernelScale(density, pc.kernelMinResponse, float(pc.kernelDegree), pc.kernelAdaptiveClamping != 0);
           float3 totalScale = scale * kIcosasVrtScale * kerScale;
           float3x3 rot = quatToMat3(rotation);
@@ -244,49 +332,49 @@ void main(uint3 dispatchThreadId : SV_DispatchThreadID)
     SplatSetDesc desc = descs[instanceIndex];
     float4x4 world = transpose(desc.transform);
     uint64_t blasAddress = desc.blasAddress;
-    const uint kMask = (blasAddress != 0) ? 0xFFu : 0u;
+    const uint kMask = (blasAddress != 0 && desc.show != 0) ? 0xFFu : 0u;
     const uint kSbtOffset = 0u;
     const uint kFlags = 0x8u;  // VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
     instances[instanceLocalId] = makeInstance(world, instanceIndex, kMask, kSbtOffset, kFlags, blasAddress);
     return;
   }
 
-  if(pc.globalIndexTableAddress == 0)
+  if(pc.instanceMode == 2)
+  {
+    // Per-particle instanced mode: write local particle transform only (no global transform baked).
+    // The TLAS is shared across all instances of the same splat set asset.
+    // The per-instance global transform is applied to the ray at trace time by the raygen shader.
+    SplatSetDesc desc = descs[pc.splatSetDescIndex];
+    uint splatLocalId = pc.instanceBaseIndex + instanceLocalId;
+
+    float3 position = fetchCenter(desc, splatLocalId);
+    float3 scale    = exp(fetchScale(desc, splatLocalId));
+    quat   rotation = normalize(vec4toQuat(fetchRotation(desc, splatLocalId)));
+    float  density  = fetchColor(desc, splatLocalId).w;
+
+    float kerScale = kernelScale(density, pc.kernelMinResponse, float(pc.kernelDegree), pc.kernelAdaptiveClamping != 0);
+    float vrtScale = (pc.geometryType == kGeometryTriangles) ? kIcosasVrtScale :
+                     (pc.geometryType == kGeometrySpheres)  ? kSphereVrtScale : kAabbVrtScale;
+
+    scale = applyBillboardBounding(scale, pc.billboardBoundingMode);
+
+    float3 totalScale = scale * vrtScale * kerScale;
+
+    float3x3 rot = quatToMat3(rotation);
+    float3x3 scaledRot = float3x3(rot[0] * totalScale.x, rot[1] * totalScale.y, rot[2] * totalScale.z);
+
+    float4x4 local = float4x4(
+        scaledRot[0].x, scaledRot[1].x, scaledRot[2].x, position.x,
+        scaledRot[0].y, scaledRot[1].y, scaledRot[2].y, position.y,
+        scaledRot[0].z, scaledRot[1].z, scaledRot[2].z, position.z,
+        0.0f,           0.0f,           0.0f,           1.0f);
+
+    const uint kMask = 0xFFu;
+    const uint kSbtOffset = 0u;
+    const uint kFlags = 0x8u;  // VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
+    instances[instanceLocalId] = makeInstance(local, pc.splatSetDescIndex, kMask, kSbtOffset, kFlags, pc.blasAddress);
     return;
-
-  uint globalSplatId = pc.instanceBaseIndex + instanceLocalId;
-  // 64-bit byte offset to prevent overflow when globalSplatId > ~537M (buffer > 4 GB)
-  uint64_t gitByteOffset = uint64_t(globalSplatId) * uint64_t(sizeof(GlobalSplatIndexEntry));
-  GlobalSplatIndexEntry entry = *(GlobalSplatIndexEntry*)(pc.globalIndexTableAddress + gitByteOffset);
-  SplatSetDesc          desc  = descs[entry.splatSetIndex];
-  uint splatLocalId = entry.splatIndex;
-
-  float3 position = fetchCenter(desc, splatLocalId);
-  float3 scale    = exp(fetchScale(desc, splatLocalId));
-  quat   rotation = normalize(vec4toQuat(fetchRotation(desc, splatLocalId)));
-  float  density  = fetchColor(desc, splatLocalId).w;
-
-  float kerScale = kernelScale(density, pc.kernelMinResponse, float(pc.kernelDegree), pc.kernelAdaptiveClamping != 0);
-  float vrtScale = (pc.geometryType == kGeometryTriangles) ? kIcosasVrtScale : kAabbVrtScale;
-  float3 totalScale = scale * vrtScale * kerScale;
-
-  float3x3 rot = quatToMat3(rotation);
-  float3x3 scaledRot = float3x3(rot[0] * totalScale.x, rot[1] * totalScale.y, rot[2] * totalScale.z);
-
-  float4x4 local = float4x4(
-      scaledRot[0].x, scaledRot[1].x, scaledRot[2].x, position.x,
-      scaledRot[0].y, scaledRot[1].y, scaledRot[2].y, position.y,
-      scaledRot[0].z, scaledRot[1].z, scaledRot[2].z, position.z,
-      0.0f,           0.0f,           0.0f,           1.0f);
-
-  // Match CPU path: world = instanceTransform * localTransform
-  float4x4 world = mul(transpose(desc.transform), local);
-
-  const uint kMask = 0xFFu;
-  const uint kSbtOffset = 0u;
-  const uint kFlags = 0x8u;  // VK_GEOMETRY_INSTANCE_FORCE_NO_OPAQUE_BIT_KHR
-
-  instances[instanceLocalId] = makeInstance(world, globalSplatId, kMask, kSbtOffset, kFlags, pc.blasAddress);
+  }
 
 }
 

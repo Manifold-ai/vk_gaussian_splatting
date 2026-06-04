@@ -16,6 +16,8 @@ This project implements several **rendering pipelines** based on **rasterization
 
 ## Quick Start
 
+Requirements: NVIDIA GPU or Full Vulkan 1.4 enabled GPU, 64-bit Windows or Linux.
+
 1. [Download the latest release](https://github.com/nvpro-samples/vk_gaussian_splatting/releases) for your OS
     * decompress the archive
     * run the executable vk_gaussian_splatting[.exe]
@@ -30,15 +32,17 @@ Please consult the [documentation](https://nvpro-samples.github.io/vk_gaussian_s
 
 * [Release Notes](https://nvpro-samples.github.io/vk_gaussian_splatting/release-notes) — with feature videos for novelties
 * [Getting Started](https://nvpro-samples.github.io/vk_gaussian_splatting/getting-started/) — get **up and running**, download pre-builds or build from source, and open your first scene
+* 🔥[Sample Projects](https://nvpro-samples.github.io/vk_gaussian_splatting/sample-projects/) — ready-made scenes showcasing the renderer, with image comparisons
+* [Datasets](https://nvpro-samples.github.io/vk_gaussian_splatting/datasets/) — download links and recommended settings for additional sample models
 * [User Guides](https://nvpro-samples.github.io/vk_gaussian_splatting/user-guides/overview/) — walkthrough of the UI, rendering settings, and tools
 * [Deep Dives](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/rasterization_of_3d_gaussian_splatting/) — in-depth technical presentation of the rendering implementations and features:
   * [VK3DGSR — Rasterization](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/rasterization_of_3d_gaussian_splatting/)
   * [VK3DGRT — Ray Tracing](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/ray_tracing_3d_gaussians/)
   * [VK3DGUT — Unscented Transform](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/rasterization_of_3dgut/)
   * [VK3DGHR — Hybrid Rendering](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/hybrid_rendering_3d_gaussians/)
-  * 🔥[Stochastic Transparency](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/stochastic_transparency/)
-  * 🔥[Lighting and Shadows](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/lighting_and_shadows/)
-* [Datasets](https://nvpro-samples.github.io/vk_gaussian_splatting/datasets/) — download links and recommended settings for sample models
+  * [Stochastic Transparency](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/stochastic_transparency/)
+  * [Lighting and Shadows](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/lighting_and_shadows/)
+  * 🔥[Billboard Ray Tracing](https://nvpro-samples.github.io/vk_gaussian_splatting/deep-dives/billboard_ray_tracing/)
 * [References](https://nvpro-samples.github.io/vk_gaussian_splatting/references/) — bibliography
 
 If you are working offline, you can browse the documentation markdown pages in the [docs](./docs) folder.
@@ -47,7 +51,22 @@ If you are working offline, you can browse the documentation markdown pages in t
 
 ## News
 
-- [2026/04] 🔥Release 2026.1.7 
+- [2026/06] 🔥Release 2026.2
+  - **GGX PBR materials** (metallic-roughness) replacing Phong, with indirect lighting for splat sets
+  - **glTF/GLB mesh loading** with full PBR textures, emissive, and scene-graph flattening
+  - **Physically-based lighting**: IBL environment maps, physical sky background, and NEE + BRDF path tracing with MIS
+  - **Tone mapping and auto-exposure** integrated from nvpro_core2
+  - **Billboard ray tracing** path with intersection shaders and selectable TLAS bounding modes
+  - **Sphere primitive mode** via `VK_NV_ray_tracing_linear_swept_spheres`
+  - **Shared TLAS** for per-particle RTX with reduced VRAM and fewer acceleration-structure rebuilds
+  - **DLSS improvements**: motion vectors for meshes and splat sets, hardware depth, firefly clamp
+  - **Renderer UI rework** with Denoising / Rasterization / Raytracing tabs
+  - **Save / Save As projects** including renderer and tonemapping settings
+  - **Samples folder** with an asset-download build script and new sample projects
+  - **Billboard benchmark suite** and **headless mode** with an expanded CLI
+  - **Platform**: HardwareSupport capability registry, Intel Arc and Linux build fixes, upgraded nvpro_core2
+  - [Release Notes](https://nvpro-samples.github.io/vk_gaussian_splatting/release-notes)
+- [2026/04] Release 2026.1.7 
   - **Pre-built binaries** available on GitHub Releases page
   - **New online [documentation](https://nvpro-samples.github.io/vk_gaussian_splatting/) website** — user guides, technical deep dives, and references now available as a browsable site
   - **Simplified root README.md** (this file)
@@ -55,30 +74,8 @@ If you are working offline, you can browse the documentation markdown pages in t
   - **Navigation mode icons** in toolbar with improved camera controls
   - **Fix profiler reporting** during camera drag in raster/hybrid pipelines
   - **Fix 32-bit addressing overflow** in sorting buffers by converting to LargeBuffer (supports larger models)
-- [2026/03] 🔥Release 2026.1
-  - **Multi-instance splat set architecture** with global index tables and unified sorting
-  - **Centralized bindless asset management** with a root bindless scene assets buffer
-  - **Multi-light lighting system** (point / spot / directional, ray traced hard / soft shadows)
-  - **Front-to-back rasterization** with depth consolidation for lighting
-  - **Deferred shading** for rasterized Gaussian splats
-  - **GPU-built particle acceleration structures** with multi-TLAS / multi-BLAS chunking and VRAM budget pre-checking 
-    - **Ray tracing now supports very large models** and updates faster
-  - **Stochastic splat sorting** and **Monte Carlo trace strategy** for enhanced interactivity
-  - **DLSS Ray Reconstruction** for anti-aliasing, upscaling and denoising
-  - **Expanded visualization modes** in ray tracing and hybrid pipelines (normals, depth, DLSS buffers, splat ID)
-  - **UI / UX enhancements** (summary overlay, shader feedback and ray hit profile, editing mode)
-  - **3D transform** and **infinite grid** visual helpers
-  - **Runtime image comparison tool** with MSE / PSNR / FLIP metrics
-  - **Added new models** from [teleportour.com](https://teleportour.com/). Thanks to [Andrii Shramko](https://www.linkedin.com/in/andrii-shramko). See [Datasets](https://nvpro-samples.github.io/vk_gaussian_splatting/datasets/) page.
-- [2025/10] Migration from GLSL to SLANG.
-- [2025/09] Added Unscented Transform (3DGUT) and hybrid rendering (3DGUT/3DGRT) pipelines, with support for fisheye and depth of field.
-- [2025/09] Added import of .spz file format from [nianticlabs](https://github.com/nianticlabs/spz).
-- [2025/08] Added depth of field to raytracing (3DGRT) pipeline.
-- [2025/08] Added raytracing (3DGRT) and hybrid rendering (3DGS/3DGRT) pipelines + 3DGRT dataset.
-- [2025/08] Added compositing with meshes and project save/load functionality.
-- [2025/06] Ported to new NVIDIA DesignWorks [nvpro_core2](https://github.com/nvpro-samples/nvpro_core2).
-- [2025/03] Added new models from [3ds-scan.de](https://3ds-scan.de/). Thanks to Christian Rochner.
-- [2025/03] First release with 3DGS rasterization.
+
+For earlier releases and full details, see the [Release Notes](https://nvpro-samples.github.io/vk_gaussian_splatting/release-notes) page.
 
 ## Support and Feedback
 

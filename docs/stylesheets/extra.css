@@ -11,3 +11,60 @@
   width: auto;
   filter: brightness(0) invert(1);
 }
+
+.md-typeset img-comparison-slider {
+  width: 100%;
+  outline: none;
+}
+
+.md-typeset img-comparison-slider:focus {
+  outline: none;
+}
+
+.md-typeset img-comparison-slider figure {
+  margin: initial;
+}
+
+.md-typeset img-comparison-slider img {
+  width: 100%;
+  display: block;
+}
+
+.md-typeset .before figcaption,
+.md-typeset .after figcaption {
+  background: #fff;
+  border: 1px solid #c0c0c0;
+  border-radius: 12px;
+  color: #2e3452;
+  opacity: 0.8;
+  padding: 12px;
+  position: absolute;
+  top: 75%;
+  transform: translateY(-50%);
+  line-height: 100%;
+}
+
+.md-typeset .before figcaption {
+  left: 12px;
+}
+
+.md-typeset .after figcaption {
+  right: 12px;
+}
+
+.md-typeset .tick {
+  color: #76b900;
+  font-weight: bold;
+}
+
+.md-typeset .b-dics {
+  margin: 1em 0;
+}
+
+.md-typeset .b-dics img {
+  max-width: none;
+  width: auto;
+  height: 100%;
+  display: block;
+  margin: 0;
+}

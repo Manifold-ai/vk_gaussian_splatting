@@ -21,6 +21,8 @@
 
 #include "nvgui/fonts.hpp"
 #include "nvgui/tooltip.hpp"
+#include "nvgui/azimuth_sliders.hpp"
+#include "nvgui/tonemapper.hpp"
 
 #include <nvvk/helpers.hpp>  // For imageToLinear and saveImageToFile
 
@@ -40,15 +42,23 @@ using shaderio::MeshType;  // Import MeshType enum for convenience
 #include <cmath>      // for std::round
 
 #include "gaussian_splatting_ui.h"
+#include "utilities_ui.h"
 #include "memory_statistics.h"
 #include "memory_monitor_vk.h"
 #include "vkgs_project_reader.h"
 #include "vkgs_project_writer.h"
+#include "hardware_support.h"
 #include <GLFW/glfw3.h>
 #undef APIENTRY
 #include <fmt/format.h>
 
 namespace vk_gaussian_splatting {
+
+static VkResult saveRawImageToFile(VkDevice                     device,
+                                   VkImage                      dstImage,
+                                   VkDeviceMemory               dstImageMemory,
+                                   VkExtent2D                   size,
+                                   const std::filesystem::path& filename);
 
 GaussianSplattingUI::GaussianSplattingUI(nvutils::ProfilerManager*   profilerManager,
                                          nvutils::ParameterRegistry* parameterRegistry,
@@ -57,11 +67,14 @@ GaussianSplattingUI::GaussianSplattingUI(nvutils::ProfilerManager*   profilerMan
     , m_pBenchmarkEnabled(benchmarkEnabled)
     , m_imageCompareUI(&m_imageCompare)
 {
+  registerParameters(parameterRegistry);
+};
 
-  // Register some very sepcific command line parameters, related to benchmarking, other parameters are registered in main or in registerCommandLineParameters
+void GaussianSplattingUI::registerParameters(nvutils::ParameterRegistry* parameterRegistry)
+{
+  // Parameters requiring callbacks with access to UI-level state (m_assets, m_app, etc.).
+  // Simple value-assignment parameters are registered in registerCommandLineParameters() in parameters.cpp.
 
-  // Add updateData parameter with callback to trigger splat set regeneration
-  bool updateDataTrigger = false;
   parameterRegistry->add({.name = "updateData",
                           .help = "Use only in benchmark script. 1=triggers an update of data buffers or textures after a parameter change.",
                           .callbackSuccess =
@@ -69,10 +82,10 @@ GaussianSplattingUI::GaussianSplattingUI(nvutils::ProfilerManager*   profilerMan
                                 m_assets.splatSets.markAllSplatSetsForRegeneration();
                                 m_requestUpdateShaders = true;
                               }},
-                         &updateDataTrigger, true);  // Trigger value = true
+                         &m_updateDataTrigger, true);
 
   parameterRegistry->add({.name = "screenshot",
-                          .help = "Use only in benchmark script. Takes a screenshot.",
+                          .help = "Use only in benchmark script. Takes a screenshot from the swapchain (not available in headless mode; use --saveImage instead).",
                           .callbackSuccess =
                               [&](const nvutils::ParameterBase* const) {
                                 if(m_app)
@@ -81,7 +94,87 @@ GaussianSplattingUI::GaussianSplattingUI(nvutils::ProfilerManager*   profilerMan
                                 }
                               }},
                          {".png"}, &m_screenshotFilename);
-};
+
+  parameterRegistry->add({"saveImageBuffer",
+                          "Buffer index for --saveImage. -1=all(default), 0=main, 1=aux1, "
+                          "2=comparison(if active), 3=normal, 4=depth, 5=ldr(if tonemapping), "
+                          "6+=dlss buffers(if enabled). Use --saveImage after setting this."},
+                         &m_saveImageBufferIndex, int32_t(-1), int32_t(20));
+
+  parameterRegistry->add(
+      {.name = "saveImage",
+       .help = "Save internal render buffer(s) to file. Supports .png/.jpg/.hdr extensions.\n"
+               "Use --saveImageBuffer to select which buffer (-1=all).\n"
+               "Buffer indices:\n"
+               "  0: main (HDR color buffer)\n"
+               "  1: aux1 (temporal intermediate)\n"
+               "  2: comparison (if image compare active)\n"
+               "  3: normal\n"
+               "  4: depth\n"
+               "  5: ldr (if tonemapping active)\n"
+               "  6+: DLSS buffers (if DLSS enabled):\n"
+               "    6: dlss_input, 7: dlss_albedo, 8: dlss_specular,\n"
+               "    9: dlss_normal, 10: dlss_motion, 11: dlss_depth\n"
+               "  -1: all available buffers (default)",
+       .callbackSuccess =
+           [&](const nvutils::ParameterBase* const) { saveBufferToFile(m_saveImageFilename, m_saveImageBufferIndex); }},
+      {".png"}, &m_saveImageFilename);
+
+  parameterRegistry->add({.name = "loadCameraPresets",
+                          .help = "Load camera presets from an INRIA-format JSON file. Presets are appended to the existing list.",
+                          .callbackSuccess =
+                              [&](const nvutils::ParameterBase* const) {
+                                if(!importCamerasINRIA(m_cameraPresetsFilename.string(), m_assets.cameras))
+                                {
+                                  LOGW("Failed to load camera presets from '%s'\n", m_cameraPresetsFilename.string().c_str());
+                                }
+                              }},
+                         {".json"}, &m_cameraPresetsFilename);
+
+  parameterRegistry->add({.name = "activateCameraPreset",
+                          .help = "Instantly activate a camera preset by index (0-based). Use after --loadCameraPresets.",
+                          .callbackSuccess =
+                              [&](const nvutils::ParameterBase* const) {
+                                if(m_activateCameraPresetIndex < 0
+                                   || static_cast<uint64_t>(m_activateCameraPresetIndex) >= m_assets.cameras.size())
+                                {
+                                  LOGW("Camera preset index %d is out of range [0, %zu)\n", m_activateCameraPresetIndex,
+                                       m_assets.cameras.size());
+                                  return;
+                                }
+                                uint64_t index = static_cast<uint64_t>(m_activateCameraPresetIndex);
+                                if(cameraPresetNeedsShaderRebuild(index))
+                                {
+                                  m_requestUpdateShaders = true;
+                                }
+                                m_assets.cameras.loadPreset(index, true);
+                                m_lastLoadedCamera = index;
+                              }},
+                         &m_activateCameraPresetIndex);
+
+  parameterRegistry->add({.name = "colorBufferFormat",
+                          .help = "Color buffer format: 0=R8G8B8A8_UNORM (32-bit), 1=R16G16B16A16_SFLOAT (64-bit, default), "
+                                  "2=R32G32B32A32_SFLOAT (128-bit). Use in benchmark .cfg only (requires initialized app).",
+                          .callbackSuccess =
+                              [&](const nvutils::ParameterBase* const) {
+                                constexpr VkFormat formats[] = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R16G16B16A16_SFLOAT,
+                                                                VK_FORMAT_R32G32B32A32_SFLOAT};
+                                if(m_colorBufferFormatIndex < 0 || m_colorBufferFormatIndex > 2)
+                                {
+                                  LOGW("colorBufferFormat %d is out of range [0, 2]\n", m_colorBufferFormatIndex);
+                                  return;
+                                }
+                                prmRender.colorFormat = formats[m_colorBufferFormatIndex];
+                                if(!m_app)
+                                {
+                                  LOGW("colorBufferFormat: app not initialized, format will be applied at startup\n");
+                                  return;
+                                }
+                                m_requestGBufferReinit = true;
+                                resetFrameCounter();
+                              }},
+                         &m_colorBufferFormatIndex, 0, 2);
+}
 
 GaussianSplattingUI::~GaussianSplattingUI(){
     // Nothing to do here
@@ -93,6 +186,18 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
 
   GaussianSplatting::onAttach(app);
 
+  // Override global tree node / selectable header colors to match
+  // our collapsible group header background (WindowBg + small offset)
+  {
+    ImGuiStyle& style                    = ImGui::GetStyle();
+    ImVec4      bg                       = style.Colors[ImGuiCol_WindowBg];
+    ImVec4      headerBg                 = ImVec4(bg.x + 0.06f, bg.y + 0.06f, bg.z + 0.06f, 1.0f);
+    ImVec4      headerHovered            = ImVec4(bg.x + 0.10f, bg.y + 0.10f, bg.z + 0.10f, 1.0f);
+    style.Colors[ImGuiCol_Header]        = headerBg;
+    style.Colors[ImGuiCol_HeaderHovered] = headerHovered;
+    style.Colors[ImGuiCol_HeaderActive]  = headerBg;
+  }
+
   // Cache GPU device name (static for the lifetime of the app)
   {
     VkPhysicalDeviceProperties properties{};
@@ -100,22 +205,61 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
     m_cachedGpuName = properties.deviceName;
   }
 
+  // Create and register NVML monitor and profiler elements (skip in benchmark mode)
+  if(!*m_pBenchmarkEnabled)
+  {
+    // NVML GPU monitor — suppress its own View menu entry
+    struct GpuMonitorNoMenu : nvgpu_monitor::ElementGpuMonitor
+    {
+      void onUIMenu() override {}
+    };
+    auto gpuMonitor = std::make_shared<GpuMonitorNoMenu>();
+    m_gpuMonitor    = gpuMonitor.get();
+    m_app->addElement(gpuMonitor);
+
+    // Profiler — suppress its own View menu entry
+    m_profilerViewSettings = std::make_shared<nvapp::ElementProfiler::ViewSettings>(
+        nvapp::ElementProfiler::ViewSettings{.name       = "Profiler",
+                                             .defaultTab = nvapp::ElementProfiler::TABLE,
+                                             .pieChart   = {.cpuTotal = false, .levels = true},
+                                             .lineChart  = {.cpuLine = false}});
+    struct ProfilerNoMenu : nvapp::ElementProfiler
+    {
+      using ElementProfiler::ElementProfiler;
+      void onUIMenu() override {}
+    };
+    m_app->addElement(std::make_shared<ProfilerNoMenu>(m_profilerManager, m_profilerViewSettings));
+  }
+
   // Init combo selectors used in UI
 
   m_ui.enumAdd(GUI_STORAGE, STORAGE_BUFFERS, "Buffers");
   m_ui.enumAdd(GUI_STORAGE, STORAGE_TEXTURES, "Textures");
 
+  // Pipeline entries are greyed out at creation time when their required
+  // extensions are missing. Hardware support is fixed for the lifetime of the
+  // process so a single registration suffices. Coercion of any out-of-range
+  // value (project file / CLI / hotkey) lives in
+  // GaussianSplatting::onPreRender().
+  //   - PIPELINE_MESH / PIPELINE_MESH_3DGUT need VK_EXT_mesh_shader.
+  //   - PIPELINE_RTX needs the KHR ray tracing trio (raytracing flag).
+  //   - PIPELINE_HYBRID and PIPELINE_HYBRID_3DGUT need both, since they
+  //     dispatch via vkCmdDrawMeshTasksEXT for primary rays and ray trace
+  //     secondary rays.
+  const bool meshUnavailable = !isSupported.meshShader;
+  const bool rtxUnavailable  = !isSupported.raytracing;
   m_ui.enumAdd(GUI_PIPELINE, PIPELINE_VERT, "Raster 3DGS vertex shader");
-  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_MESH, "Raster 3DGS mesh shader");
-  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_MESH_3DGUT, "Raster 3DGUT mesh shader");
-  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_RTX, "Ray tracing 3DGRT");
-  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_HYBRID, "Hybrid 3DGS+3DGRT");
-  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_HYBRID_3DGUT, "Hybrid 3DGUT+3DGRT");
+  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_MESH, "Raster 3DGS mesh shader", meshUnavailable);
+  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_MESH_3DGUT, "Raster 3DGUT mesh shader", meshUnavailable);
+  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_RTX, "Ray tracing 3DGRT", rtxUnavailable);
+  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_HYBRID, "Hybrid 3DGS+3DGRT", meshUnavailable || rtxUnavailable);
+  m_ui.enumAdd(GUI_PIPELINE, PIPELINE_HYBRID_3DGUT, "Hybrid 3DGUT+3DGRT", meshUnavailable || rtxUnavailable);
 
   m_ui.enumAdd(GUI_EXTENT_METHOD, EXTENT_EIGEN, "Eigen");
   m_ui.enumAdd(GUI_EXTENT_METHOD, EXTENT_CONIC, "Conic");
 
   m_ui.enumAdd(GUI_VISUALIZE, VISUALIZE_FINAL, "Final render");
+  m_ui.enumAdd(GUI_VISUALIZE, VISUALIZE_CLAY, "Clay mode");
   m_ui.enumAdd(GUI_VISUALIZE, VISUALIZE_CLOCK, "Clock cycles");
   m_ui.enumAdd(GUI_VISUALIZE, VISUALIZE_RAYHITS, "Ray Hit Count");
   m_ui.enumAdd(GUI_VISUALIZE, VISUALIZE_DEPTH_INTEGRATED, "Depth (iso thres)");
@@ -133,6 +277,7 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
   m_ui.enumAdd(GUI_VISUALIZE, VISUALIZE_DLSS_DEPTH, "DLSS Guide: Depth", true);
 
   m_ui.enumAdd(GUI_VISUALIZE_DLSS_ON, VISUALIZE_FINAL, "Final render");
+  m_ui.enumAdd(GUI_VISUALIZE_DLSS_ON, VISUALIZE_CLAY, "Clay");
   m_ui.enumAdd(GUI_VISUALIZE_DLSS_ON, VISUALIZE_CLOCK, "Clock cycles");
   m_ui.enumAdd(GUI_VISUALIZE_DLSS_ON, VISUALIZE_RAYHITS, "Ray Hit Count");
   m_ui.enumAdd(GUI_VISUALIZE_DLSS_ON, VISUALIZE_DEPTH_INTEGRATED, "Depth (iso thres)");
@@ -153,6 +298,10 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
   m_ui.enumAdd(GUI_SORTING, SORTING_CPU_ASYNC_MULTI, "CPU async std multi");
   m_ui.enumAdd(GUI_SORTING, SORTING_STOCHASTIC_SPLAT, "Stochastic splat");
 
+  m_ui.enumAdd(GUI_FRUSTUM_CULLING, FRUSTUM_CULLING_NONE, "Disabled");
+  m_ui.enumAdd(GUI_FRUSTUM_CULLING, FRUSTUM_CULLING_AT_DIST, "At distance stage");
+  m_ui.enumAdd(GUI_FRUSTUM_CULLING, FRUSTUM_CULLING_AT_RASTER, "At raster stage");
+
   m_ui.enumAdd(GUI_SH_FORMAT, FORMAT_FLOAT32, "Float 32");
   m_ui.enumAdd(GUI_SH_FORMAT, FORMAT_FLOAT16, "Float 16");
   m_ui.enumAdd(GUI_SH_FORMAT, FORMAT_UINT8, "Uint8");
@@ -163,6 +312,12 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
 
   m_ui.enumAdd(GUI_PARTICLE_FORMAT, PARTICLE_FORMAT_ICOSAHEDRON, "Icosahedron");
   m_ui.enumAdd(GUI_PARTICLE_FORMAT, PARTICLE_FORMAT_PARAMETRIC, "AABB + parametric");
+  // Sphere (NV) is greyed out when the device does not expose
+  // VK_NV_ray_tracing_linear_swept_spheres. Hardware support is fixed for
+  // the lifetime of the process so a single menu suffices. Coercion of any
+  // out-of-range value (e.g. a project file or CLI requesting sphere mode
+  // on hardware without LSS) lives in GaussianSplatting::onPreRender().
+  m_ui.enumAdd(GUI_PARTICLE_FORMAT, PARTICLE_FORMAT_SPHERE, "Sphere (NV)", !isSupported.rayTracingLinearSweptSpheres);
 
   m_ui.enumAdd(GUI_CAMERA_TYPE, CAMERA_PINHOLE, "Pinhole");
   m_ui.enumAdd(GUI_CAMERA_TYPE, CAMERA_FISHEYE, "Fisheye");
@@ -186,10 +341,6 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
   m_ui.enumAdd(GUI_ATTENUATION_MODE, 1, "Linear");
   m_ui.enumAdd(GUI_ATTENUATION_MODE, 2, "Quadratic");
   m_ui.enumAdd(GUI_ATTENUATION_MODE, 3, "Physical");
-
-  m_ui.enumAdd(GUI_ILLUM_MODEL, 0, "No indirect");
-  m_ui.enumAdd(GUI_ILLUM_MODEL, 1, "Reflective");
-  m_ui.enumAdd(GUI_ILLUM_MODEL, 2, "Refractive");
 
   m_ui.enumAdd(GUI_DIST_SHADER_WG_SIZE, 512, "512");
   m_ui.enumAdd(GUI_DIST_SHADER_WG_SIZE, 256, "256");
@@ -239,11 +390,10 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
   m_ui.enumAdd(GUI_COMPARISON_DISPLAY, (int)ImageCompare::Mode::eDifferenceRedOnly, "Difference (Red only)");
 
   m_ui.enumAdd(GUI_NORMAL_METHOD, (int)NormalMethod::eMaxDensityPlane, "Max density plane");
-  m_ui.enumAdd(GUI_NORMAL_METHOD, (int)NormalMethod::eIsoSurface, "Kernel elipsoid");
+  m_ui.enumAdd(GUI_NORMAL_METHOD, (int)NormalMethod::eIsoSurface, "Kernel ellipsoid");
 
-  m_ui.enumAdd(GUI_LIGHTING_MODE, (int)LightingMode::eLightingDisabled, "Lighting off");
-  m_ui.enumAdd(GUI_LIGHTING_MODE, (int)LightingMode::eLightingDirect, "Direct lighting");
-  m_ui.enumAdd(GUI_LIGHTING_MODE, (int)LightingMode::eLightingIndirect, "Indirect lighting");
+  m_ui.enumAdd(GUI_LIGHTING_MODE, LIGHTING_DISABLED, "Lighting off");
+  m_ui.enumAdd(GUI_LIGHTING_MODE, LIGHTING_ENABLED, "Lighting on");
 
   m_ui.enumAdd(GUI_SHADOWS_MODE, (int)ShadowsMode::eShadowsDisabled, "Shadows off");
   m_ui.enumAdd(GUI_SHADOWS_MODE, (int)ShadowsMode::eShadowsHard, "Hard shadows");
@@ -255,6 +405,24 @@ void GaussianSplattingUI::onAttach(nvapp::Application* app)
 
   m_ui.enumAdd(GUI_DOF_MODE_NO_AUTO, (int)DofMode::eDofDisabled, "Disabled");
   m_ui.enumAdd(GUI_DOF_MODE_NO_AUTO, (int)DofMode::eDofFixedFocus, "Fixed focus");
+
+  m_ui.enumAdd(GUI_PARTICLE_DEPTH, PARTICLE_DEPTH_BILLBOARD, "Billboard (3DGS/3DGUT)");
+  m_ui.enumAdd(GUI_PARTICLE_DEPTH, PARTICLE_DEPTH_ELLIPSOID, "Ellipsoid (3DGRT)");
+  // m_ui.enumAdd(GUI_PARTICLE_DEPTH, PARTICLE_DEPTH_MAX_DENSITY_PLANE, "Max Density Plane (StochasticSplat)");
+
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingFitted, "Fitted");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingUniform, "Uniform");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingUniform3_4, "Uniform 3/4");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingUniform2_3, "Uniform 2/3");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingUniform1_2, "Uniform 1/2");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingUniform1_3, "Uniform 1/3");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingUniform1_4, "Uniform 1/4");
+  m_ui.enumAdd(GUI_BILLBOARD_BOUNDING_MODE, (int)BillboardBoundingMode::eBillboardBoundingOptimal, "Optimal");
+
+  m_ui.enumAdd(GUI_COVARIANCE_DILATION, 0, "0.0");
+  m_ui.enumAdd(GUI_COVARIANCE_DILATION, 1, "0.1");
+  m_ui.enumAdd(GUI_COVARIANCE_DILATION, 2, "0.2");
+  m_ui.enumAdd(GUI_COVARIANCE_DILATION, 3, "0.3");
 }
 
 void GaussianSplattingUI::onDetach()
@@ -428,9 +596,9 @@ void GaussianSplattingUI::guiDrawSummaryOverlay(ImVec2 imagePos, ImVec2 imageSiz
   }
   ImGui::Text("%s", pipelineName);
 
-  // Particle count
-  int32_t totalSplatCount = m_assets.splatSets.getTotalGlobalSplatCount();
-  if(prmSelectedPipeline == PIPELINE_RTX)
+  // Particle count (uint32_t to avoid overflow beyond INT32_MAX ~2.1B splats)
+  uint32_t totalSplatCount = m_assets.splatSets.getTotalGlobalSplatCount();
+  if(isRtxPipelineOnly())
   {
     // Pure ray tracing: show total only
     ImGui::Text("Particles %s", formatSize(totalSplatCount).c_str());
@@ -440,7 +608,7 @@ void GaussianSplattingUI::guiDrawSummaryOverlay(ImVec2 imagePos, ImVec2 imageSiz
     // Raster and hybrid modes: show rasterized / total
     const bool usesDistShader =
         (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX) || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
-    int32_t rasterSplatCount = usesDistShader ? m_indirectReadback.instanceCount : totalSplatCount;
+    uint32_t rasterSplatCount = usesDistShader ? m_indirectReadback.instanceCount : totalSplatCount;
     ImGui::Text("Particles %s / %s", formatSize(rasterSplatCount).c_str(), formatSize(totalSplatCount).c_str());
   }
 
@@ -518,11 +686,8 @@ void GaussianSplattingUI::saveVisualizationImageToFile(const std::filesystem::pa
   VkDeviceMemory dstImageMemory = {};
 
   // Determine output format based on file extension
-  VkFormat format = VK_FORMAT_R8G8B8A8_UNORM;  // Default for PNG/JPG/BMP
-  if(filename.extension() == ".hdr")
-  {
-    format = VK_FORMAT_R32G32B32A32_SFLOAT;  // HDR float format
-  }
+  const bool isFloat = (filename.extension() == ".hdr" || filename.extension() == ".raw");
+  VkFormat   format  = isFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
 
   // Convert to linear tiled image (handles format conversion via GPU blit)
   nvvk::imageToLinear(cmd, m_device, m_app->getPhysicalDevice(), srcImageInfo.image, srcImageInfo.size, dstImage,
@@ -531,12 +696,101 @@ void GaussianSplattingUI::saveVisualizationImageToFile(const std::filesystem::pa
   // Submit and wait for completion (synchronous)
   m_app->submitAndWaitTempCmdBuffer(cmd);
 
-  // Save to file (quality 90 for JPEG)
-  nvvk::saveImageToFile(m_device, dstImage, dstImageMemory, srcImageInfo.size, filename, 90);
+  // Save to file
+  if(isFloat && filename.extension() == ".raw")
+    saveRawImageToFile(m_device, dstImage, dstImageMemory, srcImageInfo.size, filename);
+  else
+    nvvk::saveImageToFile(m_device, dstImage, dstImageMemory, srcImageInfo.size, filename, 90);
 
   // Clean up temporary resources
   vkFreeMemory(m_device, dstImageMemory, nullptr);
   vkDestroyImage(m_device, dstImage, nullptr);
+
+  // Multi-buffer dump: save all available G-buffers with postfixed filenames
+  const std::filesystem::path stem = filename.parent_path() / filename.stem();
+  const std::filesystem::path ext  = filename.extension();
+
+  for(const auto& buf : getAllDumpableBuffers())
+  {
+    if(buf.image == VK_NULL_HANDLE)
+      continue;
+
+    const std::filesystem::path postfixedPath = std::filesystem::path(stem.string() + buf.postfix + ext.string());
+
+    VkFormat bufDstFormat = isFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+
+    VkCommandBuffer bufCmd       = m_app->createTempCmdBuffer();
+    VkImage         bufDstImage  = {};
+    VkDeviceMemory  bufDstMemory = {};
+
+    nvvk::imageToLinear(bufCmd, m_device, m_app->getPhysicalDevice(), buf.image, buf.size, bufDstImage, bufDstMemory, bufDstFormat);
+    m_app->submitAndWaitTempCmdBuffer(bufCmd);
+
+    if(isFloat && ext == ".raw")
+      saveRawImageToFile(m_device, bufDstImage, bufDstMemory, buf.size, postfixedPath);
+    else
+      nvvk::saveImageToFile(m_device, bufDstImage, bufDstMemory, buf.size, postfixedPath, 90);
+
+    vkFreeMemory(m_device, bufDstMemory, nullptr);
+    vkDestroyImage(m_device, bufDstImage, nullptr);
+  }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Save a specific buffer by index, or all buffers if bufferIndex == -1.
+//
+void GaussianSplattingUI::saveBufferToFile(const std::filesystem::path& filename, int32_t bufferIndex)
+{
+  const auto buffers = getAllDumpableBuffers();
+
+  if(buffers.empty())
+  {
+    LOGW("saveBufferToFile: No buffers available for saving.\n");
+    return;
+  }
+
+  const bool isFloat   = (filename.extension() == ".hdr" || filename.extension() == ".raw");
+  VkFormat   dstFormat = isFloat ? VK_FORMAT_R32G32B32A32_SFLOAT : VK_FORMAT_R8G8B8A8_UNORM;
+
+  const std::filesystem::path stem = filename.parent_path() / filename.stem();
+  const std::filesystem::path ext  = filename.extension();
+
+  auto saveOneBuffer = [&](const BufferDumpInfo& buf) {
+    if(buf.image == VK_NULL_HANDLE)
+      return;
+
+    const std::filesystem::path outPath = std::filesystem::path(stem.string() + buf.postfix + ext.string());
+
+    VkCommandBuffer cmd       = m_app->createTempCmdBuffer();
+    VkImage         dstImage  = {};
+    VkDeviceMemory  dstMemory = {};
+
+    nvvk::imageToLinear(cmd, m_device, m_app->getPhysicalDevice(), buf.image, buf.size, dstImage, dstMemory, dstFormat);
+    m_app->submitAndWaitTempCmdBuffer(cmd);
+
+    if(isFloat && ext == ".raw")
+      saveRawImageToFile(m_device, dstImage, dstMemory, buf.size, outPath);
+    else
+      nvvk::saveImageToFile(m_device, dstImage, dstMemory, buf.size, outPath, 90);
+
+    vkFreeMemory(m_device, dstMemory, nullptr);
+    vkDestroyImage(m_device, dstImage, nullptr);
+  };
+
+  if(bufferIndex == -1)
+  {
+    for(const auto& buf : buffers)
+      saveOneBuffer(buf);
+  }
+  else if(bufferIndex >= 0 && bufferIndex < static_cast<int32_t>(buffers.size()))
+  {
+    saveOneBuffer(buffers[bufferIndex]);
+  }
+  else
+  {
+    LOGW("saveBufferToFile: Buffer index %d out of range [0, %d]. Use -1 for all.\n", bufferIndex,
+         static_cast<int32_t>(buffers.size()) - 1);
+  }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -570,12 +824,20 @@ std::string GaussianSplattingUI::getSettingsString(int pipeline, int visualize)
 void GaussianSplattingUI::onUIMenu()
 {
   static bool close_app{false};
+  static bool save_overwrite_requested{false};
   bool        v_sync = m_app->isVsync();
 #ifndef NDEBUG
   static bool s_showDemo{false};
   static bool s_showDemoPlot{false};
   static bool s_showDemoIcons{false};
 #endif
+
+  // Ctrl+S shortcut (outside menu so it works even when menu is closed)
+  if(ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_S) && !m_projectPath.empty())
+  {
+    save_overwrite_requested = true;
+  }
+
   if(ImGui::BeginMenu("File"))
   {
     // Project
@@ -599,12 +861,15 @@ void GaussianSplattingUI::onUIMenu()
       }
       ImGui::EndMenu();
     }
-    if(ImGui::MenuItem(ICON_MS_FILE_SAVE " Save project", ""))
+    if(ImGui::MenuItem(ICON_MS_FILE_SAVE " Save project", "Ctrl+S", false, !m_projectPath.empty()))
+    {
+      save_overwrite_requested = true;
+    }
+    if(ImGui::MenuItem(ICON_MS_FILE_SAVE " Save project as...", ""))
     {
       auto path = nvgui::windowSaveFileDialog(m_app->getWindowHandle(), "Save project file", "VKGS Files|*.vkgs");
       if(!path.empty())
       {
-        // Ensure the extension is always ".vkgs" before saving and adding to recent projects
         if(!nvutils::extensionMatches(path, ".vkgs"))
         {
           path = path.replace_extension(".vkgs");
@@ -612,6 +877,7 @@ void GaussianSplattingUI::onUIMenu()
 
         if(saveProject(path.string()))
         {
+          m_projectPath = std::filesystem::absolute(path);
           guiAddToRecentProjects(path);
         }
       }
@@ -646,11 +912,23 @@ void GaussianSplattingUI::onUIMenu()
 
     if(ImGui::MenuItem(ICON_MS_FILE_OPEN " Open Mesh", ""))
     {
-      auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load Mesh", "All Files|*.obj|OBJ Files|*.obj");
+      auto path = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load Mesh",
+                                              "All Mesh Files|*.obj;*.gltf;*.glb|OBJ Files|*.obj|glTF Files|*.gltf;*.glb");
       if(!path.empty())
       {
         prmScene.meshToImportFilename = path;
       }
+    }
+    if(ImGui::BeginMenu(ICON_MS_HISTORY " Recent Meshes"))
+    {
+      for(const auto& file : m_recentMeshes)
+      {
+        if(ImGui::MenuItem(file.string().c_str()))
+        {
+          prmScene.meshToImportFilename = file;
+        }
+      }
+      ImGui::EndMenu();
     }
 
     ImGui::Separator();
@@ -663,9 +941,39 @@ void GaussianSplattingUI::onUIMenu()
   if(ImGui::BeginMenu("View"))
   {
     ImGui::MenuItem(ICON_MS_BOTTOM_PANEL_OPEN " V-Sync", "Ctrl+Shift+V", &v_sync);
+    if(ImGui::MenuItem(ICON_MS_FULLSCREEN " Full Screen", "F11", m_fullScreen))
+    {
+      m_fullScreen = !m_fullScreen;
+    }
+    ImGui::Separator();
+    ImGui::MenuItem(ICON_MS_FOLDER_OPEN " Assets Browser", nullptr, &m_showAssetsWindow);
+    ImGui::MenuItem(ICON_MS_TUNE " Assets Properties", nullptr, &m_showPropertiesWindow);
+    ImGui::Separator();
     ImGui::MenuItem(ICON_MS_DATA_TABLE " Renderer Statistics", nullptr, &m_showRendererStatistics);
     ImGui::MenuItem(ICON_MS_DATA_TABLE " Memory Statistics", nullptr, &m_showMemoryStatistics);
     ImGui::MenuItem(ICON_MS_DATA_TABLE " Shader Feedback", nullptr, &m_showShaderFeedback);
+    ImGui::MenuItem(ICON_MS_DOCK_TO_BOTTOM " Footer Bar", nullptr, &m_showFooterBar);
+    if(m_profilerViewSettings)
+      ImGui::MenuItem(ICON_MS_BLOOD_PRESSURE " Profiler", nullptr, &m_profilerViewSettings->show);
+    if(m_gpuMonitor)
+      ImGui::MenuItem(ICON_MS_BROWSE_ACTIVITY " NVML Monitor", nullptr, &m_gpuMonitor->showWindow);
+    ImGui::Separator();
+    if(ImGui::MenuItem(ICON_MS_VISIBILITY " Show all"))
+    {
+      m_showAssetsWindow = m_showPropertiesWindow = m_showRendererStatistics = m_showMemoryStatistics =
+          m_showShaderFeedback = m_showFooterBar = true;
+      if(m_profilerViewSettings)
+        m_profilerViewSettings->show = true;
+    }
+    if(ImGui::MenuItem(ICON_MS_VISIBILITY_OFF " Hide all"))
+    {
+      m_showAssetsWindow = m_showPropertiesWindow = m_showRendererStatistics = m_showMemoryStatistics =
+          m_showShaderFeedback = m_showFooterBar = false;
+      if(m_profilerViewSettings)
+        m_profilerViewSettings->show = false;
+      if(m_gpuMonitor)
+        m_gpuMonitor->showWindow = false;
+    }
     ImGui::EndMenu();
   }
 #ifndef NDEBUG
@@ -677,6 +985,39 @@ void GaussianSplattingUI::onUIMenu()
     ImGui::EndMenu();
   }
 #endif  // !NDEBUG
+
+  // Save overwrite confirmation modal
+  if(save_overwrite_requested)
+  {
+    ImGui::OpenPopup("Overwrite project file?");
+    save_overwrite_requested = false;
+  }
+  {
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if(ImGui::BeginPopupModal("Overwrite project file?", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+      ImGui::Text("Overwrite %s?", m_projectPath.filename().string().c_str());
+      ImGui::Separator();
+
+      if(ImGui::Button("OK", ImVec2(120, 0)))
+      {
+        if(saveProject(m_projectPath.string()))
+        {
+          guiAddToRecentProjects(m_projectPath);
+        }
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SetItemDefaultFocus();
+      ImGui::SameLine();
+      if(ImGui::Button("Cancel", ImVec2(120, 0)))
+      {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+  }
 
   // V-Sync, Screenshot, and Image Comparison Toggle Buttons (centered as group on viewport)
   {
@@ -736,10 +1077,27 @@ void GaussianSplattingUI::onUIMenu()
       ImGui::SetTooltip("Toggle V-Sync");
     }
 
+    // Full Screen button (on same line)
+    ImGui::SameLine();
+
+    pushIconStyle(m_fullScreen);
+
+    if(ImGui::Button(m_fullScreen ? ICON_MS_FULLSCREEN_EXIT : ICON_MS_FULLSCREEN))
+    {
+      m_fullScreen = !m_fullScreen;
+    }
+
+    popIconStyle();
+
+    if(ImGui::IsItemHovered())
+    {
+      ImGui::SetTooltip(m_fullScreen ? "Exit full screen (F11)" : "Enter full screen (F11)");
+    }
+
     // Screenshot button (on same line)
     ImGui::SameLine();
 
-    if(ImGui::Button(ICON_MS_CAMERA))
+    if(ImGui::Button(ICON_MS_ADD_PHOTO_ALTERNATE))
     {
       // Open save file dialog
       std::filesystem::path filename =
@@ -793,7 +1151,7 @@ void GaussianSplattingUI::onUIMenu()
 
     pushIconStyle(m_showSummaryOverlay);
 
-    if(ImGui::Button(ICON_MS_MONITORING))
+    if(ImGui::Button(ICON_MS_INFO))
     {
       m_showSummaryOverlay = !m_showSummaryOverlay;
     }
@@ -820,7 +1178,7 @@ void GaussianSplattingUI::onUIMenu()
 
     if(ImGui::IsItemHovered())
     {
-      ImGui::SetTooltip("Toggle to editing mode (translate/rotate/scale)");
+      ImGui::SetTooltip("Toggle to editing mode (E)");
     }
 
     // Grid toggle button
@@ -856,7 +1214,7 @@ void GaussianSplattingUI::onUIMenu()
 
     if(ImGui::IsItemHovered())
     {
-      ImGui::SetTooltip("Toggle light proxy visibility");
+      ImGui::SetTooltip("Toggle light proxy visibility (L)");
     }
 
     // Vertical separator before navigation mode
@@ -904,6 +1262,32 @@ void GaussianSplattingUI::onUIMenu()
       {
         ImGui::SetTooltip("Walk - move on XZ plane - WASD keys plus mouse");
       }
+
+      ImGui::SameLine();
+
+      pushIconStyle(m_playPresets);
+      if(ImGui::Button(ICON_MS_LAPS))
+      {
+        m_playPresets = !m_playPresets;
+        if(m_playPresets && m_assets.cameras.size() >= 2)
+        {
+          m_lastLoadedCamera                    = 0;
+          m_requestUpdateShadersAfterCameraAnim = cameraPresetNeedsShaderRebuild(0);
+          m_assets.cameras.loadPreset(0, false);
+          m_selectedCameraPresetIndex = -1;
+        }
+        else if(!m_playPresets && cameraManip->isAnimated())
+        {
+          // Stop mid-flight: snap to the current interpolated position (instantSet=true
+          // cancels the animation and keeps the camera where it is right now)
+          cameraManip->setCamera(cameraManip->getCamera(), true);
+        }
+      }
+      popIconStyle();
+      if(ImGui::IsItemHovered())
+      {
+        ImGui::SetTooltip("Play/pause camera preset cycling");
+      }
     }
 
     // Vertical separator before pipeline/sorting/RTX settings
@@ -925,7 +1309,7 @@ void GaussianSplattingUI::onUIMenu()
     ImGui::SameLine();
 
     // Sorting method selector (disabled only for pure RTX - hybrid modes still use rasterization)
-    ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_RTX);
+    ImGui::BeginDisabled(isRtxPipelineOnly());
     guiDrawSortingSelector(true);
     ImGui::EndDisabled();
 
@@ -982,6 +1366,14 @@ void GaussianSplattingUI::onUIMenu()
         m_dlss.setSizeMode(static_cast<DlssDenoiser::SizeMode>(dlssMode));
       }
     }
+    if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip(
+          "DLSS Ray Reconstruction denoising mode.\n"
+          "Available with ray tracing and hybrid pipelines.\n\n"
+          "- Disabled: DLSS is off, rendering at native resolution.\n"
+          "- Min: smallest internal resolution, fastest but lowest quality.\n"
+          "- Optimal: balanced upscaling, recommended for most use cases.\n"
+          "- Max: largest internal resolution, denoising and anti-aliasing only.");
     ImGui::EndDisabled();
 #endif
 
@@ -994,11 +1386,32 @@ void GaussianSplattingUI::onUIMenu()
     if(m_dlss.isEnabled())
       visuMenu = GUI_VISUALIZE_DLSS_ON;
 
+    static constexpr const char* visualizeTooltip =
+        "Selects the visualization mode.\n"
+        "Available only with ray tracing and hybrid pipelines.\n\n"
+        "Final render: standard rendered output.\n"
+        "Clay mode: renders all surfaces with a uniform clay color.\n"
+        "Clock cycles: heat-map of GPU clock cycles per pixel.\n"
+        "Ray Hit Count: heat-map of ray intersection tests per pixel.\n"
+        "Depth (iso thres): depth from integrated iso-threshold.\n"
+        "Depth (Closest hit): depth of the closest ray-particle hit.\n"
+        "Depth (for DLSS): depth buffer as fed to the DLSS denoiser.\n"
+        "Normal (Integrated): surface normal from integrated contributions.\n"
+        "Normal (closest hit): surface normal at the closest ray-particle hit.\n"
+        "Normal (For DLSS): normal buffer as fed to the DLSS denoiser.\n"
+        "Splat ID (Harlequin): unique color per splat for identification.\n\n"
+        "DLSS guide modes (enabled only when DLSS is active):\n"
+        "DLSS Input: raw radiance input before denoising.\n"
+        "DLSS Guide Albedo/Specular/Normal/Motion/Depth: individual G-buffers\n"
+        "  used by the DLSS denoiser.";
+
     ImGui::SetNextItemWidth(150.0f);
     if(m_ui.enumCombobox(visuMenu, "##ID", &prmRender.visualize))
     {
       m_requestUpdateShaders = true;
     }
+    if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+      ImGui::SetTooltip("%s", visualizeTooltip);
 
     ImGui::EndDisabled();
 
@@ -1008,15 +1421,6 @@ void GaussianSplattingUI::onUIMenu()
 
   // Shortcuts
 
-  // Helper: check if an alphanumeric key OR its numpad equivalent was pressed
-  auto isNumberKeyPressed = [](int n) -> bool {
-    constexpr ImGuiKey alphaKeys[] = {ImGuiKey_0, ImGuiKey_1, ImGuiKey_2, ImGuiKey_3, ImGuiKey_4,
-                                      ImGuiKey_5, ImGuiKey_6, ImGuiKey_7, ImGuiKey_8, ImGuiKey_9};
-    constexpr ImGuiKey padKeys[]   = {ImGuiKey_Keypad0, ImGuiKey_Keypad1, ImGuiKey_Keypad2, ImGuiKey_Keypad3,
-                                      ImGuiKey_Keypad4, ImGuiKey_Keypad5, ImGuiKey_Keypad6, ImGuiKey_Keypad7,
-                                      ImGuiKey_Keypad8, ImGuiKey_Keypad9};
-    return ImGui::IsKeyPressed(alphaKeys[n]) || ImGui::IsKeyPressed(padKeys[n]);
-  };
 
   const bool wantTextInput = ImGui::GetIO().WantTextInput;
 
@@ -1031,6 +1435,13 @@ void GaussianSplattingUI::onUIMenu()
     m_assets.cameras.loadPreset(m_lastLoadedCamera, false);
     m_selectedCameraPresetIndex = -1;
   }
+  if(m_playPresets && !cameraManip->isAnimated() && m_assets.cameras.size() >= 2)
+  {
+    m_lastLoadedCamera                    = (m_lastLoadedCamera + 1) % m_assets.cameras.size();
+    m_requestUpdateShadersAfterCameraAnim = cameraPresetNeedsShaderRebuild(m_lastLoadedCamera);
+    m_assets.cameras.loadPreset(m_lastLoadedCamera, false);
+    m_selectedCameraPresetIndex = -1;
+  }
   if(ImGui::IsKeyPressed(ImGuiKey_Q) && ImGui::IsKeyDown(ImGuiKey_LeftCtrl))
   {
     close_app = true;
@@ -1040,14 +1451,18 @@ void GaussianSplattingUI::onUIMenu()
   {
     v_sync = !v_sync;
   }
+  if(!wantTextInput && ImGui::IsKeyPressed(ImGuiKey_E))
+  {
+    m_helpers.setEditingMode(!m_helpers.isEditingMode());
+  }
   if(!wantTextInput && ImGui::IsKeyPressed(ImGuiKey_G))
   {
     m_helpers.grid.toggleVisible();
   }
-  if(ImGui::IsKeyPressed(ImGuiKey_F5))
+  if(!wantTextInput && ImGui::IsKeyPressed(ImGuiKey_L))
   {
-    if(!m_recentFiles.empty())
-      prmScene.pushLoadRequest(m_recentFiles[0], false);
+    m_showLightProxies = !m_showLightProxies;
+    resetFrameCounter();
   }
   if(ImGui::IsKeyPressed(ImGuiKey_F1))
   {
@@ -1064,32 +1479,11 @@ void GaussianSplattingUI::onUIMenu()
     m_assets.splatSets.dumpDebugState("manual_F6");
   }
 
-  // Pipeline selection: supports both alphanumeric and numpad keys, skipped when typing in a text field.
-  // Known issue: alphanumeric keys '4' and '5' don't trigger IsKeyPressed() — likely consumed by ImGui's
-  // key ownership system (LockThisFrame). Numpad keys work as a workaround for all pipelines.
-  if(!wantTextInput)
-  {
-    if(isNumberKeyPressed(1))
-      prmSelectedPipeline = PIPELINE_VERT;
-    if(isNumberKeyPressed(2))
-      prmSelectedPipeline = PIPELINE_MESH;
-    if(isNumberKeyPressed(3))
-      prmSelectedPipeline = PIPELINE_RTX;
-    if(isNumberKeyPressed(4))
-      prmSelectedPipeline = PIPELINE_HYBRID;
-    if(isNumberKeyPressed(5))
-      prmSelectedPipeline = PIPELINE_MESH_3DGUT;
-    if(isNumberKeyPressed(6))
-      prmSelectedPipeline = PIPELINE_HYBRID_3DGUT;
-  }
 
-  // hot rebuild of shaders only if scene exist
+  // hot rebuild of shaders
   if(!wantTextInput && ImGui::IsKeyPressed(ImGuiKey_R))
   {
-    if(!m_loadedSceneFilename.empty())
-      m_requestUpdateShaders = true;
-    else
-      LOGW("No scene loaded, skipping shader rebuild\n");
+    m_requestUpdateShaders = true;
   }
   if(close_app)
   {
@@ -1113,6 +1507,33 @@ void GaussianSplattingUI::onUIMenu()
   if(m_app->isVsync() != v_sync)
   {
     m_app->setVsync(v_sync);
+  }
+
+  // F11 fullscreen toggle
+  if(ImGui::IsKeyPressed(ImGuiKey_F11))
+  {
+    m_fullScreen = !m_fullScreen;
+  }
+
+  // Apply fullscreen state change
+  {
+    GLFWwindow* window       = m_app->getWindowHandle();
+    bool        isFullScreen = glfwGetWindowMonitor(window) != nullptr;
+    if(m_fullScreen != isFullScreen)
+    {
+      if(m_fullScreen)
+      {
+        glfwGetWindowPos(window, &m_windowedPos[0], &m_windowedPos[1]);
+        glfwGetWindowSize(window, &m_windowedSize[0], &m_windowedSize[1]);
+        GLFWmonitor*       monitor = glfwGetPrimaryMonitor();
+        const GLFWvidmode* mode    = glfwGetVideoMode(monitor);
+        glfwSetWindowMonitor(window, monitor, 0, 0, mode->width, mode->height, mode->refreshRate);
+      }
+      else
+      {
+        glfwSetWindowMonitor(window, nullptr, m_windowedPos[0], m_windowedPos[1], m_windowedSize[0], m_windowedSize[1], 0);
+      }
+    }
   }
 
   if(!wantTextInput && ImGui::IsKeyPressed(ImGuiKey_P))
@@ -1155,7 +1576,7 @@ void GaussianSplattingUI::onFileDrop(const std::filesystem::path& filename)
   {
     prmScene.projectToLoadFilename = filename;
   }
-  else if(extension == ".obj")
+  else if(extension == ".obj" || extension == ".gltf" || extension == ".glb")
   {
     prmScene.meshToImportFilename = filename;
   }
@@ -1179,9 +1600,14 @@ void GaussianSplattingUI::updateTitleIfNeeded()
 #ifndef NDEBUG
                       " | debug"
 #endif
-                      " | "
-                      + fmt::format("{}x{} | {:.0f} FPS / {:.3f}ms", size.width, size.height, ImGui::GetIO().Framerate,
-                                    1000.F / ImGui::GetIO().Framerate);
+      ;
+  if(!m_projectPath.empty())
+  {
+    title += " | " + m_projectPath.stem().string();
+  }
+  title += " | "
+           + fmt::format("{}x{} | {:.0f} FPS / {:.3f}ms", size.width, size.height, ImGui::GetIO().Framerate,
+                         1000.F / ImGui::GetIO().Framerate);
   glfwSetWindowTitle(window, title.c_str());
 }
 
@@ -1194,6 +1620,9 @@ void GaussianSplattingUI::onUIRender()
 
   // Handle project loading (synchronous), may trigger a scene loading
   loadProjectIfNeeded();
+
+  // Handle mesh import requests (modal + synchronous load)
+  guiImportMeshIfNeeded();
 
   // synchronous with no progress bar if benchmarkEnabled
   // asynchronous and multi-frame progress bar update if not benchmarking.
@@ -1215,224 +1644,8 @@ void GaussianSplattingUI::onUIRender()
 
   guiDrawShaderFeedbackWindow();
 
-  guiDrawFooterBar();
-}
-
-void GaussianSplattingUI::guiLoadSceneAndDrawProgressIfNeeded(void)
-{
-#ifdef WITH_DEFAULT_SCENE_FEATURE
-  // load a default scene if none was provided by command line
-  if(prmScene.enableDefaultScene && m_loadedSceneFilename.empty() && prmScene.sceneLoadQueue.empty()
-     && prmScene.projectToLoadFilename.empty() && m_plyLoader.getStatus() == PlyLoaderAsync::State::E_READY)
-  {
-    const std::vector<std::filesystem::path> defaultSearchPaths = getResourcesDirs();
-    auto defaultPath = nvutils::findFile("flowers_1/flowers_1.ply", defaultSearchPaths);
-    prmScene.pushLoadRequest(defaultPath, true);
-    prmScene.enableDefaultScene = false;
-  }
-#endif
-
-  // Process next item in queue
-  if(!prmScene.sceneLoadQueue.empty() && m_plyLoader.getStatus() == PlyLoaderAsync::State::E_READY)
-  {
-    static bool             firstBatchRequest = true;
-    const SceneLoadRequest& request           = prmScene.sceneLoadQueue.front();
-    bool                    doLoad            = true;
-
-    // Show confirmation dialog only if:
-    // Not loading from project
-    if(firstBatchRequest && !request.porcelain)
-    {
-      ImGui::OpenPopup("Load .ply file ?");
-      firstBatchRequest = false;
-    }
-
-    // Always center this window when appearing
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-
-    // this block is executed only if OpenPopup was executed
-    if(ImGui::BeginPopupModal("Load .ply file ?", NULL, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-      doLoad = false;
-
-      ImGui::Text("Load additional splat set or reset project?");
-      if(prmScene.sceneLoadQueue.size() > 1)
-      {
-        ImGui::Text("Queue has %zu file(s) pending.", prmScene.sceneLoadQueue.size());
-      }
-      ImGui::Separator();
-
-      if(ImGui::Button("Import", ImVec2(120, 0)))
-      {
-        // Import - continue without reset
-        doLoad = true;
-        ImGui::CloseCurrentPopup();
-      }
-      ImGui::SetItemDefaultFocus();
-      ImGui::SameLine();
-      if(ImGui::Button("Reset", ImVec2(120, 0)))
-      {
-        // Reset and continue
-        reset();
-        doLoad = true;
-        ImGui::CloseCurrentPopup();
-      }
-      ImGui::SameLine();
-      if(ImGui::Button("Cancel All", ImVec2(120, 0)))
-      {
-        // Cancel entire queue
-        prmScene.sceneLoadQueue.clear();
-        prmScene.projectToLoadFilename.clear();
-        prmScene.projectLoadPorcelain = false;
-        ImGui::CloseCurrentPopup();
-      }
-      ImGui::EndPopup();
-    }
-
-    if(doLoad)
-    {
-      m_loadedSceneFilename = request.path;
-      vkDeviceWaitIdle(m_device);
-
-      if(prmScene.sceneLoadQueue.size() > 1)
-      {
-        LOGI("Start loading file %s (%zu more in queue)\n", request.path.string().c_str(), prmScene.sceneLoadQueue.size() - 1);
-      }
-      else
-      {
-        LOGI("Start loading file %s\n", request.path.string().c_str());
-        // We process last request of the queue
-        // reset flag for next batch
-        firstBatchRequest = true;
-      }
-
-      // Use pre-configured splat set if provided (project loading)
-      // Otherwise create a new one
-      std::shared_ptr<SplatSetVk> splatSetToLoad = request.splatSet ? request.splatSet : std::make_shared<SplatSetVk>();
-
-      if(!m_plyLoader.loadScene(request.path, splatSetToLoad))
-      {
-        LOGE("Error: cannot start scene load while loader is not ready status=%d\n", m_plyLoader.getStatus());
-        // Remove failed request
-        prmScene.sceneLoadQueue.pop_front();
-      }
-      else
-      {
-        // Store request for later (needed to access pre-configured instance)
-        m_currentLoadRequest = request;
-
-        // Remove from queue (will process in completion handler)
-        prmScene.sceneLoadQueue.pop_front();
-
-        // open the modal window that will collect results
-        ImGui::OpenPopup("Loading");
-      }
-    }
-  }
-
-  // display loading jauge modal window
-  // Always center this window when appearing
-  ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-  if(ImGui::BeginPopupModal("Loading", NULL, ImGuiWindowFlags_AlwaysAutoResize))
-  {
-    // specific wait for benchmarking mode
-    // prevent display of loading jauge and frame advancing while loading
-    // ensure scene is loaded before moving to next frame
-    if(*m_pBenchmarkEnabled)
-    {
-      while(m_plyLoader.getStatus() == PlyLoaderAsync::State::E_LOADING)
-      {
-        using namespace std::chrono_literals;
-        std::this_thread::sleep_for(100ms);
-      }
-    }
-    // managment of async load
-    switch(m_plyLoader.getStatus())
-    {
-      case PlyLoaderAsync::State::E_LOADING: {
-        ImGui::Text("%s", m_plyLoader.getFilename().string().c_str());
-        if(!prmScene.sceneLoadQueue.empty())
-        {
-          ImGui::Text("(%zu more file(s) queued)", prmScene.sceneLoadQueue.size());
-        }
-        ImGui::ProgressBar(m_plyLoader.getProgress(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f));
-      }
-      break;
-      case PlyLoaderAsync::State::E_FAILURE: {
-        ImGui::Text("Error: invalid ply file");
-        if(ImGui::Button("Ok", ImVec2(120, 0)))
-        {
-          m_loadedSceneFilename = "";
-          // destroy scene just in case it was
-          // loaded but not properly since in error
-          deinitScene();
-          // set ready for next load
-          m_plyLoader.reset();
-          ImGui::CloseCurrentPopup();
-        }
-      }
-      break;
-      case PlyLoaderAsync::State::E_LOADED: {
-
-        // Create splat set asset (data is already in the SplatSetVk object from loader)
-        auto loadedSplatSet = m_assets.splatSets.createSplatSet(m_loadedSceneFilename.string(), m_plyLoader.getLoadedSplatSet());
-
-        // If request provided a pre-configured instance, use it
-        // Otherwise create a new one with identity transform
-        if(m_currentLoadRequest.instance)
-        {
-          // Pre-configured instance (from project loading)
-          // Instance already has transform, material, etc. set by project loader
-          // Just register it with the manager and associate with the loaded splat set
-          m_currentLoadRequest.instance->splatSet = loadedSplatSet;
-
-          // Register the pre-configured instance
-          m_selectedSplatInstance = m_assets.splatSets.registerInstance(loadedSplatSet, m_currentLoadRequest.instance);
-
-          LOGD("Loaded with pre-configured instance (project mode)\n");
-
-          // Handle additional instances sharing the same splat set (Version 1+ project files)
-          for(auto& additionalInstance : m_currentLoadRequest.additionalInstances)
-          {
-            additionalInstance->splatSet = loadedSplatSet;
-            m_assets.splatSets.registerInstance(loadedSplatSet, additionalInstance);
-            LOGD("  Created additional instance sharing same splat set\n");
-          }
-        }
-        else
-        {
-          // Standard path: create new instance with identity transform
-          m_selectedSplatInstance = m_assets.splatSets.createInstance(loadedSplatSet);
-
-          LOGD("Loaded with new default instance\n");
-        }
-
-        // createSplatSet and createInstance/registerInstance already set appropriate manager requests
-        // No shader rebuild needed - bindless system handles descriptor updates at runtime
-
-        // add only if not loaded by project or command
-        if(!m_currentLoadRequest.porcelain)
-          guiAddToRecentFiles(m_loadedSceneFilename);
-
-        // set ready for next load
-        m_plyLoader.reset();
-
-        // Close modal only if queue is empty
-        // Otherwise, next file will start loading automatically
-        if(prmScene.sceneLoadQueue.empty())
-        {
-          ImGui::CloseCurrentPopup();
-        }
-      }
-      break;
-      default: {
-        // nothing to do for READY or SHUTDOWN
-      }
-    }
-    ImGui::EndPopup();
-  }
+  if(m_showFooterBar)
+    guiDrawFooterBar();
 }
 
 void GaussianSplattingUI::guiDrawSortingSelector(bool inMenuBar)
@@ -1457,8 +1670,8 @@ void GaussianSplattingUI::guiDrawSortingSelector(bool inMenuBar)
   else
   {
     // Property editor style: with label and tooltip
-    changed = PE::entry(
-        "Sorting method", [&]() { return m_ui.enumCombobox(GUI_SORTING, "##ID", &prmRaster.sortingMethod); }, tooltip);
+    changed =
+        PE::entry("Sorting method", [&]() { return m_ui.enumCombobox(GUI_SORTING, "##ID", &prmRaster.sortingMethod); }, tooltip);
   }
 
   if(changed)
@@ -1496,26 +1709,26 @@ void GaussianSplattingUI::guiDrawLightingModeSelector(bool inMenuBar)
 
   static constexpr const char* tooltip =
       "- Lighting off: no lighting computed.\n"
-      "- Direct lighting: single-bounce shading from lights (no reflections/refractions).\n"
-      "- Indirect lighting: full path tracing with bounces, reflections and refractions (ray tracing only).";
+      "- Lighting on: enables shading from lights (direct in raster, full path tracing in ray tracing).";
 
   bool changed = false;
   if(inMenuBar)
   {
     ImGui::SetNextItemWidth(150.0f);
-    changed = m_ui.enumCombobox(GUI_LIGHTING_MODE, "##LightingMode", (int*)&prmRender.lightingMode);
+    changed = m_ui.enumCombobox(GUI_LIGHTING_MODE, "##LightingMode", &prmRender.lightingEnabled);
     if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
       ImGui::SetTooltip("%s", tooltip);
   }
   else
   {
-    changed = PE::entry(
-        "Lighting mode", [&]() { return m_ui.enumCombobox(GUI_LIGHTING_MODE, "##ID", (int*)&prmRender.lightingMode); }, tooltip);
+    changed =
+        PE::entry("Lighting", [&]() { return m_ui.enumCombobox(GUI_LIGHTING_MODE, "##ID", &prmRender.lightingEnabled); }, tooltip);
   }
 
   if(changed)
   {
     m_requestUpdateShaders = true;
+    m_tonemapperData.isActive = (prmRender.lightingEnabled == LIGHTING_ENABLED) ? 1 : 0;
   }
 }
 
@@ -1529,7 +1742,7 @@ void GaussianSplattingUI::guiDrawShadowsModeSelector(bool inMenuBar)
       "- Hard shadows: sharp point-sampled shadows.\n"
       "- Soft shadows: stochastic disk-sampled shadows around lights.";
 
-  bool disabled = (prmRender.lightingMode == LightingMode::eLightingDisabled || !isRtxPipelineActive());
+  bool disabled = (!prmRender.lightingEnabled || !isRtxPipelineActive());
 
   bool changed = false;
   if(inMenuBar)
@@ -1792,15 +2005,33 @@ void GaussianSplattingUI::guiDrawViewport()
 
 void GaussianSplattingUI::guiDrawAssetsWindow()
 {
+  if(!m_showAssetsWindow)
+    return;
+
   ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyle().Colors[ImGuiCol_ChildBg]);
 
-  if(ImGui::Begin("Assets"))
+  if(ImGui::Begin("Assets", &m_showAssetsWindow))
   {
+    // Settings (leaf node)
+    {
+      ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+      if(m_selectedAsset == GUI_SETTINGS)
+        flags |= ImGuiTreeNodeFlags_Selected;
+      ImGui::TreeNodeEx(ICON_MS_SETTINGS " Settings", flags);
+      if(ImGui::IsItemClicked())
+      {
+        resetSelection();
+        m_selectedAsset = GUI_SETTINGS;
+      }
+    }
+
     guiDrawRendererTree();
 
     guiDrawCameraTree();
 
     guiDrawLightTree();
+
+    guiDrawSkyTree();
 
     guiDrawRadianceFieldsTree();
 
@@ -1928,34 +2159,377 @@ void GaussianSplattingUI::guiDrawRendererTree()
 
   ImGuiTreeNodeFlags node_flags;
 
-  // Renderer
-  std::string pipelineName = m_ui.getEnums(GUI_PIPELINE)[prmSelectedPipeline].name;
-  node_flags               = base_flags;
+  // Renderer node with inline pipeline selector
+  node_flags = base_flags | ImGuiTreeNodeFlags_SpanTextWidth;
   if(m_selectedAsset == GUI_RENDERER)
     node_flags |= ImGuiTreeNodeFlags_Selected;
   ImGui::SetNextItemOpen(true, ImGuiCond_Once);
-  node_open = ImGui::TreeNodeEx(ICON_MS_CAMERA " Renderer", node_flags);
+  node_open = ImGui::TreeNodeEx(ICON_MS_CAMERA " Renderer -##Renderer", node_flags);
   if(ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
   {
     resetSelection();
     m_selectedAsset             = GUI_RENDERER;
     m_selectedCameraPresetIndex = -1;
   }
+
+  // Pipeline selector on the same line, compact height, filling remaining width
+  ImGui::SameLine();
+  float availWidth = ImGui::GetContentRegionAvail().x;
+  ImGui::SetNextItemWidth(availWidth);
+  ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(ImGui::GetStyle().FramePadding.x, 1.0f));
+  bool pipelineChanged = m_ui.enumCombobox(GUI_PIPELINE, "##PipelineSelector", &prmSelectedPipeline);
+  ImGui::PopStyleVar();
+  if(pipelineChanged)
+  {
+    m_requestUpdateShaders = true;
+  }
+
   if(node_open)
   {
-    // display the pipeline selector
-    int i = 0;
-    {
-      ImGui::Indent(30);
-      ImGui::Text(ICON_MS_SUBDIRECTORY_ARROW_RIGHT);
-      ImGui::SameLine();
-      if(m_ui.enumCombobox(GUI_PIPELINE, "##ID", &prmSelectedPipeline))
-      {
-        m_requestUpdateShaders = true;
-      }
-      ImGui::Unindent(30);
-    }
+    guiDrawRasterizationTree();
+    guiDrawRaytracingTree();
+    guiDrawDenoisingTree();
+    guiDrawTonemappingTree();
     ImGui::TreePop();
+  }
+}
+
+void GaussianSplattingUI::guiDrawRasterizationTree()
+{
+  ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+  if(m_selectedAsset == GUI_RASTERIZATION)
+    flags |= ImGuiTreeNodeFlags_Selected;
+
+  ImGui::BeginDisabled(!isRasterPipelineActive());
+  ImGui::TreeNodeEx(ICON_MS_GRID_ON " Rasterization", flags);
+  if(ImGui::IsItemClicked())
+  {
+    resetSelection();
+    m_selectedAsset = GUI_RASTERIZATION;
+  }
+  ImGui::EndDisabled();
+}
+
+void GaussianSplattingUI::guiDrawRaytracingTree()
+{
+  ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+  if(m_selectedAsset == GUI_RAYTRACING)
+    flags |= ImGuiTreeNodeFlags_Selected;
+
+  ImGui::BeginDisabled(!isRtxPipelineActive());
+  ImGui::TreeNodeEx(ICON_MS_CALL_MISSED_OUTGOING " Raytracing", flags);
+  if(ImGui::IsItemClicked())
+  {
+    resetSelection();
+    m_selectedAsset = GUI_RAYTRACING;
+  }
+  ImGui::EndDisabled();
+}
+
+void GaussianSplattingUI::guiDrawDenoisingTree()
+{
+  ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+  if(m_selectedAsset == GUI_DENOISING)
+    flags |= ImGuiTreeNodeFlags_Selected;
+
+  ImGui::BeginDisabled(!isDlssSupportedPipeline());
+  ImGui::TreeNodeEx(ICON_MS_BLUR_ON " Denoising", flags);
+  if(ImGui::IsItemClicked())
+  {
+    resetSelection();
+    m_selectedAsset = GUI_DENOISING;
+  }
+  ImGui::EndDisabled();
+}
+
+void GaussianSplattingUI::guiDrawTonemappingTree()
+{
+  ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+  if(m_selectedAsset == GUI_TONEMAPPING)
+    flags |= ImGuiTreeNodeFlags_Selected;
+
+  ImGui::TreeNodeEx(ICON_MS_TONALITY " Tone mapping", flags);
+  if(ImGui::IsItemClicked())
+  {
+    resetSelection();
+    m_selectedAsset = GUI_TONEMAPPING;
+  }
+}
+
+void GaussianSplattingUI::guiDrawDenoisingProperties()
+{
+  bool denoisingDisabled = !isDlssSupportedPipeline();
+  ImGui::BeginDisabled(denoisingDisabled);
+
+  namespace PE = nvgui::PropertyEditor;
+
+  bool open = beginCollapsibleGroup("DLSS-RR", true);
+  if(open)
+  {
+    PE::begin("## DLSS", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+#if defined(USE_DLSS)
+    bool dlssAvailable = m_dlss.isRuntimeSupported() && m_dlss.isInitialized();
+
+    if(!dlssAvailable && m_dlss.isInitialized())
+    {
+      PE::Text("DLSS", "Not available on this device");
+    }
+
+    ImGui::BeginDisabled(!dlssAvailable);
+
+    bool dlssEnabled = m_dlss.isEnabled();
+    if(PE::Checkbox("Enable", &dlssEnabled,
+                    "Enable DLSS Ray Reconstruction denoising.\n"
+                    "Requires a supported NVIDIA GPU and driver.\n"
+                    "Available with ray tracing and hybrid pipelines."))
+    {
+      m_dlss.setEnabled(dlssEnabled);
+      m_requestUpdateShaders = true;
+    }
+
+    ImGui::BeginDisabled(!m_dlss.isEnabled());
+
+    {
+      const char* sizeModes[]     = {"Min", "Optimal", "Max"};
+      int         currentSizeMode = static_cast<int>(m_dlss.getSizeMode());
+      if(PE::entry(
+             "Size Mode",
+             [&]() {
+               bool changed = ImGui::Combo("##DLSSSizeMode", &currentSizeMode, sizeModes, IM_ARRAYSIZE(sizeModes));
+               if(changed)
+                 m_dlss.setSizeMode(static_cast<DlssDenoiser::SizeMode>(currentSizeMode));
+               return changed;
+             },
+             "DLSS internal rendering resolution mode.\n"
+             "- Min: smallest internal resolution, fastest but lowest quality.\n"
+             "- Optimal: balanced upscaling, recommended for most use cases.\n"
+             "- Max: largest internal resolution, denoising and anti-aliasing only."))
+      {
+      }
+    }
+
+    if(m_dlss.isInitialized())
+    {
+      VkExtent2D nativeSize = m_gBuffers.getSize();
+      PE::entry(
+          "Current Resolution",
+          [&]() {
+            if(m_dlss.isEnabled())
+            {
+              VkExtent2D dlssSize = m_dlss.getRenderSize();
+              ImGui::Text("%d x %d (%d x %d)", dlssSize.width, dlssSize.height, nativeSize.width, nativeSize.height);
+            }
+            else
+            {
+              ImGui::Text("%d x %d", nativeSize.width, nativeSize.height);
+            }
+            return false;
+          },
+          "Internal rendering resolution.\n"
+          "When DLSS is enabled, shows the reduced resolution followed\n"
+          "by the native viewport resolution in parentheses.\n"
+          "When DLSS is disabled, shows the native viewport resolution.");
+    }
+
+    PE::DragFloat("Minimum Radiance", &prmRtx.dlssMinRadianceThreshold, 0.001f, 0.0f, 0.1f, "%.3f", 0,
+                  "Minimum radiance threshold for DLSS input.\n"
+                  "Clamps pixel radiance to this floor before feeding to the DLSS denoiser.\n"
+                  "Prevents negative values (e.g. from amplified AO) from causing\n"
+                  "noisy artifacts in DLSS-denoised regions.");
+
+    ImGui::EndDisabled();  // !m_dlss.isEnabled()
+    ImGui::EndDisabled();  // !dlssAvailable
+#else
+    PE::Text("DLSS", "Not available (compile without USE_DLSS)");
+#endif
+
+    PE::end();
+  }
+  endCollapsibleGroup(open);
+
+  ImGui::EndDisabled();
+}
+
+void GaussianSplattingUI::guiDrawTonemappingProperties()
+{
+  namespace PE = nvgui::PropertyEditor;
+
+  bool changed = false;
+
+  const char* methods[] = {"Filmic", "Uncharted 2", "Clip", "ACES", "AgX", "Khronos PBR"};
+
+  {
+    bool open = beginCollapsibleGroup("General", true);
+    if(open)
+    {
+      PE::begin("##ToneMapMain", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      changed |= PE::Checkbox("Enable", reinterpret_cast<bool*>(&m_tonemapperData.isActive),
+                              "Enable/disable tone mapping post-processing");
+      ImGui::BeginDisabled(!m_tonemapperData.isActive);
+      changed |= PE::Combo("Method", &m_tonemapperData.method, methods, IM_ARRAYSIZE(methods), 0,
+                           "Tone mapping algorithm to compress high dynamic range (HDR) to standard dynamic range (SDR)");
+      changed |= PE::SliderFloat("Exposure", &m_tonemapperData.exposure, 0.1F, 200.0F, "%.3f", ImGuiSliderFlags_Logarithmic,
+                                 "Multiplier for input colors (0.1 = very dark, 1 = neutral, 200 = very bright)");
+      changed |= PE::SliderFloat("Contrast", &m_tonemapperData.contrast, 0.0F, 2.0F, "%.2f", 0,
+                                 "Scales colors away from gray (0 = no contrast, 1 = neutral, 2 = high contrast)");
+      changed |= PE::SliderFloat("Brightness", &m_tonemapperData.brightness, 0.0F, 2.0F, "%.2f", 0,
+                                 "Gamma curve for output colors (1 = neutral, higher values make midtones brighter)");
+      changed |= PE::SliderFloat("Saturation", &m_tonemapperData.saturation, 0.0F, 2.0F, "%.2f", 0,
+                                 "Controls color intensity (0 = grayscale, 1 = neutral, 2 = high saturation)");
+      changed |= PE::SliderFloat("Vignette", &m_tonemapperData.vignette, -1.0F, 1.0F, "%.2f", 0,
+                                 "Darkens image edges (-1 = very bright, 0 = none, 1 = very dark)");
+      ImGui::EndDisabled();
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Auto Exposure", true);
+    if(open)
+    {
+      ImGui::BeginDisabled(!m_tonemapperData.isActive);
+      PE::begin("##AutoExposure", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      changed |= PE::Checkbox("Enable", reinterpret_cast<bool*>(&m_tonemapperData.autoExposure),
+                              "Enable automatic exposure adjustment based on scene brightness");
+      ImGui::BeginDisabled(!m_tonemapperData.autoExposure);
+      changed |= PE::Combo("Average Mode", (int*)&m_tonemapperData.averageMode, "Mean\0Median", 0,
+                           "Method for calculating scene brightness (Mean = average, Median = value where 50% of pixels are darker and 50% of pixels are brighter)");
+      changed |= PE::DragFloat("Adaptation Speed", &m_tonemapperData.autoExposureSpeed, 0.001f, 0.f, 100.f, "%.3f",
+                               ImGuiSliderFlags_AlwaysClamp,
+                               "How quickly auto exposure adapts to lighting changes (higher = faster adaptation)");
+      changed |= PE::DragFloat("Min (EV100)", &m_tonemapperData.evMinValue, 0.01f, -24.f, 24.f, "%.2f", 0,
+                               "Minimum histogram luminance in logarithmic stops (-24 = very dark, +24 = very bright)");
+      changed |= PE::DragFloat("Max (EV100)", &m_tonemapperData.evMaxValue, 0.01f, -24.f, 24.f, "%.2f", 0,
+                               "Maximum histogram luminance in logarithmic stops (-24 = very dark, +24 = very bright)");
+      changed |= PE::Checkbox("Center Weighted Metering", (bool*)&m_tonemapperData.enableCenterMetering,
+                              "Use center area for exposure calculation instead of full frame");
+      ImGui::BeginDisabled(!m_tonemapperData.enableCenterMetering);
+      changed |= PE::DragFloat("Center Metering Size", &m_tonemapperData.centerMeteringSize, 0.01f, 0.01f, 1.0f, "%.2f",
+                               0, "Size of center area for exposure calculation (0.01 = small spot, 1.0 = full frame)");
+      ImGui::EndDisabled();
+      ImGui::EndDisabled();
+      ImGui::EndDisabled();
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Advanced Color Grading ---
+  {
+    bool open = beginCollapsibleGroup("Advanced Color Grading");
+    if(open)
+    {
+      ImGui::BeginDisabled(!m_tonemapperData.isActive);
+      PE::begin("##ColorGrading", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      changed |= PE::SliderFloat("Vibrance", &m_tonemapperData.vibrance, -1.0F, 1.0F, "%.2f", 0,
+                                 "Selective saturation boost for desaturated colors (0 = neutral, positive values boost muted colors)");
+      changed |= PE::SliderFloat("Shadow Bias", &m_tonemapperData.shadowBias, -1.0F, 1.0F, "%.2f", 0,
+                                 "Adjust shadow tones (-1 = darker, 0 = neutral, 1 = brighter)");
+      changed |= PE::SliderFloat("Midtone Bias", &m_tonemapperData.midtoneBias, -1.0F, 1.0F, "%.2f", 0,
+                                 "Adjust midtone brightness (-1 = darker, 0 = neutral, 1 = brighter)");
+      changed |= PE::SliderFloat("Highlight Bias", &m_tonemapperData.highlightBias, -1.0F, 1.0F, "%.2f", 0,
+                                 "Adjust highlight tones (-1 = darker, 0 = neutral, 1 = brighter)");
+
+      if(PE::treeNode("Split Toning"))
+      {
+        changed |= PE::ColorEdit3("Cool Shadows", &m_tonemapperData.coolColor.x, ImGuiColorEditFlags_Float,
+                                  "Color tint applied to shadow regions (default: white = no tint)");
+        changed |= PE::ColorEdit3("Warm Highlights", &m_tonemapperData.warmColor.x, ImGuiColorEditFlags_Float,
+                                  "Color tint applied to highlight regions (default: white = no tint)");
+        changed |= PE::SliderFloat("Split Balance", &m_tonemapperData.splitBalance, -0.5F, 0.5F, "%.2f", 0,
+                                   "Balance between cool and warm tones (-0.5 = more shadows cool, 0 = neutral, 0.5 = more highlights warm)");
+        PE::treePop();
+      }
+      PE::end();
+      ImGui::EndDisabled();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- White Balance ---
+  {
+    bool open = beginCollapsibleGroup("White Balance");
+    if(open)
+    {
+      ImGui::BeginDisabled(!m_tonemapperData.isActive);
+      PE::begin("##WhiteBalance", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      const float itemSpacing = 4.F;
+      const float resetButtonWidth = ImGui::CalcTextSize(ICON_MS_RESET_WHITE_BALANCE).x + ImGui::GetStyle().FramePadding.x * 2.F;
+      const float whiteBalanceSliderWidth = ImGui::GetContentRegionAvail().x - resetButtonWidth - itemSpacing;
+      PE::entry(
+          "Temperature",
+          [&]() {
+            ImGui::SetNextItemWidth(whiteBalanceSliderWidth);
+            changed |= ImGui::SliderFloat("##Temperature", &m_tonemapperData.temperature, 2000.0F, 15000.0F, "%.0f K");
+            ImGui::SameLine(0, itemSpacing);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if(ImGui::Button(ICON_MS_RESET_WHITE_BALANCE))
+            {
+              m_tonemapperData.temperature = shaderio::TonemapperData().temperature;
+              changed                      = true;
+            }
+            return changed;
+          },
+          "Scene lighting temperature to correct for in degrees Kelvin "
+          "(6506K = D65 neutral, higher values make the image more orange because they're correcting for cooler lighting)");
+
+      PE::entry(
+          "Tint",
+          [&]() {
+            ImGui::SetNextItemWidth(whiteBalanceSliderWidth);
+            changed |= ImGui::SliderFloat("##Tint", &m_tonemapperData.tint, -.03F, .03F, "%.5f");
+            ImGui::SameLine(0, itemSpacing);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if(ImGui::Button(ICON_MS_RESET_WHITE_BALANCE))
+            {
+              m_tonemapperData.tint = shaderio::TonemapperData().tint;
+              changed               = true;
+            }
+            return changed;
+          },
+          "Green/magenta lighting tint to correct for in ANSI C78.377-2008 Duv units "
+          "(-.03 = very green, 0 = blackbody, .00326 = D65 neutral, .03 = very magenta)");
+      PE::end();
+      ImGui::EndDisabled();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Dithering ---
+  {
+    bool open = beginCollapsibleGroup("Dithering");
+    if(open)
+    {
+      ImGui::BeginDisabled(!m_tonemapperData.isActive);
+      PE::begin("##Dithering", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      changed |= PE::Checkbox("Enable", reinterpret_cast<bool*>(&m_tonemapperData.dither),
+                              "Apply dithering to reduce color banding in smooth gradients");
+      PE::end();
+      ImGui::EndDisabled();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Default Properties ---
+  {
+    bool open = beginCollapsibleGroup("Default Properties");
+    if(open)
+    {
+      ImGui::BeginDisabled(!m_tonemapperData.isActive);
+      if(ImGui::SmallButton("reset"))
+      {
+        m_tonemapperData = {};
+        changed          = true;
+      }
+      if(ImGui::IsItemHovered())
+      {
+        ImGui::SetTooltip("Reset all tonemapper settings to default values");
+      }
+      ImGui::EndDisabled();
+    }
+    endCollapsibleGroup(open);
   }
 }
 
@@ -2061,7 +2635,7 @@ void GaussianSplattingUI::guiDrawLightTree()
 
   ImGui::SetNextItemOpen(true, ImGuiCond_Once);
 
-  bool node_open = ImGui::TreeNodeEx(ICON_MS_LIGHT_MODE " Lights", node_flags);
+  bool node_open = ImGui::TreeNodeEx(ICON_MS_LIGHTBULB_2 " Lights", node_flags);
   if(ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
   {
     resetSelection();
@@ -2123,6 +2697,141 @@ void GaussianSplattingUI::guiDrawLightTree()
       ImGui::PopID();
     }
     ImGui::TreePop();
+  }
+}
+
+void GaussianSplattingUI::guiDrawSkyTree()
+{
+  ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_Leaf | ImGuiTreeNodeFlags_NoTreePushOnOpen;
+  if(m_selectedAsset == GUI_SKY)
+    flags |= ImGuiTreeNodeFlags_Selected;
+
+  ImGui::TreeNodeEx(ICON_MS_PARTLY_CLOUDY_DAY " Environment", flags);
+  if(ImGui::IsItemClicked())
+  {
+    resetSelection();
+    m_selectedAsset = GUI_SKY;
+  }
+}
+
+void GaussianSplattingUI::guiDrawSkyProperties()
+{
+  namespace PE = nvgui::PropertyEditor;
+
+  bool changed = false;
+
+  // Common settings
+  if(PE::begin("##env_common", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+  {
+    int envMode = static_cast<int>(m_sky.mode());
+    if(PE::Combo("Mode", &envMode, "None\0Sky\0HDR\0"))
+    {
+      m_sky.setMode(static_cast<shaderio::EnvironmentMode>(envMode));
+      changed = true;
+    }
+
+    if(m_sky.mode() != shaderio::EnvironmentMode::eNone)
+    {
+      bool enabled = m_sky.isEnabled();
+      if(PE::Checkbox("Lighting", &enabled))
+      {
+        m_sky.setEnabled(enabled);
+        changed = true;
+      }
+
+      glm::ivec2 res         = m_sky.resolution();
+      bool       resReadOnly = (m_sky.mode() == shaderio::EnvironmentMode::eHDR);
+      if(resReadOnly)
+        ImGui::BeginDisabled();
+      if(PE::InputInt2("Resolution", &res[0]))
+      {
+        m_sky.setResolution(res);
+        changed = true;
+      }
+      if(resReadOnly)
+        ImGui::EndDisabled();
+    }
+
+    PE::end();
+  }
+
+  // Sky parameters (eSky mode only)
+  if(m_sky.mode() == shaderio::EnvironmentMode::eSky)
+  {
+    auto& params = m_sky.skyParams();
+
+    if(PE::begin("##sky_sun", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+    {
+      if(PE::entry("", [&] { return ImGui::SmallButton("reset"); }, "Default values"))
+      {
+        params  = shaderio::SkyPhysicalParameters();
+        changed = true;
+      }
+      changed |= nvgui::azimuthElevationSliders(params.sunDirection, false, params.yIsUp == 1);
+      changed |= PE::SliderFloat("Sun Disk Scale", &params.sunDiskScale, 0.F, 10.F);
+      changed |= PE::SliderFloat("Sun Disk Intensity", &params.sunDiskIntensity, 0.F, 5.F);
+      changed |= PE::SliderFloat("Sun Glow Intensity", &params.sunGlowIntensity, 0.F, 5.F);
+      PE::end();
+    }
+
+    if(PE::begin("##sky_extra", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+    {
+      changed |= PE::SliderFloat("Haze", &params.haze, 0.F, 15.F);
+      changed |= PE::SliderFloat("Red Blue Shift", &params.redblueshift, -1.F, 1.F);
+      changed |= PE::SliderFloat("Saturation", &params.saturation, 0.F, 1.F);
+      changed |= PE::SliderFloat("Horizon Height", &params.horizonHeight, -1.F, 1.F);
+      changed |= PE::ColorEdit3("Ground Color", &params.groundColor.x, ImGuiColorEditFlags_Float);
+      changed |= PE::SliderFloat("Horizon Blur", &params.horizonBlur, 0.F, 5.F);
+      changed |= PE::ColorEdit3("Night Color", &params.nightColor.x, ImGuiColorEditFlags_Float);
+      PE::end();
+    }
+  }
+
+  // HDR IBL parameters (eHDR mode only)
+  if(m_sky.mode() == shaderio::EnvironmentMode::eHDR)
+  {
+    if(PE::begin("##ibl_settings", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+    {
+      PE::entry("File", [&] {
+        ImGui::TextUnformatted(m_sky.iblFilePath().empty() ? "(none)" : m_sky.iblFilePath().filename().string().c_str());
+        ImGui::SameLine();
+        if(ImGui::SmallButton("Load..."))
+        {
+          std::filesystem::path filename =
+              nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load HDR Environment", "HDR Image|*.hdr");
+          if(!filename.empty())
+          {
+            VkCommandBuffer cmd = m_app->createTempCmdBuffer();
+            m_sky.loadHdrEnvironment(cmd, filename);
+            m_app->submitAndWaitTempCmdBuffer(cmd);
+            changed = true;
+          }
+        }
+        return false;
+      });
+
+      float intensity = m_sky.iblIntensity();
+      if(PE::SliderFloat("Intensity", &intensity, 0.0f, 10.0f))
+      {
+        m_sky.setIblIntensity(intensity);
+        changed = true;
+      }
+
+      glm::vec3 rotation = m_sky.iblRotation();
+      if(PE::DragFloat3("Rotation", &rotation[0], 0.5f))
+      {
+        m_sky.setIblRotation(rotation);
+        changed = true;
+      }
+
+      PE::end();
+    }
+  }
+
+  if(changed)
+  {
+    m_sky.setDirty();
+    resetFrameCounter();
   }
 }
 
@@ -2201,14 +2910,28 @@ void GaussianSplattingUI::guiDrawRadianceFieldsTree()
       if(m_selectedAsset == GUI_SPLATSET && m_selectedSplatInstance == instance)
         instanceFlags |= ImGuiTreeNodeFlags_Selected;
 
+      if(!instance->show)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
+
       bool node_open = ImGui::TreeNodeEx((void*)(intptr_t)instance->index, instanceFlags,
                                          ICON_MS_SUBDIRECTORY_ARROW_RIGHT "%s", instance->displayName.c_str());
+
+      if(!instance->show)
+        ImGui::PopStyleColor();
 
       if(ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
       {
         selectSplatSetInstance(instance);
       }
 
+      ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 110);
+      if(ImGui::SmallButton(instance->show ? ICON_MS_VISIBILITY : ICON_MS_VISIBILITY_OFF))
+      {
+        instance->show = !instance->show;
+        m_assets.splatSets.setVisibilityDirty();
+        resetFrameCounter();
+      }
+      nvgui::tooltip(instance->show ? "Hide" : "Show");
       ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 70);
       if(ImGui::SmallButton(ICON_MS_CONTENT_COPY))
       {
@@ -2274,54 +2997,9 @@ void GaussianSplattingUI::guiDrawObjectTree()
   ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 30);
   if(ImGui::SmallButton(ICON_MS_FILE_OPEN))
   {
-    prmScene.meshToImportFilename = nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load obj file", "OBJ|*.obj");
-  }
-  // Handle the request form file open or from drag and drop
-  if(!prmScene.meshToImportFilename.empty())
-  {
-    bool valid = true;
-
-    const auto name               = prmScene.meshToImportFilename;
-    prmScene.meshToImportFilename = "";  // reset the request
-    if(!name.empty())
-    {
-      // synchronous load
-      auto meshPtr = m_assets.meshes.loadModel(name);
-      valid        = (meshPtr != nullptr);
-    }
-
-    if(!valid)
-    {
-      ImGui::OpenPopup("Obj Loading");
-    }
-    else
-    {
-      // Clear any existing gizmo attachment
-      m_helpers.transform.clearAttachment();
-
-      // Mesh manager will set its own pendingRequests (RebuildBLAS, UpdateDescriptors, etc.)
-      // No shader rebuild needed - bindless system handles new mesh at runtime
-      m_selectedAsset        = GUI_MESH;
-      m_selectedMeshInstance = m_assets.meshes.m_lastCreatedInstance;  // Store pointer directly
-      //
-      m_objListUpdated = true;  // so that next loop will force the Object open if selected
-
-      // Note: Gizmo attachment happens when user clicks the instance in the tree
-    }
-
-    // definition of the obj error popup
-    // Always center this window when appearing
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
-    if(ImGui::BeginPopupModal("Obj Loading", NULL, ImGuiWindowFlags_AlwaysAutoResize))
-    {
-      ImGui::Text("Error: invalid obj file");
-      if(ImGui::Button("Ok", ImVec2(120, 0)))
-      {
-        ImGui::CloseCurrentPopup();
-      }
-      ImGui::EndPopup();
-    }
+    prmScene.meshToImportFilename =
+        nvgui::windowOpenFileDialog(m_app->getWindowHandle(), "Load Mesh",
+                                    "All Mesh Files|*.obj;*.gltf;*.glb|OBJ Files|*.obj|glTF Files|*.gltf;*.glb");
   }
   if(node_open)
   {
@@ -2348,12 +3026,28 @@ void GaussianSplattingUI::guiDrawObjectTree()
       if(m_selectedAsset == GUI_MESH && m_selectedMeshInstance == instance)
         node_flags |= ImGuiTreeNodeFlags_Selected;
 
+      if(!instance->show)
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.5f, 0.5f, 0.5f, 0.5f));
+
       bool node_open = ImGui::TreeNodeEx((void*)(intptr_t)instance.get(), node_flags,
                                          ICON_MS_SUBDIRECTORY_ARROW_RIGHT "%s", instance->name.c_str());
+
+      if(!instance->show)
+        ImGui::PopStyleColor();
+
       if(ImGui::IsItemClicked() && !ImGui::IsItemToggledOpen())
       {
         selectMeshInstance(instance);
       }
+      ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 110);
+      if(ImGui::SmallButton(instance->show ? ICON_MS_VISIBILITY : ICON_MS_VISIBILITY_OFF))
+      {
+        instance->show = !instance->show;
+        m_assets.meshes.setVisibilityDirty();
+        m_objListUpdated = true;
+        resetFrameCounter();
+      }
+      nvgui::tooltip(instance->show ? "Hide" : "Show");
       ImGui::SameLine(ImGui::GetWindowContentRegionMax().x - 70);
       if(ImGui::SmallButton(ICON_MS_CONTENT_COPY))
       {
@@ -2388,16 +3082,86 @@ void GaussianSplattingUI::guiDrawObjectTree()
 
 void GaussianSplattingUI::guiDrawPropertiesWindow()
 {
-  if(ImGui::Begin("Properties"))
+  if(!m_showPropertiesWindow)
+    return;
+
+  if(ImGui::Begin("Properties", &m_showPropertiesWindow))
   {
     switch(m_selectedAsset)
     {
       case GUI_RENDERER:
-        if(ImGui::CollapsingHeader("Renderer", ImGuiTreeNodeFlags_DefaultOpen))
+      case GUI_RASTERIZATION:
+      case GUI_RAYTRACING:
+      case GUI_DENOISING:
+      case GUI_TONEMAPPING: {
+        // Force-select a tab only when the tree selection actually changes
+        static int prevSelectedAsset = GUI_NONE;
+        bool       selectionChanged  = (m_selectedAsset != prevSelectedAsset);
+
+        ImGuiTabItemFlags selectRenderer =
+            (selectionChanged && m_selectedAsset == GUI_RENDERER) ? ImGuiTabItemFlags_SetSelected : 0;
+        ImGuiTabItemFlags selectRaster =
+            (selectionChanged && m_selectedAsset == GUI_RASTERIZATION) ? ImGuiTabItemFlags_SetSelected : 0;
+        ImGuiTabItemFlags selectRaytrace =
+            (selectionChanged && m_selectedAsset == GUI_RAYTRACING) ? ImGuiTabItemFlags_SetSelected : 0;
+        ImGuiTabItemFlags selectDenoise =
+            (selectionChanged && m_selectedAsset == GUI_DENOISING) ? ImGuiTabItemFlags_SetSelected : 0;
+        ImGuiTabItemFlags selectTonemap =
+            (selectionChanged && m_selectedAsset == GUI_TONEMAPPING) ? ImGuiTabItemFlags_SetSelected : 0;
+
+        if(ImGui::BeginTabBar("##RendererTabs"))
         {
-          guiDrawRendererProperties();
+          if(ImGui::BeginTabItem(ICON_MS_CAMERA " Renderer", nullptr, selectRenderer))
+          {
+            if(!selectionChanged)
+              m_selectedAsset = GUI_RENDERER;
+            guiDrawRendererProperties();
+            ImGui::EndTabItem();
+          }
+
+          ImGui::BeginDisabled(!isRasterPipelineActive());
+          if(ImGui::BeginTabItem(ICON_MS_GRID_ON " Raster", nullptr, selectRaster))
+          {
+            if(!selectionChanged)
+              m_selectedAsset = GUI_RASTERIZATION;
+            guiDrawRasterizationProperties();
+            ImGui::EndTabItem();
+          }
+          ImGui::EndDisabled();
+
+          ImGui::BeginDisabled(!isRtxPipelineActive());
+          if(ImGui::BeginTabItem(ICON_MS_CALL_MISSED_OUTGOING " Raytrace", nullptr, selectRaytrace))
+          {
+            if(!selectionChanged)
+              m_selectedAsset = GUI_RAYTRACING;
+            guiDrawRaytracingProperties();
+            ImGui::EndTabItem();
+          }
+          ImGui::EndDisabled();
+
+          ImGui::BeginDisabled(!isDlssSupportedPipeline());
+          if(ImGui::BeginTabItem(ICON_MS_BLUR_ON " Denoise", nullptr, selectDenoise))
+          {
+            if(!selectionChanged)
+              m_selectedAsset = GUI_DENOISING;
+            guiDrawDenoisingProperties();
+            ImGui::EndTabItem();
+          }
+          ImGui::EndDisabled();
+
+          if(ImGui::BeginTabItem(ICON_MS_TONALITY " Tone map", nullptr, selectTonemap))
+          {
+            if(!selectionChanged)
+              m_selectedAsset = GUI_TONEMAPPING;
+            guiDrawTonemappingProperties();
+            ImGui::EndTabItem();
+          }
+          ImGui::EndTabBar();
         }
+
+        prevSelectedAsset = m_selectedAsset;
         break;
+      }
       case GUI_SPLATSET:
         if(m_selectedSplatInstance)
         {
@@ -2421,13 +3185,17 @@ void GaussianSplattingUI::guiDrawPropertiesWindow()
         }
         if(m_selectedMeshInstance)
         {
-          if(ImGui::CollapsingHeader("Transform", ImGuiTreeNodeFlags_DefaultOpen))
           {
-            guiDrawMeshTransformProperties();
+            bool open = beginCollapsibleGroup("Transform", true);
+            if(open)
+              guiDrawMeshTransformProperties();
+            endCollapsibleGroup(open);
           }
-          if(ImGui::CollapsingHeader("Materials", ImGuiTreeNodeFlags_DefaultOpen))
           {
-            guiDrawMeshMaterialProperties();
+            bool open = beginCollapsibleGroup("Materials", true);
+            if(open)
+              guiDrawMeshMaterialProperties();
+            endCollapsibleGroup(open);
           }
         }
         break;
@@ -2437,22 +3205,27 @@ void GaussianSplattingUI::guiDrawPropertiesWindow()
         {
           guiDrawCameraProperties();
         }
-        if(m_selectedCameraPresetIndex == -1)
-        {
-          if(ImGui::CollapsingHeader("Navigation", ImGuiTreeNodeFlags_DefaultOpen))
-          {
-            guiDrawNavigationProperties();
-          }
-        }
         break;
       case GUI_LIGHT:
         if(m_selectedLightInstance)
         {
-          if(ImGui::CollapsingHeader("Light", ImGuiTreeNodeFlags_DefaultOpen))
           {
-            guiDrawLightProperties();
+            bool open = beginCollapsibleGroup("Light", true);
+            if(open)
+              guiDrawLightProperties();
+            endCollapsibleGroup(open);
           }
         }
+        break;
+      case GUI_SKY: {
+        bool open = beginCollapsibleGroup("Sky", true);
+        if(open)
+          guiDrawSkyProperties();
+        endCollapsibleGroup(open);
+      }
+      break;
+      case GUI_SETTINGS:
+        guiDrawSettingsProperties();
         break;
       default:
         // display nothing
@@ -2462,466 +3235,808 @@ void GaussianSplattingUI::guiDrawPropertiesWindow()
   ImGui::End();
 }
 
+void GaussianSplattingUI::guiDrawSettingsProperties()
+{
+  {
+    bool open = beginCollapsibleGroup("Navigation", true);
+    if(open)
+      guiDrawNavigationProperties();
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Transform Helpers", true);
+    if(open)
+    {
+      namespace PE        = nvgui::PropertyEditor;
+      bool  editingMode   = m_helpers.isEditingMode();
+      bool  snapEnabled   = m_helpers.transform.isSnapEnabled();
+      float snapTranslate = m_helpers.transform.getSnapTranslate();
+      float snapRotate    = m_helpers.transform.getSnapRotate();
+      float snapScale     = m_helpers.transform.getSnapScale();
+
+      if(PE::begin("##TransformHelpers", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
+        if(PE::Checkbox("Show", &editingMode, "Show/hide transform helpers (E)"))
+          m_helpers.setEditingMode(editingMode);
+        if(PE::Checkbox("Snapping", &snapEnabled, "Enable grid snapping for transform operations"))
+          m_helpers.transform.setSnapEnabled(snapEnabled);
+        PE::end();
+      }
+
+      ImGui::BeginDisabled(!snapEnabled);
+      if(PE::begin("## Snap Values", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
+        if(PE::DragFloat("Translate", &snapTranslate, 0.01f, 0.001f, 100.0f, "%.3f", 0, "Translation snap increment"))
+          m_helpers.transform.setSnapValues(snapTranslate, snapRotate, snapScale);
+        if(PE::DragFloat("Rotate", &snapRotate, 0.5f, 0.1f, 180.0f, "%.1f", 0, "Rotation snap increment (degrees)"))
+          m_helpers.transform.setSnapValues(snapTranslate, snapRotate, snapScale);
+        if(PE::DragFloat("Scale", &snapScale, 0.01f, 0.001f, 10.0f, "%.3f", 0, "Scale snap increment"))
+          m_helpers.transform.setSnapValues(snapTranslate, snapRotate, snapScale);
+        PE::end();
+      }
+      ImGui::EndDisabled();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Infinite Grid", true);
+    if(open)
+    {
+      namespace PE     = nvgui::PropertyEditor;
+      bool gridVisible = m_helpers.grid.isVisible();
+      if(PE::begin("##InfiniteGrid", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
+        if(PE::Checkbox("Show", &gridVisible, "Show/hide infinite grid (G)"))
+          m_helpers.grid.setVisible(gridVisible);
+        PE::end();
+      }
+    }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Light Proxies", true);
+    if(open)
+    {
+      namespace PE = nvgui::PropertyEditor;
+      if(PE::begin("##LightProxies", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
+        if(PE::Checkbox("Show", &m_showLightProxies, "Show/hide light proxy meshes (L)"))
+          resetFrameCounter();
+        PE::end();
+      }
+    }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Summary Info Overlay", true);
+    if(open)
+    {
+      namespace PE = nvgui::PropertyEditor;
+      if(PE::begin("##SummaryOverlay", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
+        PE::Checkbox("Show", &m_showSummaryOverlay, "Show/hide summary info overlay in viewport");
+        PE::end();
+      }
+    }
+    endCollapsibleGroup(open);
+  }
+}
+
 void GaussianSplattingUI::guiDrawRendererProperties()
 {
+  namespace PE = nvgui::PropertyEditor;
+
+  // --- Global settings ---
+  {
+    bool open = beginCollapsibleGroup("Global Settings", true);
+    if(open)
+    {
+      PE::begin("## Global settings ", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      bool vsync = m_app->isVsync();
+      if(PE::Checkbox("V-Sync", &vsync))
+        m_app->setVsync(vsync);
+
+      if(PE::entry("Pipeline", [&]() { return m_ui.enumCombobox(GUI_PIPELINE, "##ID", &prmSelectedPipeline); }, "Selects the rendering method"))
+      {
+        m_requestUpdateShaders = true;
+      }
+
+      int colorFormatInt = static_cast<int>(prmRender.colorFormat);
+      if(PE::entry(
+             "Color Format", [&]() { return m_ui.enumCombobox(GUI_COLOR_FORMAT, "##ColorFormat", &colorFormatInt); },
+             "Color buffer format.\n"
+             "Higher precision improves temporal accumulation quality but uses more memory.\n"
+             "R8G8B8A8 UNORM: 32-bit (lowest memory, fastest rendering)\n"
+             "R16G16B16A16 SFLOAT: 64-bit (default, good balance)\n"
+             "R32G32B32A32 SFLOAT: 128-bit (highest precision)"))
+      {
+        prmRender.colorFormat  = static_cast<VkFormat>(colorFormatInt);
+        m_requestGBufferReinit = true;
+        resetFrameCounter();
+      }
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Lighting and temporal ---
+  {
+    bool open = beginCollapsibleGroup("Lighting and Temporal", true);
+    if(open)
+    {
+      PE::begin("## Lighting and temporal", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      guiDrawLightingModeSelector(false);
+      guiDrawShadowsModeSelector(false);
+
+      if(PE::entry(
+             "Temporal sampling",
+             [&]() { return m_ui.enumCombobox(GUI_TEMPORAL_SAMPLING, "##ID", &prmRtx.temporalSamplingMode); },
+             "Enable accumulation of frame results over time.\n"
+             "Automatic will activate sampling depending on other effects such as DoF or Pass Monte Carlo trace strategy.\n"
+             "If enabled, the specified number of temporal samples will be accumulated over \"Temporal samples count\" frames,\n"
+             "and the last accumulated frame will be presented without additional rendering.\n"
+             "Note that rendering converges faster if v-sync is off.\n"
+             "If disabled, the system renders in free run mode."))
+      {
+        resetFrameCounter();
+        m_requestUpdateShaders = true;
+
+        if(prmComparison.enabled && m_imageCompare.hasValidCaptureImage())
+        {
+          int historySize = prmRtx.temporalSampling ? prmFrame.frameSampleMax : 25;
+          m_imageCompare.setMetricsHistorySize(historySize);
+        }
+      }
+
+      if(PE::InputInt("Temporal samples count", &prmFrame.frameSampleMax, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue,
+                      "Number of frames after which temporal sampling is stopped. \n"
+                      "A value of 0 disables temporal sampling."))
+      {
+        prmFrame.frameSampleMax = std::clamp(prmFrame.frameSampleMax, 1, 100000);
+        resetFrameCounter();
+
+        if(prmComparison.enabled && m_imageCompare.hasValidCaptureImage() && prmRtx.temporalSampling)
+        {
+          m_imageCompare.setMetricsHistorySize(prmFrame.frameSampleMax);
+        }
+      }
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Visualization ---
+  {
+    bool open = beginCollapsibleGroup("Visualization", true);
+    if(open)
+    {
+      PE::begin("## Visualization", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      auto visuMenu = GUI_VISUALIZE;
+      if(m_dlss.isEnabled())
+        visuMenu = GUI_VISUALIZE_DLSS_ON;
+
+      ImGui::BeginDisabled(!isRtxPipelineActive());
+
+      static constexpr const char* visualizeTooltip =
+          "Selects the visualization mode.\n"
+          "Available only with ray tracing and hybrid pipelines.\n\n"
+          "Final render: standard rendered output.\n"
+          "Clay mode: renders all surfaces with a uniform clay color.\n"
+          "Clock cycles: heat-map of GPU clock cycles per pixel.\n"
+          "Ray Hit Count: heat-map of ray intersection tests per pixel.\n"
+          "Depth (iso thres): depth from integrated iso-threshold.\n"
+          "Depth (Closest hit): depth of the closest ray-particle hit.\n"
+          "Depth (for DLSS): depth buffer as fed to the DLSS denoiser.\n"
+          "Normal (Integrated): surface normal from integrated contributions.\n"
+          "Normal (closest hit): surface normal at the closest ray-particle hit.\n"
+          "Normal (For DLSS): normal buffer as fed to the DLSS denoiser.\n"
+          "Splat ID (Harlequin): unique color per splat for identification.\n\n"
+          "DLSS guide modes (enabled only when DLSS is active):\n"
+          "DLSS Input: raw radiance input before denoising.\n"
+          "DLSS Guide Albedo/Specular/Normal/Motion/Depth: individual G-buffers\n"
+          "  used by the DLSS denoiser.";
+
+      if(PE::entry("Visualize Mode", [&]() { return m_ui.enumCombobox(visuMenu, "##ID", &prmRender.visualize); }, visualizeTooltip))
+      {
+        m_requestUpdateShaders = true;
+      }
+      switch(prmRender.visualize)
+      {
+        case VISUALIZE_CLAY: {
+          if(PE::ColorEdit3("Clay Color", glm::value_ptr(prmRender.clayColor)))
+            resetFrameCounter();
+          break;
+        }
+        case VISUALIZE_CLOCK: {
+          bool changed = PE::DragFloat2("Min/max", glm::value_ptr(prmRender.clockVisuMinMax), 0.01f);
+          changed |= PE::SliderFloat("Shift", &prmRender.clockVisuShift, -1.0f, 1.0f);
+          if(changed)
+            resetFrameCounter();
+          break;
+        }
+        case VISUALIZE_DEPTH:
+        case VISUALIZE_DEPTH_INTEGRATED:
+        case VISUALIZE_DEPTH_FOR_DLSS: {
+          bool changed = PE::DragFloat2("Min/max", glm::value_ptr(prmRender.depthVisuMinMax), 0.01f);
+          changed |= PE::SliderFloat("Shift", &prmRender.depthVisuShift, -1.0f, 1.0f);
+          if(changed)
+            resetFrameCounter();
+          break;
+        }
+        case VISUALIZE_RAYHITS: {
+          bool changed = PE::DragFloat2("Min/max", glm::value_ptr(prmRender.hitsVisuMinMax), 1.0f);
+          changed |= PE::SliderFloat("Shift", &prmRender.hitsVisuShift, -1.0f, 1.0f);
+          if(changed)
+            resetFrameCounter();
+          break;
+        }
+      }
+      ImGui::EndDisabled();
+
+      {
+        const bool wireframeSupported = isSupported.shaderFloat64 && isSupported.fragmentShaderBarycentric;
+        ImGui::BeginDisabled(!wireframeSupported);
+        if(PE::Checkbox("Wireframe", &prmRender.wireframe,
+                        wireframeSupported ? "Show particle bounds in wireframe." :
+                                             "Wireframe requires VK_KHR_fragment_shader_barycentric and shaderFloat64, neither of which are supported by this device."))
+          m_requestUpdateShaders = true;
+        ImGui::EndDisabled();
+      }
+
+      int alphaThres = int(255.0 * prmFrame.alphaCullThreshold);
+      if(PE::SliderInt("Alpha culling threshold", &alphaThres, 0, 255, "%d", 0, "Discard splats with low opacity (with low contribution)."))
+      {
+        prmFrame.alphaCullThreshold = (float)alphaThres / 255.0f;
+      }
+
+      if(PE::SliderInt("Maximum SH degree", (int*)&prmFrame.shDegree, 0, 3, "%d", 0,
+                       "Sets the highest degree of Spherical Harmonics (SH) used for view-dependent effects."))
+      {
+      }
+
+      if(PE::Checkbox("Show SH deg > 0 only", &prmRender.showShOnly,
+                      "Removes the base color from SH degree 0, applying only color deduced from \n"
+                      "higher-degree SH to a neutral gray. This helps visualize their contribution."))
+        m_requestUpdateShaders = true;
+
+      if(PE::Checkbox("Disable opacity gaussian ", &prmRender.opacityGaussianDisabled,
+                      "Disables the alpha component of the Gaussians, making their full range visible.\n"
+                      "This helps analyze splat distribution and scales, especially when combined with Splat Scale adjustments."))
+        m_requestUpdateShaders = true;
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Particle Filtering ---
+  {
+    bool open = beginCollapsibleGroup("Particle Filtering", true);
+    if(open)
+    {
+      PE::begin("## Particle Filtering", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      {
+        static const float kernelSizeValues[] = {0.0f, 0.1f, 0.2f, 0.3f};
+        int                kernelIdx          = 0;
+        for(int i = 0; i < IM_ARRAYSIZE(kernelSizeValues); i++)
+        {
+          if(prmRaster.covarianceDilation == kernelSizeValues[i])
+            kernelIdx = i;
+        }
+
+        if(PE::entry(
+               "Low pass Kernel Size",
+               [&]() { return m_ui.enumCombobox(GUI_COVARIANCE_DILATION, "##AAKernelSize", &kernelIdx); },
+               "2D covariance dilation, low-pass kernel size (0.0 = no filtering).\n"
+               "Larger values produce more smoothing but may reduce sharpness.\n"
+               "0.0: disabled\n"
+               "0.1: MipSplatting default\n"
+               "0.2\n"
+               "0.3: 3DGS, 3DGUT, and StochasticSplat default"))
+        {
+          prmRaster.covarianceDilation = kernelSizeValues[kernelIdx];
+          m_requestUpdateShaders       = true;
+        }
+      }
+
+      ImGui::BeginDisabled(prmRaster.covarianceDilation == 0.0);
+      if(PE::Checkbox("Mip splatting antialiasing", &prmRaster.msAntialiasing,
+                      "Indicates if Gaussians were trained (and should be rendered) with mip-splatting antialiasing method.\n"
+                      "Compensates the particle opacity with respect to the selected Low pass Kernel Size\n"
+                      "Active only if covariance dilation is > 0.0"))
+      {
+        m_requestUpdateShaders = true;
+      }
+      ImGui::EndDisabled();
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Particle Normal Vectors ---
+  {
+    bool open = beginCollapsibleGroup("Particle Normal Vectors", true);
+    if(open)
+    {
+      PE::begin("## Normal computation", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      if(PE::entry(
+             "Normal vectors",
+             [&]() { return m_ui.enumCombobox(GUI_NORMAL_METHOD, "##ID", (int*)&prmRender.normalMethod); },
+             "Select the method used to compute normal vectors for Gaussian particles.\n"
+             "Max density plane: approximates the iso-density surface with a tangent plane at the\n"
+             "  Gaussian center (StochasticSplats approach). Fast and good quality.\n"
+             "Iso-surface ellipsoid: computes ray-ellipsoid surface intersection in canonical space.\n"
+             "  More geometrically accurate for individual particles."))
+        m_requestUpdateShaders = true;
+
+      PE::DragFloat("Thin particle threshold", &prmRender.thinParticleThreshold, 0.0001f, 0.0f, 1.0f, "%.6f", 0,
+                    "Scale below which a particle axis is considered degenerate for normal computation.\n"
+                    "Particles with an axis thinner than this threshold are treated as flat disks\n"
+                    "(normal along the thin axis) instead of using the full ellipsoid computation.");
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Default Settings ---
+  {
+    bool open = beginCollapsibleGroup("Default Settings", true);
+    if(open)
+    {
+      PE::begin("##ResetSettings", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      if(PE::entry("Default settings", [&] { return ImGui::Button("Reset"); }, "resets to default settings"))
+      {
+        resetRenderSettings();
+        m_requestUpdateShaders = true;
+        m_assets.splatSets.markAllSplatSetsForRegeneration();
+      }
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+}
+
+void GaussianSplattingUI::guiDrawRasterizationProperties()
+{
+  bool rasterDisabled = !isRasterPipelineActive();
+  ImGui::BeginDisabled(rasterDisabled);
 
   namespace PE = nvgui::PropertyEditor;
 
-  PE::begin("## Global settings ");
-  bool vsync = m_app->isVsync();
-  if(PE::Checkbox("V-Sync", &vsync))
-    m_app->setVsync(vsync);
-
-  if(PE::entry(
-         "Pipeline", [&]() { return m_ui.enumCombobox(GUI_PIPELINE, "##ID", &prmSelectedPipeline); }, "Selects the rendering method"))
+  // --- Shape ---
   {
-    m_requestUpdateShaders = true;
-  }
-
-  if(PE::entry(
-         "Default settings", [&] { return ImGui::Button("Reset"); }, "resets to default settings"))
-  {
-    resetRenderSettings();
-    m_requestUpdateShaders = true;
-    // resetRenderSettings() may change global parameters - regenerate all splat sets
-    m_assets.splatSets.markAllSplatSetsForRegeneration();
-  }
-
-  int colorFormatInt = static_cast<int>(m_colorFormat);
-  if(PE::entry(
-         "Color Format", [&]() { return m_ui.enumCombobox(GUI_COLOR_FORMAT, "##ColorFormat", &colorFormatInt); },
-         "Color buffer format.\n"
-         "Higher precision improves temporal accumulation quality but uses more memory.\n"
-         "R8G8B8A8 UNORM: 32-bit (lowest memory, fastest rendering)\n"
-         "R16G16B16A16 SFLOAT: 64-bit (default, good balance)\n"
-         "R32G32B32A32 SFLOAT: 128-bit (highest precision)"))
-  {
-    m_colorFormat          = static_cast<VkFormat>(colorFormatInt);
-    m_requestGBufferReinit = true;
-    resetFrameCounter();
-  }
-
-  PE::end();
-
-  PE::begin("## Visualization");
-
-  auto visuMenu = GUI_VISUALIZE;
-  if(m_dlss.isEnabled())
-    visuMenu = GUI_VISUALIZE_DLSS_ON;
-
-  // Visualization available for all ray tracing pipelines (pure RTX and hybrids)
-  ImGui::BeginDisabled(!isRtxPipelineActive());
-
-  if(PE::entry(
-         "Visualize", [&]() { return m_ui.enumCombobox(visuMenu, "##ID", &prmRender.visualize); },
-         "Selects the visualization mode.\nDLSS guide modes display the G-buffers used for DLSS (only when DLSS is enabled)."))
-  {
-    m_requestUpdateShaders = true;
-  }
-  switch(prmRender.visualize)
-  {
-    case VISUALIZE_CLOCK: {
-      bool changed = PE::DragFloat2("Min/max", glm::value_ptr(prmRender.clockVisuMinMax), 0.01f);
-      changed |= PE::SliderFloat("Shift", &prmRender.clockVisuShift, -1.0f, 1.0f);
-      prmFrame.visuMinMax = prmRender.clockVisuMinMax;
-      prmFrame.visuShift  = prmRender.clockVisuShift;
-      if(changed)
-        resetFrameCounter();
-      break;
-    }
-    case VISUALIZE_DEPTH:
-    case VISUALIZE_DEPTH_INTEGRATED:
-    case VISUALIZE_DEPTH_FOR_DLSS: {
-      bool changed = PE::DragFloat2("Min/max", glm::value_ptr(prmRender.depthVisuMinMax), 0.01f);
-      changed |= PE::SliderFloat("Shift", &prmRender.depthVisuShift, -1.0f, 1.0f);
-      prmFrame.visuMinMax = prmRender.depthVisuMinMax;
-      prmFrame.visuShift  = prmRender.depthVisuShift;
-      if(changed)
-        resetFrameCounter();
-      break;
-    }
-    case VISUALIZE_RAYHITS: {
-      bool changed = PE::DragFloat2("Min/max", glm::value_ptr(prmRender.hitsVisuMinMax), 1.0f);
-      changed |= PE::SliderFloat("Shift", &prmRender.hitsVisuShift, -1.0f, 1.0f);
-      prmFrame.visuMinMax = prmRender.hitsVisuMinMax;
-      prmFrame.visuShift  = prmRender.hitsVisuShift;
-      if(changed)
-        resetFrameCounter();
-      break;
-    }
-  }
-  ImGui::EndDisabled();
-
-  PE::end();
-
-  PE::begin("## Common settings");
-  if(PE::Checkbox("Wireframe", &prmRender.wireframe, "Show particle bounds in wireframe "))
-    m_requestUpdateShaders = true;
-
-  int alphaThres = int(255.0 * prmFrame.alphaCullThreshold);
-  if(PE::SliderInt("Alpha culling threshold", &alphaThres, 0, 255, "%d", 0, "Discard splats with low opacity (with low contribution)."))
-  {
-    prmFrame.alphaCullThreshold = (float)alphaThres / 255.0f;
-  }
-
-  if(PE::SliderInt("Maximum SH degree", (int*)&prmFrame.shDegree, 0, 3, "%d", 0,
-                   "Sets the highest degree of Spherical Harmonics (SH) used for view-dependent effects."))
-  {
-    // not needed anymore
-    // m_requestUpdateShaders = true;
-  }
-
-  if(PE::Checkbox("Show SH deg > 0 only", &prmRender.showShOnly,
-                  "Removes the base color from SH degree 0, applying only color deduced from \n"
-                  "higher-degree SH to a neutral gray. This helps visualize their contribution."))
-    m_requestUpdateShaders = true;
-
-  if(PE::Checkbox("Disable opacity gaussian ", &prmRender.opacityGaussianDisabled,
-                  "Disables the alpha component of the Gaussians, making their full range visible.\n"
-                  "This helps analyze splat distribution and scales, especially when combined with Splat Scale adjustments."))
-    m_requestUpdateShaders = true;
-
-  if(PE::entry(
-         "Normal vectors", [&]() { return m_ui.enumCombobox(GUI_NORMAL_METHOD, "##ID", (int*)&prmRender.normalMethod); },
-         "Select the method used to compute normal vectors for Gaussian particles.\n"
-         "Max density plane: approximates the iso-density surface with a tangent plane at the\n"
-         "  Gaussian center (StochasticSplats approach). Fast and good quality.\n"
-         "Iso-surface ellipsoid: computes ray-ellipsoid surface intersection in canonical space.\n"
-         "  More geometrically accurate for individual particles."))
-    m_requestUpdateShaders = true;
-
-  PE::DragFloat("Thin particle threshold", &prmRender.thinParticleThreshold, 0.0001f, 0.0f, 1.0f, "%.6f", 0,
-                "Scale below which a particle axis is considered degenerate for normal computation.\n"
-                "Particles with an axis thinner than this threshold are treated as flat disks\n"
-                "(normal along the thin axis) instead of using the full ellipsoid computation.");
-
-  guiDrawLightingModeSelector(false);
-  guiDrawShadowsModeSelector(false);
-
-  if(PE::entry(
-         "Temporal sampling",
-         [&]() { return m_ui.enumCombobox(GUI_TEMPORAL_SAMPLING, "##ID", &prmRtx.temporalSamplingMode); },
-         "Enable accumulation of frame results over time.\n"
-         "Automatic will activate sampling depending on other effects such as DoF or Pass Monte Carlo trace strategy.\n"
-         "If enabled, the specified number of temporal samples will be accumulated over \"Temporal samples count\" frames,\n"
-         "and the last accumulated frame will be presented without additional rendering.\n"
-         "Note that rendering converges faster if v-sync is off.\n"
-         "If disabled, the system renders in free run mode."))
-  {
-    resetFrameCounter();
-    m_requestUpdateShaders = true;
-
-    // Update metrics history size if comparison is active
-    if(prmComparison.enabled && m_imageCompare.hasValidCaptureImage())
+    bool open = beginCollapsibleGroup("Shape", true);
+    if(open)
     {
-      int historySize = prmRtx.temporalSampling ? prmFrame.frameSampleMax : 25;
-      m_imageCompare.setMetricsHistorySize(historySize);
-    }
-  }
+      PE::begin("## Shape", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
 
-  if(PE::InputInt("Temporal samples count", &prmFrame.frameSampleMax, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue,
-                  "Number of frames after which temporal sampling is stopped. \n"
-                  "A value of 0 disables temporal sampling."))
-  {
-    prmFrame.frameSampleMax = std::clamp(prmFrame.frameSampleMax, 1, 100000);
-    resetFrameCounter();
-
-    // Update metrics history size if comparison is active and temporal sampling is enabled
-    if(prmComparison.enabled && m_imageCompare.hasValidCaptureImage() && prmRtx.temporalSampling)
-    {
-      m_imageCompare.setMetricsHistorySize(prmFrame.frameSampleMax);
-    }
-  }
-
-  PE::end();
-
-  ImGuiTabBarFlags tab_bar_flags = ImGuiTabBarFlags_None;
-  if(ImGui::BeginTabBar("##SpecificsBar", tab_bar_flags))
-  {
-    if(prmSelectedPipeline != PIPELINE_RTX)
-    {
-      if(ImGui::BeginTabItem("Rasterization specifics"))
       {
-        PE::begin("## Raster settings");
+        bool is3dgut = (prmSelectedPipeline == PIPELINE_MESH_3DGUT || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
+        ImGui::BeginDisabled(!is3dgut);
+        if(PE::entry(
+               "Kernel degree",
+               [&]() { return m_ui.enumCombobox(GUI_KERNEL_DEGREE, "##RasterKD", &prmRtx.kernelDegree); },
+               "Degree of the kernel function used for Gaussian evaluation.\n"
+               "Must match the degree used during model training/generation.\n"
+               "Only available for 3DGUT and Hybrid 3DGUT pipelines.\n"
+               "Changing this triggers a BLAS rebuild."))
+        {
+          m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+          m_requestUpdateShaders = true;
+        }
+        ImGui::EndDisabled();
+      }
 
-        guiDrawSortingSelector(false);
+      bool forceExtentProjection = prmSelectedPipeline == PIPELINE_VERT || prmSelectedPipeline == PIPELINE_MESH
+                                   || prmSelectedPipeline == PIPELINE_HYBRID;
+      ImGui::BeginDisabled(forceExtentProjection);
+      if(PE::entry(
+             "Projection Method",
+             [&]() { return m_ui.enumCombobox(GUI_EXTENT_METHOD, "##ID", &prmRaster.extentProjection); },
+             "Available for 3DGUT pipelines only, 3DGS allways uses Eigen.\n"
+             "Method used to compute the 2D extent projection from the 3D covariance:\n"
+             "- Eigen method leads to basis aligned rectangular extent, more performant\n"
+             "- Conic method leads to axis aligned rectangular extent as in 3DGS and 3DGUT papers"))
+      {
+        m_requestUpdateShaders = true;
+      }
+      ImGui::EndDisabled();
 
-        // CPU sorting options disabled for GPU radix and stochastic modes
-        const bool cpuSortingDisabled =
-            (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX || prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
-        ImGui::BeginDisabled(cpuSortingDisabled);
-        PE::Checkbox("Lazy CPU sorting", &prmRaster.cpuLazySort, "Perform sorting only if viewpoint changes");
+      ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
+      PE::entry(
+          "Splat scale",
+          [&]() {
+            ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
+            return ImGui::DragFloat("##splatScale", &prmFrame.splatScale, 0.01f, 0.1f,
+                                    prmRaster.pointCloudModeEnabled != 0 ? 10.0f : 2.0f, "%.3f");
+          },
+          "Adjusts the size of the splats for visualization purposes.");
 
-        PE::Text("CPU sorting state", m_assets.splatSets.getCpuSorterStatus() == SplatSorterAsync::E_SORTING ? "Sorting" : "Idled");
+      if(PE::Checkbox("Disable splatting", &prmRaster.pointCloudModeEnabled,
+                      "Switches to point cloud mode, displaying only the splat centers. \n"
+                      "Other parameters such as Splat Scale still apply in this mode."))
+        m_requestUpdateShaders = true;
+      ImGui::EndDisabled();
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Sorting ---
+  {
+    bool open = beginCollapsibleGroup("Sorting", true);
+    if(open)
+    {
+      PE::begin("## Sorting", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      guiDrawSortingSelector(false);
+
+      const bool cpuSortingDisabled =
+          (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX || prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
+      ImGui::BeginDisabled(cpuSortingDisabled);
+      PE::Checkbox("Lazy CPU sorting", &prmRaster.cpuLazySort, "Perform sorting only if viewpoint changes");
+      PE::Text("CPU sorting state", m_assets.splatSets.getCpuSorterStatus() == SplatSorterAsync::E_SORTING ? "Sorting" : "Idled");
+      nvgui::tooltip(
+          "Current state of the CPU-based asynchronous sorting.\n"
+          "'Sorting' = sort in progress, 'Idled' = sort complete or not needed.");
+      ImGui::EndDisabled();
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Culling ---
+  {
+    bool open = beginCollapsibleGroup("Culling", true);
+    if(open)
+    {
+      PE::begin("## Culling", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      if(PE::entry(
+             "Frustum culling",
+             [&]() { return m_ui.enumCombobox(GUI_FRUSTUM_CULLING, "##FrustumCulling", &prmRaster.frustumCulling); },
+             "Defines where frustum culling is performed:\n"
+             "- Disabled: no frustum culling (for performance comparisons).\n"
+             "- At distance stage: culling in the distance compute shader\n"
+             "  (only available with GPU radix sort or stochastic splat).\n"
+             "- At raster stage: culling in the vertex or mesh shader."))
+      {
+        const bool usesDistShader =
+            (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX) || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
+        if(!usesDistShader && prmRaster.frustumCulling == FRUSTUM_CULLING_AT_DIST)
+          prmRaster.frustumCulling = FRUSTUM_CULLING_AT_RASTER;
+        m_requestUpdateShaders = true;
+      }
+
+      PE::SliderFloat("Frustum dilation", &prmFrame.frustumDilation, 0.0f, 1.0f, "%.1f", 0,
+                      "Adjusts the frustum culling bounds to account for the fact that visibility is tested \n"
+                      "only at the center of each splat, rather than its full elliptical shape. A positive \n"
+                      "value expands the frustum by the given percentage, reducing the risk of prematurely \n"
+                      "discarding splats near the frustum boundaries.");
+
+      {
+        const bool usesDistShader =
+            (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX) || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
+        ImGui::BeginDisabled(!usesDistShader);
+        if(PE::Checkbox("Screen size culling", (bool*)&prmRaster.sizeCulling,
+                        "Cull splats whose projected bounding sphere is smaller than the specified pixel coverage.\n"
+                        "Only available when using the distance compute shader (GPU radix sort or stochastic splat)."))
+        {
+          m_requestUpdateShaders = true;
+        }
         ImGui::EndDisabled();
 
-        // Radio buttons for exclusive selection
+        ImGui::BeginDisabled(!prmRaster.sizeCulling || !usesDistShader);
         PE::entry(
-            "Frustum culling",
-            [&]() {
-              if(ImGui::RadioButton("Disabled", prmRaster.frustumCulling == FRUSTUM_CULLING_NONE))
-              {
-                prmRaster.frustumCulling = FRUSTUM_CULLING_NONE;
-                m_requestUpdateShaders   = true;
-              }
-
-              // GPU radix sort and stochastic splat both use the distance compute shader
-              const bool usesDistShader = (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX)
-                                          || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
-              ImGui::BeginDisabled(!usesDistShader);
-              if(ImGui::RadioButton("At distance stage", prmRaster.frustumCulling == FRUSTUM_CULLING_AT_DIST))
-              {
-                prmRaster.frustumCulling = FRUSTUM_CULLING_AT_DIST;
-                m_requestUpdateShaders   = true;
-              }
-              ImGui::EndDisabled();
-
-              if(ImGui::RadioButton("At raster stage", prmRaster.frustumCulling == FRUSTUM_CULLING_AT_RASTER))
-              {
-                prmRaster.frustumCulling = FRUSTUM_CULLING_AT_RASTER;
-                m_requestUpdateShaders   = true;
-              }
-              return true;
-            },
-            "Defines where frustum culling is performed: in the distance compute shader or \n"
-            "at rasterization (in vertex or mesh shader). Culling can also be disabled for performance comparisons.");
-
-        PE::SliderFloat("Frustum dilation", &prmFrame.frustumDilation, 0.0f, 1.0f, "%.1f", 0,
-                        "Adjusts the frustum culling bounds to account for the fact that visibility is tested \n"
-                        "only at the center of each splat, rather than its full elliptical shape. A positive \n"
-                        "value expands the frustum by the given percentage, reducing the risk of prematurely \n"
-                        "discarding splats near the frustum boundaries.");
-
-        // Size culling: cull splats whose projected bounding sphere is smaller than a threshold
-        {
-          // GPU radix sort and stochastic splat both use the distance compute shader
-          const bool usesDistShader = (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX)
-                                      || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
-          ImGui::BeginDisabled(!usesDistShader);
-          if(PE::Checkbox("Screen size culling", (bool*)&prmRaster.sizeCulling,
-                          "Cull splats whose projected bounding sphere is smaller than the specified pixel coverage.\n"
-                          "Only available when using the distance compute shader (GPU radix sort or stochastic splat)."))
-          {
-            m_requestUpdateShaders = true;
-          }
-          ImGui::EndDisabled();
-
-          ImGui::BeginDisabled(!prmRaster.sizeCulling || !usesDistShader);
-          PE::entry(
-              "Min pixel coverage",
-              [&]() {
-                ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-                return ImGui::DragFloat("##sizeCullingMinPixels", &prmFrame.sizeCullingMinPixels, 0.1f, 0.1f, 20.0f, "%.2f");
-              },
-              "Minimum projected pixel coverage for a splat to be visible.\n"
-              "Splats with a projected bounding sphere diameter smaller than this value will be culled.");
-          ImGui::EndDisabled();
-        }
-
-        if(PE::entry(
-               "Dist WG size",
-               [&]() { return m_ui.enumCombobox(GUI_DIST_SHADER_WG_SIZE, "##ID", &prmRaster.distShaderWorkgroupSize); },
-               "Distance shader workgroup size"))
-        {
-          m_requestUpdateShaders = true;
-        }
-
-        if(PE::entry(
-               "Mesh WG size",
-               [&]() { return m_ui.enumCombobox(GUI_MESH_SHADER_WG_SIZE, "##ID", &prmRaster.meshShaderWorkgroupSize); },
-               "Mesh shader workgroup size"))
-        {
-          m_requestUpdateShaders = true;
-        }
-
-        bool forceExtentProjection = prmSelectedPipeline == PIPELINE_VERT || prmSelectedPipeline == PIPELINE_MESH
-                                     || prmSelectedPipeline == PIPELINE_HYBRID;
-
-        ImGui::BeginDisabled(forceExtentProjection);
-        if(PE::entry(
-               "Projection Method",
-               [&]() { return m_ui.enumCombobox(GUI_EXTENT_METHOD, "##ID", &prmRaster.extentProjection); },
-               "Available for 3DGUT pipelines only, 3DGS allways uses Eigen.\n"
-               "Method used to compute the 2D extent projection from the 3D covariance:\n"
-               "- Eigen method leads to basis aligned rectangular extent, more performant\n"
-               "- Conic method leads to axis aligned rectangular extent as in 3DGS and 3DGUT papers"))
-        {
-          m_requestUpdateShaders = true;
-        }
-        ImGui::EndDisabled();
-
-        if(PE::Checkbox("Mip splatting antialiasing", &prmRaster.msAntialiasing,
-                        "Indicates if Gaussians were trained (and should be rendered) with mip-splatting antialiasing method."))
-          m_requestUpdateShaders = true;
-
-        // Shading sub-options (disabled when shading is off)
-        ImGui::BeginDisabled(prmRender.lightingMode == LightingMode::eLightingDisabled);
-        {
-          if(PE::Checkbox("Quantize Normals", &prmRaster.quantizeNormals,
-                          "Use octahedral encoding for normals (Meyer et al. 2010).\n"
-                          "Reduces mesh-to-fragment bandwidth from 96 bits to 32 bits per normal."))
-          {
-            m_requestUpdateShaders = true;
-          }
-
-          // FTB options only apply when shading is ON and not using stochastic splat
-          const bool ftbDisabled = (prmRender.lightingMode == LightingMode::eLightingDisabled)
-                                   || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
-          ImGui::BeginDisabled(ftbDisabled);
-          if(PE::entry(
-                 "FTB Sync Mode", [&]() { return m_ui.enumCombobox(GUI_FTB_SYNC_MODE, "##ID", &prmRaster.ftbSyncMode); },
-                 "Synchronization mode for depth buffer storage image access.\n"
-                 "Interlock: Correct ordering via fragment shader interlock (slower).\n"
-                 "Disabled: No synchronization (faster, may have rare artifacts)."))
-          {
-            m_requestUpdateShaders = true;
-          }
-
-          PE::DragFloat("Depth Iso Threshold", &prmRaster.depthIsoThreshold, 0.01f, 0.0f, 1.0f, "%.2f", 0,
-                        "Transmittance threshold for depth picking.\n"
-                        "Depth is captured when transmittance drops below this value.\n"
-                        "Lower values pick depth later (more accumulated opacity).");
-          ImGui::EndDisabled();
-        }
-        ImGui::EndDisabled();
-
-        ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
-
-        if(PE::Checkbox("Fragment shader barycentric", &prmRaster.fragmentBarycentric,
-                        "Enables fragment shader barycentric to reduce vertex and mesh shaders outputs."))
-          m_requestUpdateShaders = true;
-
-        // we set a different size range for point and splat rendering
-        PE::entry(
-            "Splat scale",
+            "Min pixel coverage",
             [&]() {
               ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x);
-              return ImGui::DragFloat("##splatScale", &prmFrame.splatScale, 0.01f, 0.1f,
-                                      prmRaster.pointCloudModeEnabled != 0 ? 10.0f : 2.0f, "%.3f");
+              return ImGui::DragFloat("##sizeCullingMinPixels", &prmFrame.sizeCullingMinPixels, 0.1f, 0.1f, 20.0f, "%.2f");
             },
-            "Adjusts the size of the splats for visualization purposes.");
-
-        if(PE::Checkbox("Disable splatting", &prmRaster.pointCloudModeEnabled,
-                        "Switches to point cloud mode, displaying only the splat centers. \n"
-                        "Other parameters such as Splat Scale still apply in this mode."))
-          m_requestUpdateShaders = true;
-
+            "Minimum projected pixel coverage for a splat to be visible.\n"
+            "Splats with a projected bounding sphere diameter smaller than this value will be culled.");
         ImGui::EndDisabled();
-
-        PE::end();
-
-        ImGui::EndTabItem();
       }
+
+      PE::end();
     }
+    endCollapsibleGroup(open);
+  }
 
-    if(prmSelectedPipeline == PIPELINE_RTX || prmSelectedPipeline == PIPELINE_HYBRID
-       || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT || prmSelectedPipeline == PIPELINE_MESH_3DGUT)
+  // --- Shading ---
+  {
+    bool open = beginCollapsibleGroup("Shading", true);
+    if(open)
     {
-      bool updated = false;
+      PE::begin("## Shading", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
 
-      if(ImGui::BeginTabItem("Ray tracing and 3DGUT specifics"))
+      ImGui::BeginDisabled(!prmRender.lightingEnabled);
       {
-        PE::begin("## Raytrace sampling and bounces");
-
-        ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT);
-        updated |= PE::SliderInt("Max bounces", &prmFrame.rtxMaxBounces, 1, 16);
-        ImGui::EndDisabled();
-
-        ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_HYBRID);
+        if(PE::Checkbox("Quantize Normals", &prmRaster.quantizeNormals,
+                        "Use octahedral encoding for normals (Meyer et al. 2010).\n"
+                        "Reduces mesh-to-fragment bandwidth from 96 bits to 32 bits per normal."))
         {
-          // #DLSS - DLSS UI section
-#if defined(USE_DLSS)
-          ImGui::BeginDisabled(!isDlssSupportedPipeline());
-          {
-            // Check if DLSS state changed
-            if(m_dlss.onUi())
-            {
-              // Descriptors need to be updated to bind DLSS G-buffers
-              m_requestUpdateShaders = true;
-            }
-          }
-          ImGui::EndDisabled();
-#endif
-        }
-        ImGui::EndDisabled();
-
-        PE::end();
-
-        PE::begin("## Raytrace gaussians settings");
-
-        if(PE::entry("Kernel degree",
-                     [&]() { return m_ui.enumCombobox(GUI_KERNEL_DEGREE, "##ID", &prmRtx.kernelDegree); }))
-        {
-          // Kernel degree affects particle shape - rebuild BLAS
-          m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
           m_requestUpdateShaders = true;
-          updated                = true;
         }
 
-        ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT);
-
-        int parametric = prmRtxData.useAABBs ? PARTICLE_FORMAT_PARAMETRIC : PARTICLE_FORMAT_ICOSAHEDRON;
-
+        const bool ftbDisabled = !prmRender.lightingEnabled || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
+        ImGui::BeginDisabled(ftbDisabled);
         if(PE::entry(
-               "Particles format", [&]() { return m_ui.enumCombobox(GUI_PARTICLE_FORMAT, "##ID", &parametric); },
-               "This is a convenience shortcut to switch the Radiance Field use AABB property.\n"
-               "Note that activating parametric will force the use of TLAS instance.\n"))
+               "FTB Sync Mode", [&]() { return m_ui.enumCombobox(GUI_FTB_SYNC_MODE, "##ID", &prmRaster.ftbSyncMode); },
+               "Synchronization mode for depth buffer storage image access.\n"
+               "Interlock: Correct ordering via fragment shader interlock (slower).\n"
+               "Disabled: No synchronization (faster, may have rare artifacts)."))
         {
-          if(parametric == PARTICLE_FORMAT_ICOSAHEDRON)
-          {
-            prmRtxData.useAABBs = false;
-          }
-          if(parametric == PARTICLE_FORMAT_PARAMETRIC)
-          {
-            prmRtxData.useAABBs         = true;
-            prmRtxData.useTlasInstances = true;
-          }
-          // Particle format affects BLAS geometry - rebuild BLAS
+          m_requestUpdateShaders = true;
+        }
+
+        PE::DragFloat("Depth Iso Threshold", &prmRaster.depthIsoThreshold, 0.01f, 0.0f, 1.0f, "%.2f", 0,
+                      "Transmittance threshold for depth picking.\n"
+                      "Depth is captured when transmittance drops below this value.\n"
+                      "Lower values pick depth later (more accumulated opacity).");
+        ImGui::EndDisabled();
+      }
+      ImGui::EndDisabled();
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Advanced ---
+  {
+    bool open = beginCollapsibleGroup("Advanced", true);
+    if(open)
+    {
+      PE::begin("## Advanced", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      if(PE::entry(
+             "Dist WG size",
+             [&]() { return m_ui.enumCombobox(GUI_DIST_SHADER_WG_SIZE, "##ID", &prmRaster.distShaderWorkgroupSize); },
+             "Workgroup size for the distance compute shader.\n"
+             "Affects GPU occupancy and performance.\n"
+             "Best value depends on the GPU architecture."))
+      {
+        m_requestUpdateShaders = true;
+      }
+
+      if(PE::entry(
+             "Mesh WG size",
+             [&]() { return m_ui.enumCombobox(GUI_MESH_SHADER_WG_SIZE, "##ID", &prmRaster.meshShaderWorkgroupSize); },
+             "Workgroup size for the mesh shader.\n"
+             "Affects GPU occupancy and performance.\n"
+             "Best value depends on the GPU architecture."))
+      {
+        m_requestUpdateShaders = true;
+      }
+
+      ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
+      ImGui::BeginDisabled(!isSupported.fragmentShaderBarycentric);
+      if(PE::Checkbox("Fragment shader barycentric", &prmRaster.fragmentBarycentric,
+                      isSupported.fragmentShaderBarycentric ?
+                          "Enables fragment shader barycentric to reduce vertex and mesh shaders outputs." :
+                          "VK_KHR_fragment_shader_barycentric is not supported by this device."))
+        m_requestUpdateShaders = true;
+      ImGui::EndDisabled();
+      ImGui::EndDisabled();
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  ImGui::EndDisabled();
+}
+
+void GaussianSplattingUI::guiDrawRaytracingProperties()
+{
+  bool raytraceDisabled = !isRtxPipelineActive();
+  ImGui::BeginDisabled(raytraceDisabled);
+
+  namespace PE = nvgui::PropertyEditor;
+
+  bool updated = false;
+
+  // --- Path Tracing ---
+  {
+    bool open = beginCollapsibleGroup("Path Tracing", true);
+    if(open)
+    {
+      PE::begin("## Path Tracing", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT);
+      updated |= PE::SliderInt("Max bounces", &prmFrame.rtxMaxBounces, 0, 16, "%d", 0,
+                               "Maximum number of light bounces for path tracing.\n"
+                               "Higher values produce more realistic global illumination but are slower.\n"
+                               "0 = direct lighting only.");
+      updated |= PE::DragFloat("Secondary ray offset", &prmFrame.rtxSecondaryRayOffset, 0.0001f, 0.0f, 1.0f, "%.4f", 0,
+                               "TMin offset for all secondary rays (bounce and mesh shadow).\n"
+                               "Prevents self-intersection artifacts.\n"
+                               "Primary rays use the camera near clip plane distance as TMin.\n"
+                               "Particle shadow rays use the dedicated 'Particle shadow offset' instead.");
+      ImGui::EndDisabled();
+
+      updated |= PE::DragFloat("Firefly clamp", &prmRtx.fireflyClampThreshold, 0.1f, 0.0f, 100.0f, "%.1f", 0,
+                               "Luminance threshold to suppress stochastic bright outliers (fireflies).\n"
+                               "Radiance above this threshold is scaled down proportionally.\n"
+                               "Reduces temporal streaks during fast camera movement, especially with DLSS.\n"
+                               "Set to 0 to disable.");
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Particle Shape ---
+  {
+    bool open = beginCollapsibleGroup("Particle Shape", true);
+    if(open)
+    {
+      PE::begin("## Particle Shape", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      if(PE::entry(
+             "Kernel degree", [&]() { return m_ui.enumCombobox(GUI_KERNEL_DEGREE, "##ID", &prmRtx.kernelDegree); },
+             "Degree of the kernel function used for Gaussian evaluation.\n"
+             "Must match the degree used during model training/generation.\n"
+             "Affects particle shape and rendering quality.\n"
+             "Changing this triggers a BLAS rebuild."))
+      {
+        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+
+      ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT);
+
+      int parametric = prmRtxData.useSpheres ? PARTICLE_FORMAT_SPHERE :
+                       prmRtxData.useAABBs   ? PARTICLE_FORMAT_PARAMETRIC :
+                                               PARTICLE_FORMAT_ICOSAHEDRON;
+
+      if(PE::entry(
+             "Particle format", [&]() { return m_ui.enumCombobox(GUI_PARTICLE_FORMAT, "##ID", &parametric); },
+             "Particle primitive type for RT acceleration structures.\n"
+             "Parametric and Sphere modes force the use of TLAS instances.\n"
+             "Sphere mode requires VK_NV_ray_tracing_linear_swept_spheres \n"
+             "(greyed out when the device does not expose this extension).\n"))
+      {
+        prmRtxData.useAABBs   = false;
+        prmRtxData.useSpheres = false;
+        if(parametric == PARTICLE_FORMAT_PARAMETRIC)
+        {
+          prmRtxData.useAABBs         = true;
+          prmRtxData.useTlasInstances = true;
+          prmRtx.particleDepth        = PARTICLE_DEPTH_BILLBOARD;
+        }
+        else if(parametric == PARTICLE_FORMAT_SPHERE)
+        {
+          prmRtxData.useSpheres       = true;
+          prmRtxData.useTlasInstances = true;
+        }
+        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+
+      if(PE::Checkbox("Adaptive clamp", &prmRtx.kernelAdaptiveClamping,
+                      "Adapt particle bounding volume based on its opacity (density).\n"
+                      "Low-opacity particles get tighter bounds, improving ray tracing performance.\n"
+                      "When disabled, all particles use the same bounding scale regardless of opacity.\n"
+                      "Triggers a BLAS rebuild when toggled."))
+      {
+        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+
+      {
+        const bool billboardAllowed = prmRtxData.useAABBs || prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT;
+        ImGui::BeginDisabled(!billboardAllowed);
+        if(PE::entry(
+               "Particle depth",
+               [&]() { return m_ui.enumCombobox(GUI_PARTICLE_DEPTH, "##ParticleDepth", &prmRtx.particleDepth); },
+               "Method used to compute depth for particle hits:\n"
+               "- Billboard (3DGS/3DGUT): depth is the ray-to-billboard-plane intersection.\n"
+               "  Requires AABB geometry or Stochastic any-hit trace strategy.\n"
+               "- Ellipsoid (3DGRT): depth depends on geometry mode.\n"
+               "  - AABB (custom intersection): depth is the point of maximum density along the ray\n"
+               "  (closest approach to the ellipsoid center in canonical space).\n"
+               "  - Icosahedron/Sphere (hardware intersection): depth is the actual ellipsoid surface hit."))
+        {
           m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
           m_requestUpdateShaders = true;
           updated                = true;
         }
+        ImGui::EndDisabled();
+      }
 
-        if(PE::Checkbox("Adaptive clamp", &prmRtx.kernelAdaptiveClamping))
+      ImGui::BeginDisabled(prmRtx.particleDepth != PARTICLE_DEPTH_BILLBOARD
+                           || (!prmRtxData.useAABBs && prmRtx.rtxTraceStrategy != RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT));
+      {
+        int bbMode = (int)prmRtxData.billboardBoundingMode;
+        if(PE::entry(
+               "Billboard bounding mode",
+               [&]() { return m_ui.enumCombobox(GUI_BILLBOARD_BOUNDING_MODE, "##BillboardBoundingModeRT", &bbMode); },
+               "How TLAS instance bounding boxes are scaled in billboard mode:\n"
+               "- Fitted: per-axis scales (default, fastest traversal; may miss anisotropic billboards).\n"
+               "- Uniform / fractions: clamp each axis toward max scale (trade speed vs. correctness).\n"
+               "- Optimal: per-axis (max + s_i) / 2 — recommended for raster-matching quality."))
         {
-          // Adaptive clamping affects particle shape - rebuild BLAS
+          prmRtxData.billboardBoundingMode = (BillboardBoundingMode)bbMode;
           m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
-          m_requestUpdateShaders = true;
-          updated                = true;
+          updated = true;
         }
+      }
+      if(PE::Checkbox("Billboard frustum culling", &prmRtx.billboardFrustumCulling,
+                      "Cull particles whose center is outside the camera frustum in the any-hit shader.\n"
+                      "Reduces border artifacts from particles that are visible in ray tracing\n"
+                      "but would be culled in rasterization."))
+      {
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+      ImGui::EndDisabled();
 
-        updated |= PE::InputFloat("Alpha clamp", &prmFrame.alphaClamp, 0.0, 3.0, "%.2f", ImGuiInputTextFlags_EnterReturnsTrue,
-                                  "Maximum alpha value per particle hit.\n"
-                                  "Clamps the opacity computed from the kernel response,\n"
-                                  "preventing any single splat from being fully opaque.\n"
-                                  "Default 0.99 (from the original 3DGS paper).\n"
-                                  "Avoid numerical instabilities (see paper appendix).\n"
-                                  "Not really needed in our visualization context.");
+      ImGui::BeginDisabled(prmRtx.particleDepth != PARTICLE_DEPTH_BILLBOARD
+                           || prmRtx.rtxTraceStrategy != RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
+      if(PE::Checkbox("Shorten ray", &prmRtx.shortenRay,
+                      "Use payload max distance to early-terminate ray traversal in stochastic any-hit.\n"
+                      "When enabled, rays are shortened based on the farthest stored hit,\n"
+                      "allowing the hardware to skip particles beyond that distance."))
+      {
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+      ImGui::EndDisabled();
 
-        updated |= PE::InputFloat("Minimum transmittance", &prmFrame.minTransmittance, 0.0, 1.0, "%.2f",
-                                  ImGuiInputTextFlags_EnterReturnsTrue,
-                                  "Transmittance threshold below which particle ray marching stops.");
+      ImGui::EndDisabled();
 
-        guiDrawTracingStrategySelector(false);
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
 
+  // --- Particle Tracing ---
+  {
+    bool open = beginCollapsibleGroup("Particle Tracing", true);
+    if(open)
+    {
+      PE::begin("## Particle Tracing", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      guiDrawTracingStrategySelector(false);
+
+      ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_MESH_3DGUT);
+      {
+        const bool stochasticAnyhit = (prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
+        ImGui::BeginDisabled(stochasticAnyhit);
+        int displaySpp = stochasticAnyhit ? 1 : prmRtx.particleSamplesPerPass;
+        if(PE::entry(
+               "Particle samples per pass",
+               [&]() { return m_ui.enumCombobox(GUI_RAY_HIT_PER_PASS, "##ID", &displaySpp); },
+               "Number of particle ray hits stored per pass (PARTICLES_SPP).\n"
+               "Payload array size is max(this, mesh minimum)."))
         {
-          const bool stochasticAnyhit = (prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
-          ImGui::BeginDisabled(stochasticAnyhit);
-          int displaySpp = stochasticAnyhit ? 1 : prmRtx.particleSamplesPerPass;
-          if(PE::entry(
-                 "Particle samples per pass",
-                 [&]() { return m_ui.enumCombobox(GUI_RAY_HIT_PER_PASS, "##ID", &displaySpp); },
-                 "Number of particle ray hits stored per pass (PARTICLES_SPP).\n"
-                 "Payload array size is max(this, mesh minimum)."))
-          {
-            prmRtx.particleSamplesPerPass = displaySpp;
-            m_requestUpdateShaders        = true;
-            updated                       = true;
-          }
-          ImGui::EndDisabled();
+          prmRtx.particleSamplesPerPass = displaySpp;
+          m_requestUpdateShaders        = true;
+          updated                       = true;
         }
+        ImGui::EndDisabled();
 
-        if(PE::InputInt("Maximum pass count", &prmFrame.maxPasses, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue))
+        if(PE::InputInt("Maximum pass count", &prmFrame.maxPasses, 1, 100, ImGuiInputTextFlags_EnterReturnsTrue,
+                        "Maximum number of ray marching passes per pixel.\n"
+                        "Each pass processes up to 'Particle samples per pass' hits.\n"
+                        "More passes allow rendering denser scenes at the cost of performance."))
         {
           prmFrame.maxPasses = std::clamp(prmFrame.maxPasses, 1, 1000);
           updated            = true;
@@ -2930,43 +4045,144 @@ void GaussianSplattingUI::guiDrawRendererProperties()
         {
           const int effectiveSpp = (prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT) ? 1 : prmRtx.particleSamplesPerPass;
           PE::Text("Maximum anyhit/pixel", std::to_string(effectiveSpp * prmFrame.maxPasses));
+          nvgui::tooltip(
+              "Total maximum any-hit invocations per pixel (samples per pass x pass count).\n"
+              "Read-only computed value.");
         }
-
-        ImGui::EndDisabled();
-
-        updated |= PE::InputFloat("Particle shadow offset", &prmRtx.particleShadowOffset, 0.0, 1.0, "%.2f",
-                                  ImGuiInputTextFlags_EnterReturnsTrue,
-                                  "Shadow ray origin offset for particles.\n"
-                                  "Larger values prevent self-shadowing artifacts due to the volumetric nature of splats.");
-        updated |= PE::DragFloat("Particle shadow threshold", &prmRtx.particleShadowTransmittanceThreshold, 0.01f, 0.0f,
-                                 0.99f, "%.2f", 0,
-                                 "Transmittance threshold for particle shadow termination.\n"
-                                 "Higher values = earlier termination = harder shadows.\n"
-                                 "Lower values = more gradual shadow falloff.");
-        updated |= PE::DragFloat("Colored shadow strength", &prmRtx.particleShadowColorStrength, 0.01f, 0.0f, 5.0f, "%.2f", 0,
-                                 "Per-channel color tinting of particle shadows (stained-glass effect).\n"
-                                 "Below the transmittance threshold, shadows are fully black.\n"
-                                 "Above it, particle color modulates per-channel light transmission.\n"
-                                 "0 = monochrome shadows. Higher values = stronger color bleeding.");
-
-        updated |= PE::DragFloat("Mesh composite threshold", &prmFrame.minMeshCompositeTransmittance, 0.01f, 0.0f, 1.0f, "%.2f", 0,
-                                 "Minimum transmittance required for meshes to be composited with splats.\n"
-                                 "Below this threshold, splats fully occlude meshes behind them.");
-
-        updated |= PE::DragFloat("Depth Iso Threshold", &prmRtx.depthIsoThresholdRTX, 0.01f, 0.0f, 1.0f, "%.2f", 0,
-                                 "Transmittance threshold for depth picking in ray tracing.\n"
-                                 "Depth is captured when transmittance drops below this value.\n"
-                                 "Lower values pick depth later (more accumulated opacity).");
-
-        PE::end();
-
-        ImGui::EndTabItem();
       }
-      if(updated)
-        resetFrameCounter();
+      ImGui::EndDisabled();
+
+      updated |= PE::InputFloat("Minimum transmittance", &prmFrame.minTransmittance, 0.0, 1.0, "%.2f", ImGuiInputTextFlags_EnterReturnsTrue,
+                                "Transmittance threshold below which particle ray marching stops.");
+
+      PE::end();
     }
+    endCollapsibleGroup(open);
   }
-  ImGui::EndTabBar();
+
+  // --- Shading ---
+  {
+    bool open = beginCollapsibleGroup("Shading", true);
+    if(open)
+    {
+      PE::begin("## RT Shading", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      updated |= PE::DragFloat("Depth Iso Threshold", &prmRtx.depthIsoThresholdRTX, 0.01f, 0.0f, 1.0f, "%.2f", 0,
+                               "Transmittance threshold for depth picking in ray tracing.\n"
+                               "Depth is captured when transmittance drops below this value.\n"
+                               "Lower values pick depth later (more accumulated opacity).");
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Shadows ---
+  {
+    bool open = beginCollapsibleGroup("Shadows", true);
+    if(open)
+    {
+      PE::begin("## Shadows", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      updated |= PE::InputFloat("Particle shadow offset", &prmRtx.particleShadowOffset, 0.0, 1.0, "%.2f",
+                                ImGuiInputTextFlags_EnterReturnsTrue,
+                                "Shadow ray origin offset for particles.\n"
+                                "Larger values prevent self-shadowing artifacts due to the volumetric nature of splats.");
+      updated |= PE::DragFloat("Particle shadow threshold", &prmRtx.particleShadowTransmittanceThreshold, 0.01f, 0.0f,
+                               0.99f, "%.2f", 0,
+                               "Transmittance threshold for particle shadow termination.\n"
+                               "Higher values = earlier termination = harder shadows.\n"
+                               "Lower values = more gradual shadow falloff.");
+      updated |= PE::DragFloat("Colored shadow strength", &prmRtx.particleShadowColorStrength, 0.01f, 0.0f, 5.0f, "%.2f", 0,
+                               "Per-channel color tinting of particle shadows (stained-glass effect).\n"
+                               "Below the transmittance threshold, shadows are fully black.\n"
+                               "Above it, particle color modulates per-channel light transmission.\n"
+                               "0 = monochrome shadows. Higher values = stronger color bleeding.");
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Ambient Occlusion ---
+  {
+    bool open = beginCollapsibleGroup("Ambient Occlusion", true);
+    if(open)
+    {
+      PE::begin("## Ambient Occlusion", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      if(PE::Checkbox("Particle emissive AO", &prmRtx.particleEmissiveAoEnabled,
+                      "Enable ambient occlusion for emissive splat sets.\n"
+                      "Attenuates emissive radiance when nearby meshes occlude the hemisphere.\n"
+                      "Traces against meshes only (not other splat sets)."))
+      {
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+      ImGui::BeginDisabled(!prmRtx.particleEmissiveAoEnabled);
+      updated |= PE::DragFloat("Particle emissive AO radius", &prmRtx.particleEmissiveAoRadius, 0.01f, 0.001f, FLT_MAX, "%.3f", 0,
+                               "Hemisphere sampling radius for emissive AO.\n"
+                               "Controls how far AO rays are traced to find occluding meshes.");
+      updated |= PE::DragFloat("Particle emissive AO strength", &prmRtx.particleEmissiveAoStrength, 0.01f, 0.0f, 5.0f, "%.2f", 0,
+                               "Intensity of AO darkening for emissive splat sets.\n"
+                               "0 = no darkening. 1 = full occlusion. >1 = exaggerated darkening.");
+      ImGui::EndDisabled();
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Compositing ---
+  {
+    bool open = beginCollapsibleGroup("Compositing", true);
+    if(open)
+    {
+      PE::begin("## Compositing", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      updated |= PE::DragFloat("Splat set composite threshold", &prmFrame.minSplatSetCompositeTransmittance, 0.01f,
+                               0.0f, 1.0f, "%.2f", 0,
+                               "Minimum transmittance required for meshes and environment to be composited behind splats.\n"
+                               "Below this threshold, splats fully occlude everything behind them.");
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  // --- Advanced ---
+  {
+    bool open = beginCollapsibleGroup("Advanced", true);
+    if(open)
+    {
+      PE::begin("## RT Advanced", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      updated |= PE::InputFloat("Alpha clamp", &prmFrame.alphaClamp, 0.0, 3.0, "%.2f", ImGuiInputTextFlags_EnterReturnsTrue,
+                                "Maximum alpha value per particle hit.\n"
+                                "Clamps the opacity computed from the kernel response,\n"
+                                "preventing any single splat from being fully opaque.\n"
+                                "Default 0.99 (from the original 3DGS paper).\n"
+                                "Avoid numerical instabilities (see paper appendix).\n"
+                                "Not really needed in our visualization context.");
+
+      if(PE::Checkbox("Quantize mesh payload", &prmRtx.quantizeMeshPayload,
+                      "Pack mesh hit data using octahedral normal encoding and fp16 UVs/tangent.\n"
+                      "Reduces payload from 15 to 9 float slots, lowering register pressure\n"
+                      "and local memory spilling in the any-hit shader."))
+      {
+        m_requestUpdateShaders = true;
+        updated                = true;
+      }
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  if(updated)
+    resetFrameCounter();
+
+  ImGui::EndDisabled();
 }
 
 void GaussianSplattingUI::guiDrawCommonSplatSetProperties()
@@ -2975,77 +4191,99 @@ void GaussianSplattingUI::guiDrawCommonSplatSetProperties()
 
   ImGui::Text("Changes impact all the splat sets.");
 
-  if(ImGui::CollapsingHeader("Splat Set Format in VRAM", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    if(PE::begin("##VRAM format"))
+    bool open = beginCollapsibleGroup("Splat Set Format in VRAM", true);
+    if(open)
     {
-      if(PE::entry(
-             "Default settings", [&] { return ImGui::Button("Reset"); }, "resets to default settings"))
+      if(PE::begin("##VRAM format", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
       {
-        resetDataParameters();
-        m_assets.splatSets.markAllSplatSetsForRegeneration();
-        m_requestUpdateShaders = true;
+        if(PE::entry("Default settings", [&] { return ImGui::Button("Reset"); }, "resets to default settings"))
+        {
+          resetDataParameters();
+          m_assets.splatSets.markAllSplatSetsForRegeneration();
+          m_requestUpdateShaders = true;
+        }
+        if(PE::entry(
+               "SH format", [&]() { return m_ui.enumCombobox(GUI_SH_FORMAT, "##ID", &prmData.shFormat); },
+               "Selects storage format for SH coefficient, balancing precision and memory usage"))
+        {
+          m_assets.splatSets.markAllSplatSetsForRegeneration();
+          m_requestUpdateShaders = true;
+        }
+        if(PE::entry(
+               "RGBA format", [&]() { return m_ui.enumCombobox(GUI_RGBA_FORMAT, "##RGBAID", &prmData.rgbaFormat); },
+               "Selects storage format for RGBA color+alpha data, balancing precision and memory usage.\n"
+               "Float 32: highest precision (16 bytes/splat)\n"
+               "Float 16: good balance (8 bytes/splat)\n"
+               "Uint8: lowest memory (4 bytes/splat)"))
+        {
+          m_assets.splatSets.markAllSplatSetsForRegeneration();
+          m_requestUpdateShaders = true;
+        }
+        PE::end();
       }
-      if(PE::entry(
-             "SH format", [&]() { return m_ui.enumCombobox(GUI_SH_FORMAT, "##ID", &prmData.shFormat); },
-             "Selects storage format for SH coefficient, balancing precision and memory usage"))
-      {
-        m_assets.splatSets.markAllSplatSetsForRegeneration();
-        m_requestUpdateShaders = true;
-      }
-      if(PE::entry(
-             "RGBA format", [&]() { return m_ui.enumCombobox(GUI_RGBA_FORMAT, "##RGBAID", &prmData.rgbaFormat); },
-             "Selects storage format for RGBA color+alpha data, balancing precision and memory usage.\n"
-             "Float 32: highest precision (16 bytes/splat)\n"
-             "Float 16: good balance (8 bytes/splat)\n"
-             "Uint8: lowest memory (4 bytes/splat)"))
-      {
-        m_assets.splatSets.markAllSplatSetsForRegeneration();
-        m_requestUpdateShaders = true;
-      }
-      PE::end();
     }
+    endCollapsibleGroup(open);
   }
 
-  if(ImGui::CollapsingHeader("RTX acceleration structures", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    if(PE::begin("##VRAM format RTX"))
+    bool open = beginCollapsibleGroup("RTX Acceleration Structures", true);
+    if(open)
     {
-      if(PE::entry(
-             "Default settings", [&] { return ImGui::Button("Reset"); }, "resets to default settings"))
+      if(PE::begin("##VRAM format RTX", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
       {
-        resetRtxDataParameters();
-        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+        if(PE::entry("Default settings", [&] { return ImGui::Button("Reset"); }, "resets to default settings"))
+        {
+          resetRtxDataParameters();
+          m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+        }
+        if(PE::Checkbox("Use AABBs", &prmRtxData.useAABBs,
+                        "If on, uses AABBs for splats in BLAS instead of ICOSAHEDRON meshes."
+                        "In this case the renderer will use the collision shader instead of "
+                        "the ray/triangle intersection specialized hardware."))
+        {
+          if(prmRtxData.useAABBs)
+            prmRtxData.useSpheres = false;
+          m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+          m_requestUpdateShaders = true;
+        }
+
+        // We do not allow useAABBs/useSpheres without instances (prevent bvh with very bad properties)
+        if(prmRtxData.useAABBs || prmRtxData.useSpheres)
+          prmRtxData.useTlasInstances = true;
+
+        ImGui::BeginDisabled(prmRtxData.useAABBs || prmRtxData.useSpheres);
+        if(PE::Checkbox("Use TLAS instances", &prmRtxData.useTlasInstances,
+                        "If on, uses one TLAS entry per splat and a small BLAS "
+                        "with a unit Icosahedron. \nOtherwise use a single TLAS "
+                        "entry and a huge BLAS containing all the transformed Icosahedrons."))
+        {
+          m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+          m_requestUpdateShaders = true;  // CRITICAL: Shader recompile needed for RTX_USE_INSTANCES macro
+        }
+        ImGui::EndDisabled();
+
+        if(PE::Checkbox("BLAS Compaction", &prmRtxData.compressBlas, "Bottom Level Acceleration structure compression."))
+          m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+
+        {
+          int bbMode = (int)prmRtxData.billboardBoundingMode;
+          if(PE::entry(
+                 "Billboard bounding mode",
+                 [&]() { return m_ui.enumCombobox(GUI_BILLBOARD_BOUNDING_MODE, "##BillboardBoundingMode", &bbMode); },
+                 "How TLAS instance bounding boxes are scaled in billboard mode:\n"
+                 "- Fitted: uses per-axis particle scales (faster traversal, tighter bounds).\n"
+                 "- Uniform: uses max(sx,sy,sz) homogeneous scale (correct billboard rendering)."))
+          {
+            prmRtxData.billboardBoundingMode = (BillboardBoundingMode)bbMode;
+            m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
+          }
+        }
+
+        PE::end();
       }
-      if(PE::Checkbox("Use AABBs", &prmRtxData.useAABBs,
-                      "If on, uses AABBs for splats in BLAS instead of ICOSAHEDRON meshes."
-                      "In this case the renderer will use the collision shader instead of "
-                      "the ray/triangle intersection specialized hardware."))
-      {
-        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
-        m_requestUpdateShaders = true;  // CRITICAL: Shader recompile needed for RTX_USE_AABBS macro
-      }
-
-      // We do not allow useAABBs without instances (prevent bvh with very bad properties leading to very low frame rate and device lost error)
-      if(prmRtxData.useAABBs)
-        prmRtxData.useTlasInstances = true;
-
-      ImGui::BeginDisabled(prmRtxData.useAABBs);
-      if(PE::Checkbox("Use TLAS instances", &prmRtxData.useTlasInstances,
-                      "If on, uses one TLAS entry per splat and a small BLAS "
-                      "with a unit Icosahedron. \nOtherwise use a single TLAS "
-                      "entry and a huge BLAS containing all the transformed Icosahedrons."))
-      {
-        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
-        m_requestUpdateShaders = true;  // CRITICAL: Shader recompile needed for RTX_USE_INSTANCES macro
-      }
-      ImGui::EndDisabled();
-
-      if(PE::Checkbox("BLAS Compaction", &prmRtxData.compressBlas, "Bottom Level Acceleration structure compression."))
-        m_assets.splatSets.pendingRequests |= SplatSetManagerVk::Request::eRebuildBLAS;
-
-      PE::end();
     }
+    endCollapsibleGroup(open);
   }
 }
 
@@ -3065,92 +4303,102 @@ void GaussianSplattingUI::guiDrawSplatSetProperties()
   std::string infoHeader =
       "Splat Set Info (" + std::to_string(instanceCount) + " instance" + (instanceCount != 1 ? "s" : "") + ")";
 
-  if(ImGui::CollapsingHeader(infoHeader.c_str()))
   {
-    PE::begin("##SplatSetInfo");
-
-    // Total number of splats
-    PE::Text("Total Splats", std::to_string(splatSet->splatCount));
-
-    // SH degree
-    PE::Text("SH Degree", std::to_string(splatSet->shDegree));
-
-    // Full path (read-only, selectable for copying)
-    if(PE::entry(
-           "Path",
-           [&]() {
-             ImGui::InputText("##Path", const_cast<char*>(splatSet->path.c_str()), splatSet->path.length() + 1,
-                              ImGuiInputTextFlags_ReadOnly);
-             return false;
-           },
-           "Full path to the source .ply file"))
+    bool open = beginCollapsibleGroup(infoHeader.c_str());
+    if(open)
     {
-      // Read-only, no action needed
-    }
+      PE::begin("##SplatSetInfo", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
 
-    PE::end();
-  }
+      PE::Text("Total Splats", std::to_string(splatSet->splatCount));
+      PE::Text("SH Degree", std::to_string(splatSet->shDegree));
 
-  if(ImGui::CollapsingHeader("Model Transform", ImGuiTreeNodeFlags_DefaultOpen))
-  {
-    PE::begin("##Transform");
-    if(guiGetTransform(instance->scale, instance->rotation, instance->translation, instance->transform, instance->transformInverse, false))
-    {
-      // guiGetTransform already updated transform matrices in RAM
-      // Signal update needed (deferred to processVramUpdates)
-      if(m_selectedSplatInstance)
-        m_assets.splatSets.updateInstanceTransform(m_selectedSplatInstance);
-
-      // Defer RTX Acceleration Structure rebuild if currently in raster mode
-      // This avoids expensive RTX updates when not actively using ray tracing
-      if(!isRtxPipelineActive())
-      {
-        m_deferredRtxRebuildPending = true;
-      }
-    }
-    PE::end();
-  }
-
-  // Material properties for splat set
-  if(ImGui::CollapsingHeader("Material", ImGuiTreeNodeFlags_DefaultOpen))
-  {
-    PE::begin("##SplatMaterial");
-
-    bool materialChanged = false;
-
-    materialChanged |= PE::ColorEdit3("ambient", glm::value_ptr(instance->splatMaterial.ambient));
-    materialChanged |= PE::ColorEdit3("diffuse", glm::value_ptr(instance->splatMaterial.diffuse));
-    materialChanged |= PE::ColorEdit3("specular", glm::value_ptr(instance->splatMaterial.specular));
-    materialChanged |= PE::ColorEdit3("emission", glm::value_ptr(instance->splatMaterial.emission));
-    materialChanged |= PE::SliderFloat("shininess", &instance->splatMaterial.shininess, 0.0f, 2000.0f);
-
-    if(materialChanged)
-    {
-      // Material already modified in RAM by ImGui widgets
-      // Signal update needed (deferred to processVramUpdates)
-      if(m_selectedSplatInstance)
-        m_assets.splatSets.updateInstanceMaterial(m_selectedSplatInstance);
-    }
-
-    PE::end();
-  }
-
-  if(ImGui::CollapsingHeader("Splat Set Storage in VRAM", ImGuiTreeNodeFlags_DefaultOpen))
-  {
-    ImGui::Text("Changes impact all instances of this splat set.");
-
-    if(PE::begin("##VRAM format"))
-    {
       if(PE::entry(
-             "Storage", [&] { return m_ui.enumCombobox(GUI_STORAGE, "##ID", &splatSet->dataStorage); },
-             "Selects between Data Buffers and Textures for storing model attributes, including:\n"
-             "Position, Color and Opacity, Covariance Matrix\n"
-             "and Spherical Harmonics (SH) Coefficients (for degrees higher than 0)"))
+             "Path",
+             [&]() {
+               ImGui::InputText("##Path", const_cast<char*>(splatSet->path.c_str()), splatSet->path.length() + 1,
+                                ImGuiInputTextFlags_ReadOnly);
+               return false;
+             },
+             "Full path to the source .ply file"))
       {
-        m_assets.splatSets.markSplatSetsForRegeneration(splatSet);
+      }
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Model Transform", true);
+    if(open)
+    {
+      PE::begin("##Transform", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+      if(guiGetTransform(instance->scale, instance->rotation, instance->translation, instance->transform,
+                         instance->transformInverse, false))
+      {
+        if(m_selectedSplatInstance)
+          m_assets.splatSets.updateInstanceTransform(m_selectedSplatInstance);
+
+        if(!isRtxPipelineActive())
+        {
+          m_deferredRtxRebuildPending = true;
+        }
       }
       PE::end();
     }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Material", true);
+    if(open)
+    {
+      PE::begin("##SplatMaterial", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
+
+      bool materialChanged = false;
+
+      materialChanged |= PE::SliderInt("Max Bounces", &instance->splatMaterial.maxBounces, 0, 16);
+      materialChanged |= PE::ColorEdit3("Base Color", glm::value_ptr(instance->splatMaterial.baseColor));
+      materialChanged |= PE::SliderFloat("Metallic", &instance->splatMaterial.metallic, 0.0f, 1.0f);
+      materialChanged |= PE::SliderFloat("Roughness", &instance->splatMaterial.roughness, 0.0f, 1.0f);
+      materialChanged |= PE::ColorEdit3("Emissive", glm::value_ptr(instance->splatMaterial.emissive));
+      materialChanged |=
+          PE::DragFloat("Emissive Strength", &instance->splatMaterial.emissiveStrength, 0.1f, 0.0f, FLT_MAX, "%.1f");
+      materialChanged |= PE::SliderFloat("IOR", &instance->splatMaterial.ior, 1.0f, 3.0f);
+      materialChanged |= PE::SliderFloat("Transmission", &instance->splatMaterial.transmission, 0.0f, 1.0f);
+      materialChanged |= PE::SliderFloat("Opacity", &instance->splatMaterial.opacity, 0.0f, 1.0f);
+
+      if(materialChanged)
+      {
+        if(m_selectedSplatInstance)
+          m_assets.splatSets.updateInstanceMaterial(m_selectedSplatInstance);
+      }
+
+      PE::end();
+    }
+    endCollapsibleGroup(open);
+  }
+
+  {
+    bool open = beginCollapsibleGroup("Splat Set Storage in VRAM", true);
+    if(open)
+    {
+      ImGui::Text("Changes impact all instances of this splat set.");
+
+      if(PE::begin("##VRAM format", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
+        if(PE::entry(
+               "Storage", [&] { return m_ui.enumCombobox(GUI_STORAGE, "##ID", &splatSet->dataStorage); },
+               "Selects between Data Buffers and Textures for storing model attributes, including:\n"
+               "Position, Color and Opacity, Covariance Matrix\n"
+               "and Spherical Harmonics (SH) Coefficients (for degrees higher than 0)"))
+        {
+          m_assets.splatSets.markSplatSetsForRegeneration(splatSet);
+        }
+        PE::end();
+      }
+    }
+    endCollapsibleGroup(open);
   }
 }
 
@@ -3161,7 +4409,7 @@ void GaussianSplattingUI::guiDrawMeshTransformProperties()
   if(!m_selectedMeshInstance)
     return;  // No selection
 
-  PE::begin("##Transform");
+  PE::begin("##Transform", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
   if(guiGetTransform(m_selectedMeshInstance->scale, m_selectedMeshInstance->rotation,
                      m_selectedMeshInstance->translation, m_selectedMeshInstance->transform,
                      m_selectedMeshInstance->transformInverse, m_selectedMeshInstance->transformRotScaleInverse, false))
@@ -3185,20 +4433,23 @@ void GaussianSplattingUI::guiDrawMeshMaterialProperties()
 
   for(auto i = 0; i < materials.size(); ++i)
   {
-    PE::begin("##Material");
+    PE::begin("##Material", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
     auto& material = materials[i];
     ImGui::PushID(i);
     PE::Text("Name", m_selectedMeshInstance->mesh->matNames[i]);
-    needMaterialUpdate |= PE::entry(
-        "Model", [&]() { return m_ui.enumCombobox(GUI_ILLUM_MODEL, "##ID", &material.illum); }, "TODO");
-    needMaterialUpdate |= PE::ColorEdit3("ambient", glm::value_ptr(material.ambient));
-    needMaterialUpdate |= PE::ColorEdit3("diffuse", glm::value_ptr(material.diffuse));
-    needMaterialUpdate |= PE::ColorEdit3("specular", glm::value_ptr(material.specular));
-    needMaterialUpdate |= PE::ColorEdit3("transmittance", glm::value_ptr(material.transmittance));
-    needMaterialUpdate |= PE::ColorEdit3("emission", glm::value_ptr(material.emission));
-    needMaterialUpdate |= PE::SliderFloat("shininess", &material.shininess, 0.0f, 2000.0f);
-    needMaterialUpdate |= PE::SliderFloat("ior", &material.ior, 1.0f, 3.0f);
-    //needMaterialUpdate |= PE::DragFloat("dissolve", &material.dissolve);
+    needMaterialUpdate |= PE::SliderInt("Max Bounces", &material.maxBounces, 0, 16);
+    needMaterialUpdate |= PE::ColorEdit3("Base Color", glm::value_ptr(material.baseColor));
+    needMaterialUpdate |= PE::SliderFloat("Metallic", &material.metallic, 0.0f, 1.0f);
+    needMaterialUpdate |= PE::SliderFloat("Roughness", &material.roughness, 0.0f, 1.0f);
+    needMaterialUpdate |= PE::ColorEdit3("Emissive", glm::value_ptr(material.emissive));
+    needMaterialUpdate |= PE::DragFloat("Emissive Strength", &material.emissiveStrength, 0.1f, 0.0f, FLT_MAX, "%.1f");
+    needMaterialUpdate |= PE::SliderFloat("IOR", &material.ior, 1.0f, 3.0f);
+    needMaterialUpdate |= PE::SliderFloat("Transmission", &material.transmission, 0.0f, 1.0f);
+    needMaterialUpdate |= PE::SliderFloat("Opacity", &material.opacity, 0.0f, 1.0f);
+    needMaterialUpdate |= PE::SliderFloat("Specular Factor", &material.specularFactor, 0.0f, 1.0f);
+    needMaterialUpdate |= PE::ColorEdit3("Specular Color", glm::value_ptr(material.specularColorFactor));
+    needMaterialUpdate |= PE::SliderFloat("Clearcoat Factor", &material.clearcoatFactor, 0.0f, 1.0f);
+    needMaterialUpdate |= PE::SliderFloat("Clearcoat Roughness", &material.clearcoatRoughness, 0.0f, 1.0f);
     ImGui::PopID();
     PE::end();
   }
@@ -3225,96 +4476,104 @@ void GaussianSplattingUI::guiDrawCameraProperties()
 
   bool changed = false;
 
-  if(ImGui::CollapsingHeader("Camera Intrinsics", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    ImGui::BeginDisabled(m_selectedCameraPresetIndex != -1 || cameraManip->isAnimated());
-    if(PE::begin())
+    bool open = beginCollapsibleGroup("Camera Intrinsics", true);
+    if(open)
     {
-      if(PE::entry(
-             "Camera type", [&] { return m_ui.enumCombobox(GUI_CAMERA_TYPE, "##ID", &camera.model); },
-             "Fisheye type may not be supported by all the Pipelines.\n"
-             "The Camera type is not stored per camera for the time beeing."))
+      ImGui::BeginDisabled(m_selectedCameraPresetIndex != -1 || cameraManip->isAnimated());
+      if(PE::begin("##CameraIntrinsics", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
       {
-        m_requestUpdateShaders = true;
-        changed                = true;
-      }
-
-      PE::InputFloat2("Clip planes", glm::value_ptr(camera.clip));
-      changed |= ImGui::IsItemDeactivatedAfterEdit();
-
-      if(PE::SliderFloat("FOV", &camera.fov, 1.F, 179.F, "%.1f deg", ImGuiSliderFlags_Logarithmic, "Field of view in degrees"))
-      {
-        changed = true;
-      }
-
-      ImGui::BeginDisabled(prmSelectedPipeline != PIPELINE_RTX && prmSelectedPipeline != PIPELINE_HYBRID_3DGUT
-                           && prmSelectedPipeline != PIPELINE_MESH_3DGUT);
-
-      const bool autoFocusSupported = supportsAutoFocus();
-      if(!autoFocusSupported && camera.dofMode == DOF_AUTO_FOCUS)
-      {
-        camera.dofMode = DOF_FIXED_FOCUS;
-        changed        = true;
-      }
-
-      {
-        const int  prevDofMode = camera.dofMode;
-        const auto dofModeMenu = autoFocusSupported ? GUI_DOF_MODE : GUI_DOF_MODE_NO_AUTO;
         if(PE::entry(
-               "Depth of Field", [&]() { return m_ui.enumCombobox(dofModeMenu, "##DofMode", &camera.dofMode); },
-               "Depth of Field mode. Only works with 3DGRT, 3DGUT and hybrid 3DGUT/3DGRT.\n"
-               "- Fixed focus: manual focus distance\n"
-               "- Auto focus: uses surface distance at cursor position (requires 3DGRT)\n"
-               "Triggers \"Temporal sampling\" if set to automatic."))
+               "Camera type", [&] { return m_ui.enumCombobox(GUI_CAMERA_TYPE, "##ID", &camera.model); },
+               "Fisheye type may not be supported by all the Pipelines.\n"
+               "The Camera type is not stored per camera for the time beeing."))
         {
-          // Only rebuild shaders when crossing the disabled/enabled boundary
-          // (switching between Fixed Focus and Auto Focus doesn't change shader code)
-          if((prevDofMode == DOF_DISABLED) != (camera.dofMode == DOF_DISABLED))
+          m_requestUpdateShaders = true;
+          changed                = true;
+        }
+
+        PE::InputFloat2("Clip planes", glm::value_ptr(camera.clip));
+        changed |= ImGui::IsItemDeactivatedAfterEdit();
+
+        if(PE::SliderFloat("FOV", &camera.fov, 1.F, 179.F, "%.1f deg", ImGuiSliderFlags_Logarithmic, "Field of view in degrees"))
+        {
+          changed = true;
+        }
+
+        ImGui::BeginDisabled(prmSelectedPipeline != PIPELINE_RTX && prmSelectedPipeline != PIPELINE_HYBRID_3DGUT
+                             && prmSelectedPipeline != PIPELINE_MESH_3DGUT);
+
+        const bool autoFocusSupported = supportsAutoFocus();
+        if(!autoFocusSupported && camera.dofMode == DOF_AUTO_FOCUS)
+        {
+          camera.dofMode = DOF_FIXED_FOCUS;
+          changed        = true;
+        }
+
+        {
+          const int  prevDofMode = camera.dofMode;
+          const auto dofModeMenu = autoFocusSupported ? GUI_DOF_MODE : GUI_DOF_MODE_NO_AUTO;
+          if(PE::entry(
+                 "Depth of Field", [&]() { return m_ui.enumCombobox(dofModeMenu, "##DofMode", &camera.dofMode); },
+                 "Depth of Field mode. Only works with 3DGRT, 3DGUT and hybrid 3DGUT/3DGRT.\n"
+                 "- Fixed focus: manual focus distance\n"
+                 "- Auto focus: uses surface distance at cursor position (requires 3DGRT)\n"
+                 "Triggers \"Temporal sampling\" if set to automatic."))
           {
-            m_requestUpdateShaders = true;
+            // Only rebuild shaders when crossing the disabled/enabled boundary
+            // (switching between Fixed Focus and Auto Focus doesn't change shader code)
+            if((prevDofMode == DOF_DISABLED) != (camera.dofMode == DOF_DISABLED))
+            {
+              m_requestUpdateShaders = true;
+            }
+            resetFrameCounter();
+            changed = true;
           }
+        }
+        ImGui::BeginDisabled(camera.dofMode == DOF_DISABLED);
+        ImGui::BeginDisabled(camera.dofMode == DOF_AUTO_FOCUS);
+        if(PE::DragFloat("Focus distance", &camera.focusDist, 0.1F, 0.1F, 15.0F, "%.3f"))
+        {
           resetFrameCounter();
           changed = true;
         }
-      }
-      ImGui::BeginDisabled(camera.dofMode == DOF_DISABLED);
-      ImGui::BeginDisabled(camera.dofMode == DOF_AUTO_FOCUS);
-      if(PE::DragFloat("Focus distance", &camera.focusDist, 0.1F, 0.1F, 15.0F, "%.3f"))
-      {
-        resetFrameCounter();
-        changed = true;
-      }
-      ImGui::EndDisabled();  // Auto focus (focus distance read-only)
-      if(PE::SliderFloat("Aperture", &camera.aperture, 0.0F, 0.01F, "%.6f"))
-      {
-        resetFrameCounter();
-        changed = true;
-      }
-      ImGui::EndDisabled();  // DoF disabled
+        ImGui::EndDisabled();  // Auto focus (focus distance read-only)
+        if(PE::SliderFloat("Aperture", &camera.aperture, 0.0F, 0.01F, "%.6f"))
+        {
+          resetFrameCounter();
+          changed = true;
+        }
+        ImGui::EndDisabled();  // DoF disabled
 
-      ImGui::EndDisabled();  // Modifiable
+        ImGui::EndDisabled();  // Modifiable
 
-      PE::end();
+        PE::end();
+      }
+
+      ImGui::EndDisabled();
     }
-
-    ImGui::EndDisabled();
+    endCollapsibleGroup(open);
   }
-  if(ImGui::CollapsingHeader("Camera Extrinsics", ImGuiTreeNodeFlags_DefaultOpen))
   {
-    ImGui::BeginDisabled(m_selectedCameraPresetIndex != -1 || cameraManip->isAnimated());
-    if(PE::begin())
+    bool open = beginCollapsibleGroup("Camera Extrinsics", true);
+    if(open)
     {
+      ImGui::BeginDisabled(m_selectedCameraPresetIndex != -1 || cameraManip->isAnimated());
+      if(PE::begin("##CameraExtrinsics", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+      {
 
-      PE::InputFloat3("Eye", &camera.eye.x, "%.5f", 0, "Position of the Camera");
-      changed |= ImGui::IsItemDeactivatedAfterEdit();
-      PE::InputFloat3("Center", &camera.ctr.x, "%.5f", 0, "Center of camera interest");
-      changed |= ImGui::IsItemDeactivatedAfterEdit();
-      PE::InputFloat3("Up", &camera.up.x, "%.5f", 0, "Up vector interest");
-      changed |= ImGui::IsItemDeactivatedAfterEdit();
+        PE::InputFloat3("Eye", &camera.eye.x, "%.5f", 0, "Position of the Camera");
+        changed |= ImGui::IsItemDeactivatedAfterEdit();
+        PE::InputFloat3("Center", &camera.ctr.x, "%.5f", 0, "Center of camera interest");
+        changed |= ImGui::IsItemDeactivatedAfterEdit();
+        PE::InputFloat3("Up", &camera.up.x, "%.5f", 0, "Up vector interest");
+        changed |= ImGui::IsItemDeactivatedAfterEdit();
 
-      PE::end();
+        PE::end();
+      }
+      ImGui::EndDisabled();
     }
-    ImGui::EndDisabled();
+    endCollapsibleGroup(open);
   }
 
   // if changed it is necessarly the active camera
@@ -3352,11 +4611,11 @@ void GaussianSplattingUI::guiDrawNavigationProperties()
   ImGui::BeginDisabled(cameraManip->isAnimated());
 
   // Navigation Mode
-  if(PE::begin())
+  if(PE::begin("##Navigation", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
   {
     auto mode     = cameraManip->getMode();
-    auto speed    = cameraManip->getSpeed();
-    auto duration = static_cast<float>(cameraManip->getAnimationDuration());
+    float speed    = static_cast<float>(cameraManip->getSpeed());
+    float duration = static_cast<float>(cameraManip->getAnimationDuration());
 
     changed |= PE::entry(
         "Navigation and Animation",
@@ -3384,6 +4643,27 @@ void GaussianSplattingUI::guiDrawNavigationProperties()
   }
 
   ImGui::EndDisabled();
+
+  if(PE::begin("## Playback", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+  {
+    bool wasPlaying = m_playPresets;
+    PE::Checkbox("Play", &m_playPresets, "Cycle through camera presets");
+    if(m_playPresets && !wasPlaying && m_assets.cameras.size() >= 2)
+    {
+      m_lastLoadedCamera                    = 0;
+      m_requestUpdateShadersAfterCameraAnim = cameraPresetNeedsShaderRebuild(0);
+      m_assets.cameras.loadPreset(0, false);
+      m_selectedCameraPresetIndex = -1;
+    }
+    else if(!m_playPresets && wasPlaying && cameraManip->isAnimated())
+    {
+      // Stop mid-flight: snap to the current interpolated position (instantSet=true
+      // cancels the animation and keeps the camera where it is right now)
+      cameraManip->setCamera(cameraManip->getCamera(), true);
+    }
+    PE::Checkbox("Auto-play", &m_autoPlayPresets, "Automatically start playback when project is loaded");
+    PE::end();
+  }
 }
 
 void GaussianSplattingUI::guiDrawLightProperties()
@@ -3405,7 +4685,7 @@ void GaussianSplattingUI::guiDrawLightProperties()
 
   shaderio::LightType previousType = asset->type;
 
-  PE::begin("##Light");
+  PE::begin("##Light", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
 
   // Asset properties (shared across all instances)
   if(PE::entry(
@@ -3430,6 +4710,15 @@ void GaussianSplattingUI::guiDrawLightProperties()
       }
     }
     needAssetUpdate = true;
+  }
+
+  {
+    bool enabled = (asset->enabled != 0);
+    if(PE::Checkbox("Enabled", &enabled))
+    {
+      asset->enabled  = enabled ? 1 : 0;
+      needAssetUpdate = true;
+    }
   }
 
   // Instance properties (per-instance)
@@ -3497,8 +4786,8 @@ void GaussianSplattingUI::guiDrawLightProperties()
     asset->outerConeAngle = std::clamp(asset->outerConeAngle, asset->innerConeAngle, 90.0f);  // Must be >= inner
   }
 
-  needAssetUpdate |= PE::DragFloat("Proxy Scale", &asset->proxyScale, 0.01f, 0.01f, 100.0f, "%.2f", 0,
-                                   "Visual scale of the light proxy in the viewport");
+  needAssetUpdate |= PE::DragFloat("Radius", &asset->radius, 0.01f, 0.01f, 100.0f, "%.2f", 0,
+                                   "Light source radius (soft shadows + proxy visualization)");
   PE::end();
 
   // Update appropriately based on what changed
@@ -3578,9 +4867,9 @@ void GaussianSplattingUI::guiDrawRendererStatisticsWindow()
     {
       const uint32_t splatSetCount   = static_cast<uint32_t>(m_assets.splatSets.getSplatSetCount());
       const uint32_t splatInstCount  = static_cast<uint32_t>(m_assets.splatSets.getInstanceCount());
-      const int32_t  totalSplatCount = m_assets.splatSets.getTotalGlobalSplatCount();
+      const uint32_t totalSplatCount = m_assets.splatSets.getTotalGlobalSplatCount();
 
-      if(PE::begin("## Scene"))
+      if(PE::begin("## Scene", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
       {
         PE::Text("Splat sets", fmt::format("{} ({} instances)", splatSetCount, splatInstCount));
         PE::Text("Total particles", fmt::format("{} ({})", formatSize(totalSplatCount), totalSplatCount));
@@ -3590,22 +4879,35 @@ void GaussianSplattingUI::guiDrawRendererStatisticsWindow()
 
     // ===== Rasterization =====
     {
-      const int32_t totalSplatCount = m_assets.splatSets.getTotalGlobalSplatCount();
+      const uint32_t totalSplatCount = m_assets.splatSets.getTotalGlobalSplatCount();
       // GPU radix sort and stochastic splat both use the distance shader which populates the indirect buffer
       const bool usesDistShader =
           (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX) || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
-      const int32_t  rasterSplatCount = usesDistShader ? m_indirectReadback.instanceCount : totalSplatCount;
-      const uint32_t wgCount =
-          (prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_MESH_3DGUT) ?
-              (usesDistShader ? m_indirectReadback.groupCountX :
-                                (prmFrame.splatCount + prmRaster.meshShaderWorkgroupSize - 1) / prmRaster.meshShaderWorkgroupSize) :
-              0;
+      const uint32_t rasterSplatCount = usesDistShader ? m_indirectReadback.instanceCount : totalSplatCount;
+      // The mesh shader is dispatched as a 2D grid (groupCountX is capped at the device
+      // maxMeshWorkGroupCount[0]), so report the true total workgroup count derived from the
+      // rasterized splat count rather than the X extent alone.
+      const bool isMeshPipeline = (prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_MESH_3DGUT);
+      const uint32_t meshRasterSplatCount = usesDistShader ? m_indirectReadback.instanceCount : prmFrame.splatCount;
+      const uint32_t wgCount              = isMeshPipeline ? getMeshTaskWorkgroupCount(meshRasterSplatCount) : 0;
+      // Too many particles to dispatch as mesh tasks (exceeds the device Y / total workgroup limits):
+      // splats beyond the limit are dropped. Flag the affected stats in red.
+      const bool   meshOverflow = isMeshPipeline && isMeshTaskDispatchOverflow(meshRasterSplatCount);
+      const ImVec4 kRed(1.0f, 0.3f, 0.3f, 1.0f);
 
-      ImGui::BeginDisabled(prmSelectedPipeline == PIPELINE_RTX);
-      if(PE::begin("## Rasterization"))
+      ImGui::BeginDisabled(isRtxPipelineOnly());
+      if(PE::begin("## Rasterization", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
       {
+        if(meshOverflow)
+          ImGui::PushStyleColor(ImGuiCol_Text, kRed);
         PE::Text("Rasterized splats", fmt::format("{} ({})", formatSize(rasterSplatCount), rasterSplatCount));
         PE::Text("Mesh shader work groups", fmt::format("{} ({})", formatSize(wgCount), wgCount));
+        if(meshOverflow)
+        {
+          PE::Text("Mesh dispatch overflow", fmt::format("exceeds device limit ({} max work groups) - splats dropped",
+                                                         isSupported.maxMeshWorkGroupTotalCount));
+          ImGui::PopStyleColor();
+        }
         PE::end();
       }
       ImGui::EndDisabled();
@@ -3623,12 +4925,15 @@ void GaussianSplattingUI::guiDrawRendererStatisticsWindow()
       const bool     rtxValid    = splatSets.isRtxValid();
 
       ImGui::BeginDisabled(!isRtxPipelineActive());
-      if(PE::begin("## Ray Tracing"))
+      if(PE::begin("## Ray Tracing", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
       {
         // Mode name based on (instanced/per-splat-set) x (AABB/icosa)
-        const char* modeName = prmRtxData.useTlasInstances ?
-                                   (prmRtxData.useAABBs ? "Per-particle instanced AABB" : "Per-particle instanced icosa") :
-                                   (prmRtxData.useAABBs ? "Per-splat-set AABB" : "Per-splat-set icosa soup");
+        const char* modeName = prmRtxData.useTlasInstances ? (prmRtxData.useSpheres ? "Per-particle instanced sphere" :
+                                                              prmRtxData.useAABBs   ? "Per-particle instanced AABB" :
+                                                                                      "Per-particle instanced icosa") :
+                                                             (prmRtxData.useSpheres ? "Per-splat-set sphere" :
+                                                              prmRtxData.useAABBs   ? "Per-splat-set AABB" :
+                                                                                      "Per-splat-set icosa soup");
         PE::Text("Mode", modeName);
 
         // TLAS info (append "multi-TLAS" if >1)
@@ -3639,11 +4944,29 @@ void GaussianSplattingUI::guiDrawRendererStatisticsWindow()
 
         PE::Text("TLAS entries", fmt::format("{}", formatSize(tlasEntries)));
 
+        const uint32_t rtxDescCount  = splatSets.getRtxDescriptorCount();
+        const size_t   instanceCount = splatSets.getInstanceCount();
+        if(rtxDescCount > 0 && instanceCount > 0)
+          PE::Text("RTX descriptors",
+                   fmt::format("{} ({} inst x {} chunks)", rtxDescCount, instanceCount, rtxDescCount / instanceCount));
+
         // BLAS info (append "chunked" if using BLAS chunks)
         if(blasChunked)
           PE::Text("BLAS count", fmt::format("{} (chunked)", blasCount));
         else
           PE::Text("BLAS count", fmt::format("{}", blasCount));
+
+        bool stochastic = prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT;
+        bool hasMeshes  = !m_assets.meshes.instances.empty();
+        int  spp        = stochastic ? 1 : prmRtx.particleSamplesPerPass;
+        int  distSize   = getPayloadArraySize();             // max(spp, meshSlots)
+        int  idSize     = (hasMeshes && spp < 2) ? 2 : spp;  // mesh needs id[0]=objId, id[1]=matId
+        // id[idSize] + splatSetIdx[spp] + dist[distSize] + currentSplatSetInstance + rayBounce
+        int totalDwords = idSize + spp + distSize + 2;
+        if(stochastic)
+          totalDwords += 1 + 7 * spp;  // rngSeed + color[spp](4) + normal[spp](3)
+        PE::Text("Payload array sizes", fmt::format("dist={}, id={}, splatSetIdx={}", distSize, distSize, idSize, spp));
+        PE::Text("Payload total size", fmt::format("{} dwords ({} bytes)", totalDwords, totalDwords * 4));
 
         PE::end();
       }
@@ -3723,6 +5046,24 @@ void GaussianSplattingUI::guiAddToRecentFiles(std::filesystem::path filePath, in
   }
 }
 
+void GaussianSplattingUI::guiAddToRecentMeshes(std::filesystem::path filePath, int historySize)
+{
+  if(filePath.is_relative())
+  {
+    filePath = std::filesystem::absolute(filePath);
+  }
+  auto it = std::find(m_recentMeshes.begin(), m_recentMeshes.end(), filePath);
+  if(it != m_recentMeshes.end())
+  {
+    m_recentMeshes.erase(it);
+  }
+  m_recentMeshes.insert(m_recentMeshes.begin(), filePath);
+  if(m_recentMeshes.size() > historySize)
+  {
+    m_recentMeshes.pop_back();
+  }
+}
+
 void GaussianSplattingUI::guiAddToRecentProjects(std::filesystem::path filePath, int historySize)
 {
   // first check if filePath is absolute
@@ -3755,6 +5096,10 @@ void GaussianSplattingUI::guiRegisterIniFileHandlers()
     if(strcmp(handler->TypeName, "RecentFiles") == 0)
     {
       ui->m_recentFiles.clear();
+    }
+    else if(strcmp(handler->TypeName, "RecentMeshes") == 0)
+    {
+      ui->m_recentMeshes.clear();
     }
     else if(strcmp(handler->TypeName, "RecentProjects") == 0)
     {
@@ -3796,6 +5141,35 @@ void GaussianSplattingUI::guiRegisterIniFileHandlers()
     ImGui::GetCurrentContext()->SettingsHandlers.push_back(iniHandler);
   }
   {
+    auto saveRecentMeshesToIni = [](ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
+      auto* self = static_cast<GaussianSplattingUI*>(handler->UserData);
+      buf->appendf("[%s][Data]\n", handler->TypeName);
+      for(const auto& file : self->m_recentMeshes)
+      {
+        buf->appendf("File=%s\n", file.string().c_str());
+      }
+      buf->append("\n");
+    };
+
+    auto loadRecentMeshesFromIni = [](ImGuiContext* ctx, ImGuiSettingsHandler* handler, void* entry, const char* line) {
+      auto* self = static_cast<GaussianSplattingUI*>(handler->UserData);
+      if(strncmp(line, "File=", 5) == 0)
+      {
+        const char* filePath = line + 5;
+        self->m_recentMeshes.push_back(filePath);
+      }
+    };
+
+    ImGuiSettingsHandler iniHandler;
+    iniHandler.TypeName   = "RecentMeshes";
+    iniHandler.TypeHash   = ImHashStr(iniHandler.TypeName);
+    iniHandler.ReadOpenFn = readOpen;
+    iniHandler.WriteAllFn = saveRecentMeshesToIni;
+    iniHandler.ReadLineFn = loadRecentMeshesFromIni;
+    iniHandler.UserData   = this;
+    ImGui::GetCurrentContext()->SettingsHandlers.push_back(iniHandler);
+  }
+  {
     // Save settings handler, not using capture so can be used as a function pointer
     auto saveRecentProjectsToIni = [](ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
       auto* self = static_cast<GaussianSplattingUI*>(handler->UserData);
@@ -3832,9 +5206,12 @@ void GaussianSplattingUI::guiRegisterIniFileHandlers()
     auto saveWindowStatesToIni = [](ImGuiContext* ctx, ImGuiSettingsHandler* handler, ImGuiTextBuffer* buf) {
       auto* self = static_cast<GaussianSplattingUI*>(handler->UserData);
       buf->appendf("[%s][Data]\n", handler->TypeName);
+      buf->appendf("AssetsWindow=%d\n", self->m_showAssetsWindow ? 1 : 0);
+      buf->appendf("PropertiesWindow=%d\n", self->m_showPropertiesWindow ? 1 : 0);
       buf->appendf("ShaderDebugging=%d\n", self->m_showShaderFeedback ? 1 : 0);
       buf->appendf("MemoryStatistics=%d\n", self->m_showMemoryStatistics ? 1 : 0);
       buf->appendf("RendererStatistics=%d\n", self->m_showRendererStatistics ? 1 : 0);
+      buf->appendf("FooterBar=%d\n", self->m_showFooterBar ? 1 : 0);
       buf->append("\n");
     };
 
@@ -3843,9 +5220,25 @@ void GaussianSplattingUI::guiRegisterIniFileHandlers()
       auto* self = static_cast<GaussianSplattingUI*>(handler->UserData);
       int   value;
 #ifdef _MSC_VER
-      if(sscanf_s(line, "ShaderDebugging=%d", &value) == 1)
+      if(sscanf_s(line, "AssetsWindow=%d", &value) == 1)
 #else
-      if(sscanf(line, "ShaderDebugging=%d", &value) == 1)
+      if(sscanf(line, "AssetsWindow=%d", &value) == 1)
+#endif
+      {
+        self->m_showAssetsWindow = (value == 1);
+      }
+#ifdef _MSC_VER
+      else if(sscanf_s(line, "PropertiesWindow=%d", &value) == 1)
+#else
+      else if(sscanf(line, "PropertiesWindow=%d", &value) == 1)
+#endif
+      {
+        self->m_showPropertiesWindow = (value == 1);
+      }
+#ifdef _MSC_VER
+      else if(sscanf_s(line, "ShaderDebugging=%d", &value) == 1)
+#else
+      else if(sscanf(line, "ShaderDebugging=%d", &value) == 1)
 #endif
       {
         self->m_showShaderFeedback = (value == 1);
@@ -3866,6 +5259,14 @@ void GaussianSplattingUI::guiRegisterIniFileHandlers()
       {
         self->m_showRendererStatistics = (value == 1);
       }
+#ifdef _MSC_VER
+      else if(sscanf_s(line, "FooterBar=%d", &value) == 1)
+#else
+      else if(sscanf(line, "FooterBar=%d", &value) == 1)
+#endif
+      {
+        self->m_showFooterBar = (value == 1);
+      }
     };
 
     // Custom readOpen for WindowStates that checks for "Data" section
@@ -3884,6 +5285,309 @@ void GaussianSplattingUI::guiRegisterIniFileHandlers()
     iniHandler.ReadLineFn = loadWindowStatesFromIni;
     iniHandler.UserData   = this;  // Pass the current instance to the handler
     ImGui::GetCurrentContext()->SettingsHandlers.push_back(iniHandler);
+  }
+}
+
+///////////////////////////////////
+// Loading splt sets and meshes
+
+void GaussianSplattingUI::guiLoadSceneAndDrawProgressIfNeeded(void)
+{
+#ifdef WITH_DEFAULT_SCENE_FEATURE
+  // load a default scene if none was provided by command line
+  if(prmScene.enableDefaultScene && m_currentLoadingSplatSetFilename.empty() && prmScene.sceneLoadQueue.empty()
+     && prmScene.projectToLoadFilename.empty() && m_plyLoader.getStatus() == PlyLoaderAsync::State::E_READY)
+  {
+    const std::vector<std::filesystem::path> defaultSearchPaths = getResourcesDirs();
+    auto defaultPath = nvutils::findFile("flowers_1/flowers_1.ply", defaultSearchPaths);
+    prmScene.pushLoadRequest(defaultPath, true);
+    prmScene.enableDefaultScene = false;
+  }
+#endif
+
+  // Process next item in queue
+  if(!prmScene.sceneLoadQueue.empty() && m_plyLoader.getStatus() == PlyLoaderAsync::State::E_READY)
+  {
+    static bool             firstBatchRequest = true;
+    const SceneLoadRequest& request           = prmScene.sceneLoadQueue.front();
+    bool                    doLoad            = true;
+
+    // Show confirmation dialog only if:
+    // Not loading from project
+    if(firstBatchRequest && !request.porcelain)
+    {
+      ImGui::OpenPopup("Load .ply file ?");
+      firstBatchRequest = false;
+    }
+
+    // Always center this window when appearing
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    // this block is executed only if OpenPopup was executed
+    if(ImGui::BeginPopupModal("Load .ply file ?", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+      doLoad = false;
+
+      ImGui::Text("Load additional splat set or reset project?");
+      if(prmScene.sceneLoadQueue.size() > 1)
+      {
+        ImGui::Text("Queue has %zu file(s) pending.", prmScene.sceneLoadQueue.size());
+      }
+      ImGui::Separator();
+
+      if(ImGui::Button("Import", ImVec2(120, 0)))
+      {
+        // Import - continue without reset
+        doLoad = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SetItemDefaultFocus();
+      ImGui::SameLine();
+      if(ImGui::Button("Reset", ImVec2(120, 0)))
+      {
+        // Reset and continue
+        reset();
+        doLoad = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if(ImGui::Button("Cancel", ImVec2(120, 0)))
+      {
+        // Cancel entire queue
+        prmScene.sceneLoadQueue.clear();
+        prmScene.projectToLoadFilename.clear();
+        prmScene.projectLoadPorcelain = false;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+
+    if(doLoad)
+    {
+      m_currentLoadingSplatSetFilename = request.path;
+      vkDeviceWaitIdle(m_device);
+
+      if(prmScene.sceneLoadQueue.size() > 1)
+      {
+        LOGI("Start loading file %s (%zu more in queue)\n", request.path.string().c_str(), prmScene.sceneLoadQueue.size() - 1);
+      }
+      else
+      {
+        LOGI("Start loading file %s\n", request.path.string().c_str());
+        // We process last request of the queue
+        // reset flag for next batch
+        firstBatchRequest = true;
+      }
+
+      // Use pre-configured splat set if provided (project loading)
+      // Otherwise create a new one
+      std::shared_ptr<SplatSetVk> splatSetToLoad = request.splatSet ? request.splatSet : std::make_shared<SplatSetVk>();
+
+      if(!m_plyLoader.loadScene(request.path, splatSetToLoad))
+      {
+        LOGE("Error: cannot start scene load while loader is not ready status=%d\n", m_plyLoader.getStatus());
+        // Remove failed request
+        prmScene.sceneLoadQueue.pop_front();
+      }
+      else
+      {
+        // Store request for later (needed to access pre-configured instance)
+        m_currentLoadRequest = request;
+
+        // Remove from queue (will process in completion handler)
+        prmScene.sceneLoadQueue.pop_front();
+
+        // open the modal window that will collect results
+        ImGui::OpenPopup("Loading");
+      }
+    }
+  }
+
+  // display loading jauge modal window
+  // Always center this window when appearing
+  ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+  ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+  if(ImGui::BeginPopupModal("Loading", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+  {
+    // specific wait for benchmarking mode
+    // prevent display of loading jauge and frame advancing while loading
+    // ensure scene is loaded before moving to next frame
+    if(*m_pBenchmarkEnabled)
+    {
+      while(m_plyLoader.getStatus() == PlyLoaderAsync::State::E_LOADING)
+      {
+        using namespace std::chrono_literals;
+        std::this_thread::sleep_for(100ms);
+      }
+    }
+    // managment of async load
+    switch(m_plyLoader.getStatus())
+    {
+      case PlyLoaderAsync::State::E_LOADING: {
+        ImGui::Text("%s", m_plyLoader.getFilename().string().c_str());
+        if(!prmScene.sceneLoadQueue.empty())
+        {
+          ImGui::Text("(%zu more file(s) queued)", prmScene.sceneLoadQueue.size());
+        }
+        ImGui::ProgressBar(m_plyLoader.getProgress(), ImVec2(ImGui::GetContentRegionAvail().x, 0.0f));
+      }
+      break;
+      case PlyLoaderAsync::State::E_FAILURE: {
+        ImGui::Text("Error: invalid ply file");
+        if(ImGui::Button("Ok", ImVec2(120, 0)))
+        {
+          m_currentLoadingSplatSetFilename = "";
+          // destroy scene just in case it was
+          // loaded but not properly since in error
+          deinitScene();
+          // set ready for next load
+          m_plyLoader.reset();
+          ImGui::CloseCurrentPopup();
+        }
+      }
+      break;
+      case PlyLoaderAsync::State::E_LOADED: {
+
+        // Create splat set asset (data is already in the SplatSetVk object from loader)
+        auto loadedSplatSet =
+            m_assets.splatSets.createSplatSet(m_currentLoadingSplatSetFilename.string(), m_plyLoader.getLoadedSplatSet());
+
+        // If request provided a pre-configured instance, use it
+        // Otherwise create a new one with identity transform
+        if(m_currentLoadRequest.instance)
+        {
+          // Pre-configured instance (from project loading)
+          // Instance already has transform, material, etc. set by project loader
+          // Just register it with the manager and associate with the loaded splat set
+          m_currentLoadRequest.instance->splatSet = loadedSplatSet;
+
+          // Register the pre-configured instance
+          m_selectedSplatInstance = m_assets.splatSets.registerInstance(loadedSplatSet, m_currentLoadRequest.instance);
+
+          LOGD("Loaded with pre-configured instance (project mode)\n");
+
+          // Handle additional instances sharing the same splat set (Version 1+ project files)
+          for(auto& additionalInstance : m_currentLoadRequest.additionalInstances)
+          {
+            additionalInstance->splatSet = loadedSplatSet;
+            m_assets.splatSets.registerInstance(loadedSplatSet, additionalInstance);
+            LOGD("  Created additional instance sharing same splat set\n");
+          }
+        }
+        else
+        {
+          // Standard path: create new instance with identity transform
+          m_selectedSplatInstance = m_assets.splatSets.createInstance(loadedSplatSet);
+
+          LOGD("Loaded with new default instance\n");
+        }
+
+        // createSplatSet and createInstance/registerInstance already set appropriate manager requests
+        // No shader rebuild needed - bindless system handles descriptor updates at runtime
+
+        // add only if not loaded by project or command
+        if(!m_currentLoadRequest.porcelain)
+          guiAddToRecentFiles(m_currentLoadingSplatSetFilename);
+
+        // set ready for next load
+        m_plyLoader.reset();
+
+        // Close modal only if queue is empty
+        // Otherwise, next file will start loading automatically
+        if(prmScene.sceneLoadQueue.empty())
+        {
+          ImGui::CloseCurrentPopup();
+        }
+      }
+      break;
+      default: {
+        // nothing to do for READY or SHUTDOWN
+      }
+    }
+    ImGui::EndPopup();
+  }
+}
+
+void GaussianSplattingUI::guiImportMeshIfNeeded()
+{
+  static std::filesystem::path pendingMeshImport;
+  if(!prmScene.meshToImportFilename.empty())
+  {
+    pendingMeshImport             = prmScene.meshToImportFilename;
+    prmScene.meshToImportFilename = "";
+    ImGui::OpenPopup("Import mesh file?");
+  }
+
+  {
+    bool doImport = false;
+
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+
+    if(ImGui::BeginPopupModal("Import mesh file?", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+      ImGui::Text("Import mesh or reset project?");
+      ImGui::Separator();
+
+      if(ImGui::Button("Import", ImVec2(120, 0)))
+      {
+        doImport = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SetItemDefaultFocus();
+      ImGui::SameLine();
+      if(ImGui::Button("Reset", ImVec2(120, 0)))
+      {
+        reset();
+        doImport = true;
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::SameLine();
+      if(ImGui::Button("Cancel", ImVec2(120, 0)))
+      {
+        pendingMeshImport.clear();
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
+
+    if(doImport && !pendingMeshImport.empty())
+    {
+      const auto name = pendingMeshImport;
+      pendingMeshImport.clear();
+
+      auto meshPtr = m_assets.meshes.loadModel(name);
+      bool valid   = (meshPtr != nullptr);
+      if(valid)
+        guiAddToRecentMeshes(name);
+
+      if(!valid)
+      {
+        ImGui::OpenPopup("Obj Loading");
+      }
+      else
+      {
+        m_helpers.transform.clearAttachment();
+        m_selectedAsset        = GUI_MESH;
+        m_selectedMeshInstance = m_assets.meshes.m_lastCreatedInstance;
+        m_objListUpdated       = true;
+      }
+    }
+  }
+
+  {
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
+    if(ImGui::BeginPopupModal("Obj Loading", NULL, ImGuiWindowFlags_AlwaysAutoResize))
+    {
+      ImGui::Text("Error: invalid mesh file");
+      if(ImGui::Button("Ok", ImVec2(120, 0)))
+      {
+        ImGui::CloseCurrentPopup();
+      }
+      ImGui::EndPopup();
+    }
   }
 }
 
@@ -3964,8 +5668,8 @@ bool GaussianSplattingUI::loadProjectIfNeeded()
         {
           // cancel any request leading to a reset
           prmScene.sceneLoadQueue.clear();
-          prmScene.projectToLoadFilename  = "";
-          prmScene.projectLoadPorcelain = false;
+          prmScene.projectToLoadFilename = "";
+          prmScene.projectLoadPorcelain  = false;
           ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -3980,8 +5684,8 @@ bool GaussianSplattingUI::loadProjectIfNeeded()
       if(!i.is_open())
       {
         LOGE("Error: unable to open project file %s\n", path.c_str());
-        prmScene.projectToLoadFilename  = "";
-        prmScene.projectLoadPorcelain = false;
+        prmScene.projectToLoadFilename = "";
+        prmScene.projectLoadPorcelain  = false;
         return false;
       }
 
@@ -3992,8 +5696,8 @@ bool GaussianSplattingUI::loadProjectIfNeeded()
       catch(...)
       {
         LOGE("Error: invalid project file %s\n", path.c_str());
-        prmScene.projectToLoadFilename  = "";
-        prmScene.projectLoadPorcelain = false;
+        prmScene.projectToLoadFilename = "";
+        prmScene.projectLoadPorcelain  = false;
         return false;
       }
       i.close();
@@ -4023,13 +5727,14 @@ bool GaussianSplattingUI::loadProjectIfNeeded()
 
   if(!success)
   {
-    prmScene.projectToLoadFilename  = "";
-    prmScene.projectLoadPorcelain = false;
+    prmScene.projectToLoadFilename = "";
+    prmScene.projectLoadPorcelain  = false;
     return false;
   }
 
-  prmScene.projectToLoadFilename  = "";
-  prmScene.projectLoadPorcelain = false;
+  m_projectPath                  = std::filesystem::absolute(path);
+  prmScene.projectToLoadFilename = "";
+  prmScene.projectLoadPorcelain  = false;
   return true;
 }
 
@@ -4121,6 +5826,41 @@ void GaussianSplattingUI::dumpSplat()
   //
   LOGI("Splat dumped: Global ID=%d, SplatSet Index=%d, Local Splat Index=%d -> c:\\Temp\\debug_splat.ply\n",
        globalSplatId, splatSetIndex, splatIdx);
+}
+
+// Local .raw file writer: 16-byte header (width, height, channels, bytesPerChannel) + float32 RGBA data.
+// Bypasses nvpro_core so we don't need to modify the submodule.
+static VkResult saveRawImageToFile(VkDevice                     device,
+                                   VkImage                      dstImage,
+                                   VkDeviceMemory               dstImageMemory,
+                                   VkExtent2D                   size,
+                                   const std::filesystem::path& filename)
+{
+  VkImageSubresource  subResource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+  VkSubresourceLayout subResourceLayout{};
+  vkGetImageSubresourceLayout(device, dstImage, &subResource, &subResourceLayout);
+
+  const char* data   = nullptr;
+  VkResult    result = vkMapMemory(device, dstImageMemory, 0, VK_WHOLE_SIZE, 0, (void**)&data);
+  if(result != VK_SUCCESS)
+    return result;
+  data += subResourceLayout.offset;
+
+  std::string filenameUtf8 = nvutils::utf8FromPath(filename);
+  FILE*       fp           = fopen(filenameUtf8.c_str(), "wb");
+  if(fp)
+  {
+    uint32_t header[4] = {size.width, size.height, 4, sizeof(float)};
+    fwrite(header, sizeof(uint32_t), 4, fp);
+    for(uint32_t y = 0; y < size.height; y++)
+    {
+      fwrite(data + y * subResourceLayout.rowPitch, sizeof(float), size.width * 4, fp);
+    }
+    fclose(fp);
+  }
+
+  vkUnmapMemory(device, dstImageMemory);
+  return VK_SUCCESS;
 }
 
 }  // namespace vk_gaussian_splatting

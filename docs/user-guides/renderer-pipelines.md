@@ -43,6 +43,6 @@ Each pipeline exposes additional properties in dedicated tabs (Rasterization or 
 | **Raster vertex shader 3DGS**  | [VK3DGSR: 3D Gaussian Splatting (3DGS) [Kerbl2023] using Vulkan Rasterization](../deep-dives/rasterization_of_3d_gaussian_splatting.md) |
 | **Raster mesh shader 3DGS**| [VK3DGSR: 3D Gaussian Splatting (3DGS) [Kerbl2023] using Vulkan Rasterization](../deep-dives/rasterization_of_3d_gaussian_splatting.md) |
 | **Raster mesh shader 3DGUT**| [VK3DGUT: 3D Gaussian Unscented Transform (3DGUT) [Wu2024] Using Vulkan Rasterization](../deep-dives/rasterization_of_3dgut.md) |
-| **Ray tracing 3DGRT**        | [VK3DGRT: 3D Gaussian Ray Tracing (3DGRT) [Moënne-Loccoz2024] using Vulkan RTX](../deep-dives/ray_tracing_3d_gaussians.md)    |
+| **Ray tracing 3DGRT**        | [VK3DGRT: 3D Gaussian Ray Tracing (3DGRT) [Moënne-Loccoz2024] using Vulkan RTX](../deep-dives/ray_tracing_3d_gaussians.md) — billboard depth and bounding modes: [Billboard Ray Tracing](../deep-dives/billboard_ray_tracing.md) |
 | **Hybrid 3DGS+3DGRT**        | [VK3DGHR: 3D Gaussian Hybrid Rendering Using Vulkan RTX and Rasterization](../deep-dives/hybrid_rendering_3d_gaussians.md)                   |
 | **Hybrid 3DGUT+3DGRT**        | [VK3DGHR: 3D Gaussian Hybrid Rendering Using Vulkan RTX and Rasterization](../deep-dives/hybrid_rendering_3d_gaussians.md)                   |

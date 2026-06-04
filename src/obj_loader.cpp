@@ -23,12 +23,12 @@
 #include "obj_loader.h"
 #include <nvutils/logger.hpp>
 
-bool ObjLoader::load(const std::filesystem::path& filename)
-{
-  // reset the mesh batch
-  reset();
+namespace vk_gaussian_splatting {
 
-  //
+bool ObjLoader::load(const std::filesystem::path& filename, Mesh& mesh)
+{
+  mesh = {};
+
   tinyobj::ObjReader reader;
   reader.ParseFromFile(filename.string());
   if(!reader.Valid())
@@ -37,47 +37,63 @@ bool ObjLoader::load(const std::filesystem::path& filename)
     return false;
   }
 
-  this->filename = filename;
+  mesh.path = filename.string();
 
-  // Collecting the material in the scene
+  // Collecting the material in the scene — convert OBJ Phong to PBR metallic-roughness
   for(const auto& material : reader.GetMaterials())
   {
-    ObjMaterial m;
-    m.ambient       = glm::vec3(material.ambient[0], material.ambient[1], material.ambient[2]);
-    m.diffuse       = glm::vec3(material.diffuse[0], material.diffuse[1], material.diffuse[2]);
-    m.specular      = glm::vec3(material.specular[0], material.specular[1], material.specular[2]);
-    m.emission      = glm::vec3(material.emission[0], material.emission[1], material.emission[2]);
-    m.transmittance = glm::vec3(material.transmittance[0], material.transmittance[1], material.transmittance[2]);
-    m.dissolve      = material.dissolve;
-    m.ior           = material.ior;
-    m.shininess     = material.shininess;
-    if(m.transmittance.x != 0.0 || m.transmittance.y != 0.0 || m.transmittance.x != 0.0)
-      m.illum = 2;  // refractive
-    else if(material.illum > 1)
-      m.illum = 1;  // reflective
-    else
-      m.illum = 0;
+    Material m;
 
-    if(!material.diffuse_texname.empty())
-    {
-      m_textures.push_back(material.diffuse_texname);
-      m.textureID = static_cast<int>(m_textures.size()) - 1;
-    }
+    glm::vec3 diffuse  = glm::vec3(material.diffuse[0], material.diffuse[1], material.diffuse[2]);
+    glm::vec3 specular = glm::vec3(material.specular[0], material.specular[1], material.specular[2]);
+    glm::vec3 transmit = glm::vec3(material.transmittance[0], material.transmittance[1], material.transmittance[2]);
 
-    m_materials.emplace_back(m);
-    m_matNames.emplace_back(material.name);
+    m.baseColor = diffuse;
+    m.emissive  = glm::vec3(material.emission[0], material.emission[1], material.emission[2]);
+
+    // Phong shininess → GGX roughness approximation
+    float shininess = std::max(material.shininess, 1.0f);
+    m.roughness     = std::sqrt(2.0f / (shininess + 2.0f));
+
+    // Heuristic: high specular with low diffuse → metallic
+    float specLum = glm::length(specular);
+    float diffLum = glm::length(diffuse);
+    m.metallic    = (specLum > 0.5f && diffLum < 0.1f) ? 1.0f : 0.0f;
+
+    m.ior     = (material.ior > 0.0f) ? material.ior : 1.5f;
+    m.opacity = material.dissolve;
+
+    // Transmission from OBJ transmittance
+    float transmitLen = glm::length(transmit);
+    m.transmission    = (transmitLen > 0.001f) ? 1.0f : 0.0f;
+
+    // Map OBJ texture names to PBR texture slots
+    // sRGB for color maps (diffuse, emissive), linear for data maps (normal, specular)
+    auto addTex = [&](const std::string& name, bool sRGB) -> int {
+      if(name.empty())
+        return -1;
+      mesh.textures.push_back(name);
+      mesh.textureSRGB.push_back(sRGB);
+      return static_cast<int>(mesh.textures.size()) - 1;
+    };
+    m.baseColorTexture         = addTex(material.diffuse_texname, true);
+    m.normalTexture            = addTex(material.bump_texname, false);
+    m.metallicRoughnessTexture = addTex(material.specular_texname, false);
+    m.emissiveTexture          = addTex(material.emissive_texname, true);
+
+    mesh.materials.emplace_back(m);
+    mesh.matNames.emplace_back(material.name);
   }
 
   // If there were none, add a default
-  if(m_materials.empty())
+  if(mesh.materials.empty())
   {
-    ObjMaterial defaultMat;
-    defaultMat.ambient   = glm::vec3(0.1f, 0.1f, 0.1f);
-    defaultMat.diffuse   = glm::vec3(0.7f, 0.7f, 0.7f);
-    defaultMat.specular  = glm::vec3(1.0f, 1.0f, 1.0f);
-    defaultMat.shininess = 32.0f;
-    m_materials.emplace_back(defaultMat);
-    m_matNames.emplace_back("Default");
+    Material defaultMat;
+    defaultMat.baseColor = glm::vec3(0.7f, 0.7f, 0.7f);
+    defaultMat.roughness = 0.5f;
+    defaultMat.metallic  = 0.0f;
+    mesh.materials.emplace_back(defaultMat);
+    mesh.matNames.emplace_back("Default");
   }
 
   const tinyobj::attrib_t& attrib = reader.GetAttrib();
@@ -88,9 +104,9 @@ bool ObjLoader::load(const std::filesystem::path& filename)
 
   for(const auto& shape : reader.GetShapes())
   {
-    m_vertices.reserve(shape.mesh.indices.size() + m_vertices.size());
-    m_indices.reserve(shape.mesh.indices.size() + m_indices.size());
-    m_matIndices.insert(m_matIndices.end(), shape.mesh.material_ids.begin(), shape.mesh.material_ids.end());
+    mesh.vertices.reserve(shape.mesh.indices.size() + mesh.vertices.size());
+    mesh.indices.reserve(shape.mesh.indices.size() + mesh.indices.size());
+    mesh.matIndices.insert(mesh.matIndices.end(), shape.mesh.material_ids.begin(), shape.mesh.material_ids.end());
 
     // If we do not have normal vectors we generate some
     if(true)  //attrib.normals.empty())
@@ -155,7 +171,7 @@ bool ObjLoader::load(const std::filesystem::path& filename)
     // same primary index for rendering
     for(const auto& index : shape.mesh.indices)
     {
-      ObjVertex    vertex = {};
+      Vertex       vertex = {};
       const float* vp     = &attrib.vertices[3 * index.vertex_index];
       vertex.pos          = {*(vp + 0), *(vp + 1), *(vp + 2)};
 
@@ -169,33 +185,27 @@ bool ObjLoader::load(const std::filesystem::path& filename)
         vertex.nrm = normals[index.vertex_index];
       }
 
-      /*
       if(!attrib.texcoords.empty() && index.texcoord_index >= 0)
       {
         const float* tp = &attrib.texcoords[2 * index.texcoord_index + 0];
         vertex.texCoord = {*tp, 1.0f - *(tp + 1)};
       }
-
-      if(!attrib.colors.empty())
-      {
-        const float* vc = &attrib.colors[3 * index.vertex_index];
-        vertex.color    = {*(vc + 0), *(vc + 1), *(vc + 2)};
-      }
-      */
-      m_vertices.push_back(vertex);
-      m_indices.push_back(static_cast<int>(m_indices.size()));
+      mesh.vertices.push_back(vertex);
+      mesh.indices.push_back(static_cast<uint32_t>(mesh.indices.size()));
     }
   }
 
   // Fixing material indices
-  for(auto& mi : m_matIndices)
+  for(auto& mi : mesh.matIndices)
   {
-    // Note: mi is uint32_t so no need to check < 0
-    if(mi >= m_materials.size())
+    if(mi >= mesh.materials.size())
       mi = 0;
   }
 
-  if(!isValid())
+  // Generate tangent vectors from UVs (needed for normal mapping)
+  computeTangents(mesh.vertices, mesh.indices);
+
+  if(!mesh.isValid())
   {
     LOGE("Invalid Obj file %s \n", filename.c_str());
     return false;
@@ -203,3 +213,5 @@ bool ObjLoader::load(const std::filesystem::path& filename)
 
   return true;
 }
+
+}  // namespace vk_gaussian_splatting

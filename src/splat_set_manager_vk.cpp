@@ -27,6 +27,7 @@
 #include <nvvk/check_error.hpp>
 #include <algorithm>
 #include <cassert>
+#include <cmath>
 #include <chrono>
 #include <fstream>
 #include <iomanip>
@@ -81,10 +82,14 @@ void SplatSetInstanceVk::rebuildDescriptor(const SplatSetVk* splatSet, shaderio:
   descriptor.format     = splatSet->shFormat;
   descriptor.rgbaFormat = splatSet->rgbaFormat;
 
+  // Visibility
+  descriptor.show = show ? 1 : 0;
+
   // Instance-specific data (transform, material)
   descriptor.transform                = transform;
   descriptor.transformInverse         = transformInverse;
   descriptor.transformRotScaleInverse = transformRotScaleInverse;
+  descriptor.prevTransform            = prevTransform;
 
   // Update needShading flag before copying to GPU descriptor
   shaderio::updateMaterialNeedsShading(splatMaterial);
@@ -244,13 +249,16 @@ std::shared_ptr<SplatSetVk> SplatSetManagerVk::createSplatSet(const std::string&
   splatSetVk->splatCount = static_cast<uint32_t>(splatSetVk->size());
   splatSetVk->shDegree   = static_cast<uint32_t>(splatSetVk->maxShDegree());
 
-  // Initialize default material (will be set again in initDataStorage, but needed now for instances)
-  splatSetVk->splatMaterial.ambient       = glm::vec3(0.0f);
-  splatSetVk->splatMaterial.diffuse       = glm::vec3(0.0f);
-  splatSetVk->splatMaterial.specular      = glm::vec3(0.0f);
-  splatSetVk->splatMaterial.transmittance = glm::vec3(0.0f);
-  splatSetVk->splatMaterial.emission      = glm::vec3(1.0f);  // Fully emissive
-  splatSetVk->splatMaterial.shininess     = 0.0f;
+
+  // Initialize default material: pure emissive (display trained radiance as-is, no lighting interaction)
+  splatSetVk->splatMaterial.baseColor           = glm::vec3(0.0f);
+  splatSetVk->splatMaterial.metallic            = 0.0f;
+  splatSetVk->splatMaterial.roughness           = 0.5f;
+  splatSetVk->splatMaterial.emissive            = glm::vec3(1.0f);  // Fully emissive
+  splatSetVk->splatMaterial.transmission        = 0.0f;
+  splatSetVk->splatMaterial.specularFactor      = 0.0f;
+  splatSetVk->splatMaterial.specularColorFactor = glm::vec3(0.0f);
+  splatSetVk->splatMaterial.maxBounces          = 0;
 
   // Set flag: needs GPU upload (deferred to processVramUpdates)
   splatSetVk->flags |= SplatSetVk::Flags::eNew;
@@ -268,7 +276,7 @@ std::shared_ptr<SplatSetVk> SplatSetManagerVk::createSplatSet(const std::string&
   pendingRequests |= Request::eUpdateDescriptors;
   pendingRequests |= Request::eRebuildBLAS;
 
-  LOGD("Created splat set '%s' (index=%d, splats=%u) - deferred upload\n", path.c_str(), splatSetVk->index, splatSetVk->splatCount);
+  LOGD("Created splat set '%s' (index=%zu, splats=%u) - deferred upload\n", path.c_str(), splatSetVk->index, splatSetVk->splatCount);
 
   return splatSetVk;
 }
@@ -295,7 +303,7 @@ void SplatSetManagerVk::deleteSplatSet(std::shared_ptr<SplatSetVk> splatSet)
 
   pendingRequests |= Request::eProcessDeletions;
 
-  LOGD("Marked splat set (index=%d) for deletion\n", splatSet->index);
+  LOGD("Marked splat set (index=%zu) for deletion\n", splatSet->index);
 }
 
 // Note: getSplatSet() now inline in header (direct vector access)
@@ -352,13 +360,25 @@ std::shared_ptr<SplatSetInstanceVk> SplatSetManagerVk::createInstance(std::share
   m_instances.push_back(instance);
 
   // Request GPU updates
-  // Force full BLAS+TLAS rebuild (not just TLAS) so that subsequent TLAS updates work correctly.
-  // The GPU TLAS-only rebuild path creates a TLAS that cannot be updated in-place reliably.
   pendingRequests |= Request::eUpdateDescriptors;
-  pendingRequests |= Request::eRebuildBLAS;
   pendingRequests |= Request::eUpdateGlobalIndexTable;
 
-  LOGD("Created instance '%s' (index=%d)\n", instance->displayName.c_str(), instance->index);
+  // In per-particle instanced mode the BLAS is a shared unit primitive and TLASes are
+  // per-unique-asset with local-only transforms (model transform applied via ray transform
+  // in raygen). Adding a new instance of an existing asset only needs descriptor updates —
+  // no BLAS or TLAS rebuild. Route through the transform-update path which rebuilds the
+  // RTX descriptor array from existing TLASes.
+  // If the BLAS doesn't exist yet, fall back to full rebuild.
+  if(prmRtxData.useTlasInstances && m_particleAsHelper.getBlas().accel != VK_NULL_HANDLE)
+  {
+    pendingRequests |= Request::eUpdateTransformsOnly;
+  }
+  else
+  {
+    pendingRequests |= Request::eRebuildBLAS;
+  }
+
+  LOGD("Created instance '%s' (index=%zu)\n", instance->displayName.c_str(), instance->index);
 
   return instance;
 }
@@ -397,14 +417,20 @@ std::shared_ptr<SplatSetInstanceVk> SplatSetManagerVk::registerInstance(std::sha
 
   m_instances.push_back(instance);
 
-  // Request GPU updates
-  // Force full BLAS+TLAS rebuild (not just TLAS) so that subsequent TLAS updates work correctly.
-  // The GPU TLAS-only rebuild path creates a TLAS that cannot be updated in-place reliably.
+  // Request GPU updates (same logic as createInstance — see comment there)
   pendingRequests |= Request::eUpdateDescriptors;
-  pendingRequests |= Request::eRebuildBLAS;
   pendingRequests |= Request::eUpdateGlobalIndexTable;
 
-  LOGD("Registered instance '%s' (index=%d)\n", instance->displayName.c_str(), instance->index);
+  if(prmRtxData.useTlasInstances && m_particleAsHelper.getBlas().accel != VK_NULL_HANDLE)
+  {
+    pendingRequests |= Request::eUpdateTransformsOnly;
+  }
+  else
+  {
+    pendingRequests |= Request::eRebuildBLAS;
+  }
+
+  LOGD("Registered instance '%s' (index=%zu)\n", instance->displayName.c_str(), instance->index);
 
   return instance;
 }
@@ -455,7 +481,7 @@ void SplatSetManagerVk::deleteInstance(std::shared_ptr<SplatSetInstanceVk> insta
   instance->flags |= SplatSetInstanceVk::Flags::eDelete;
   pendingRequests |= Request::eProcessDeletions;
 
-  LOGD("Marked instance (index=%d) for deletion\n", instance->index);
+  LOGD("Marked instance (index=%zu) for deletion\n", instance->index);
 }
 
 // Note: getInstance() now inline in header (direct vector access)
@@ -470,6 +496,7 @@ void SplatSetManagerVk::updateInstanceTransform(std::shared_ptr<SplatSetInstance
 
   // UI has already modified instance->translation/rotation/scale
   // Just set flag and request GPU update
+  instance->transformDirtyCount = 2;  // Two descriptor uploads needed for DLSS motion vectors
   instance->flags |= SplatSetInstanceVk::Flags::eTransformChanged;
   markGpuDescriptorsDirty();
   pendingRequests |= Request::eUpdateTransformsOnly;
@@ -489,6 +516,32 @@ void SplatSetManagerVk::updateInstanceMaterial(std::shared_ptr<SplatSetInstanceV
   pendingRequests |= Request::eUpdateDescriptors;  // Material embedded in descriptor
 }
 
+void SplatSetManagerVk::setVisibilityDirty()
+{
+  // Always update GPU descriptors (show field)
+  pendingRequests |= Request::eUpdateDescriptors;
+
+  // In non-instanced RTX mode (large BLAS per splat set), visibility is enforced via
+  // TLAS instance masks set by the compute shader from desc.show. Trigger a TLAS update
+  // so the masks are refreshed.
+  if(!prmRtxData.useTlasInstances && !m_particleAsTlasHelpers.empty())
+    pendingRequests |= Request::eUpdateTransformsOnly;
+
+  // Recompute visible splat count (used by hasParticlesNow shader-rebuild check).
+  // A full global index table rebuild is deferred to the next raster-mode frame
+  // (processDescriptorsAndIndexTables) if needed; here we only update the count.
+  uint32_t visibleSplatCount = 0;
+  for(const auto& instance : m_instances)
+  {
+    if(instance && instance->splatSet && instance->shouldRender())
+      visibleSplatCount += instance->splatSet->splatCount;
+  }
+  m_totalGlobalSplatCount = visibleSplatCount;
+
+  // Mark global index table dirty so it is rebuilt when raster needs it
+  m_globalIndexTableDirty = true;
+}
+
 //-----------------------------------------------------------------------------
 // VRAM SYNC - Process all deferred updates
 //-----------------------------------------------------------------------------
@@ -505,9 +558,27 @@ void SplatSetManagerVk::processVramUpdates(bool processRtx)
   bool hasTransformChanges = false;
   processRamToVramDataUploads(instanceCountChanged, descriptorsNeedRebuild, hasTransformChanges);
 
+  // Phase 2b: Update BINDING_SPLAT_TEXTURES before Phase 3.
+  // Phase 2 may create new textures (e.g., switching storage mode to textures), and Phase 3's
+  // AS build compute shader reads from the bindless texture array. Without this update the
+  // shader would access stale/uninitialized descriptors causing VK_ERROR_DEVICE_LOST.
+  if(m_textureDescriptorsDirty && m_particleAsDescriptorSet != VK_NULL_HANDLE)
+  {
+    updateBindingSplatTextures(m_particleAsDescriptorSet);
+  }
+
   // Phase 3: RTX Acceleration Structures (BLAS first, then TLAS)
   if(!processRtxAccelerationStructures(processRtx, hasTransformChanges, descriptorsNeedRebuild))
-    return;  // Early exit requested by Phase 3 - skip Phase 4
+  {
+    if(m_rtxState != RtxState::eRtxError)
+    {
+      // Phase 3 completed successfully and handled descriptors internally — skip Phase 4
+      refreshModelBufferStats();
+      return;
+    }
+    // RTX build failed — fall through to Phase 4 so raster fallback has descriptors/GIT
+    descriptorsNeedRebuild = true;
+  }
 
   // Phase 4: Rebuild descriptors & index tables (after all GPU resources ready)
   processDescriptorsAndIndexTables(descriptorsNeedRebuild);
@@ -521,6 +592,8 @@ void SplatSetManagerVk::processVramUpdates(bool processRtx)
   {
     pendingRequests &= ~Request::eUpdateTransformsOnly;
   }
+
+  refreshModelBufferStats();
 }
 
 //-----------------------------------------------------------------------------
@@ -559,7 +632,7 @@ void SplatSetManagerVk::processRamVramDeletionsIfNeeded(bool& instanceCountChang
           // Check if this was the last instance referencing the splat set
           if(splatSet->instanceRefCount == 0)
           {
-            LOGD("  Last instance deleted, marking splat set for deletion (index=%d)\n", splatSet->index);
+            LOGD("  Last instance deleted, marking splat set for deletion (index=%zu)\n", splatSet->index);
             splatSet->flags |= SplatSetVk::Flags::eDelete;
           }
         }
@@ -669,11 +742,11 @@ void SplatSetManagerVk::processRamToVramDataUploads(bool& instanceCountChanged, 
       continue;
     if(static_cast<uint32_t>(splatSet->flags & SplatSetVk::Flags::eNew))
     {
-      LOGD("processVramUpdates: Uploading new splat set to GPU (index=%d, storage=%d, format=%d)\n", splatSet->index,
+      LOGD("processVramUpdates: Uploading new splat set to GPU (index=%zu, storage=%d, format=%d)\n", splatSet->index,
            splatSet->dataStorage, prmData.shFormat);
 
-      // Upload data to GPU
-      splatSet->initDataStorage(prmData.shFormat, prmData.rgbaFormat);
+      // Upload data to GPU (skip covariance in pure RTX — raster-only resource)
+      splatSet->initDataStorage(prmData.shFormat, prmData.rgbaFormat, !m_needsCovarianceData);
 
       descriptorsNeedRebuild = true;
       pendingRequests |= Request::eRebuildBLAS;
@@ -696,10 +769,11 @@ void SplatSetManagerVk::processRamToVramDataUploads(bool& instanceCountChanged, 
       continue;
     if(static_cast<uint32_t>(instance->flags & SplatSetInstanceVk::Flags::eNew))
     {
-      LOGD("processVramUpdates: Adding new instance to descriptors (index=%d)\n", instance->index);
+      LOGD("processVramUpdates: Adding new instance to descriptors (index=%zu)\n", instance->index);
 
-      instanceCountChanged   = true;
-      descriptorsNeedRebuild = true;
+      instance->prevTransform = instance->transform;  // No object motion on first frame
+      instanceCountChanged    = true;
+      descriptorsNeedRebuild  = true;
       instance->flags &= ~SplatSetInstanceVk::Flags::eNew;
     }
   }
@@ -711,12 +785,12 @@ void SplatSetManagerVk::processRamToVramDataUploads(bool& instanceCountChanged, 
       continue;
     if(static_cast<uint32_t>(instance->flags & SplatSetInstanceVk::Flags::eTransformChanged))
     {
-      // Recompute transform matrix from components (UI modified translation/rotation/scale)
+      // Recompute transform matrix from components (ensures transformRotScaleInverse is up-to-date,
+      // as the panel's 5-arg computeTransform overload doesn't compute it)
       computeTransform(instance->scale, instance->rotation, instance->translation, instance->transform,
                        instance->transformInverse, instance->transformRotScaleInverse);
 
       hasTransformChanges = true;
-      instance->flags &= ~SplatSetInstanceVk::Flags::eTransformChanged;
     }
   }
 
@@ -753,14 +827,14 @@ void SplatSetManagerVk::processRamToVramDataUploads(bool& instanceCountChanged, 
       continue;
     if(static_cast<uint32_t>(splatSet->flags & SplatSetVk::Flags::eDataChanged))
     {
-      LOGD("processVramUpdates: Regenerating data storage (index=%d, storage=%d, format=%d)\n", splatSet->index,
+      LOGD("processVramUpdates: Regenerating data storage (index=%zu, storage=%d, format=%d)\n", splatSet->index,
            splatSet->dataStorage, prmData.shFormat);
 
       // Deinitialize old data
       splatSet->deinitDataStorage();
 
-      // Reinitialize with global prmData settings
-      splatSet->initDataStorage(prmData.shFormat, prmData.rgbaFormat);
+      // Reinitialize with global prmData settings (skip covariance in pure RTX)
+      splatSet->initDataStorage(prmData.shFormat, prmData.rgbaFormat, !m_needsCovarianceData);
 
       descriptorsNeedRebuild = true;
       dataStorageRegenerated = true;
@@ -792,7 +866,10 @@ void SplatSetManagerVk::processRamToVramDataUploads(bool& instanceCountChanged, 
 void SplatSetManagerVk::processDescriptorsAndIndexTables(bool descriptorsNeedRebuild)
 {
   // 4a. Rebuild global index tables if needed
-  if(static_cast<uint32_t>(pendingRequests & Request::eUpdateGlobalIndexTable) || m_globalIndexTableDirty)
+  // Explicit eUpdateGlobalIndexTable requests (createInstance, deleteInstance, etc.) always rebuild.
+  // m_globalIndexTableDirty alone only rebuilds when raster needs the table (m_needsGlobalIndexTable),
+  // so that visibility toggles in pure RTX mode skip this work.
+  if(static_cast<uint32_t>(pendingRequests & Request::eUpdateGlobalIndexTable) || (m_globalIndexTableDirty && m_needsGlobalIndexTable))
   {
     LOGD("processVramUpdates: Rebuilding global index tables\n");
 
@@ -802,6 +879,16 @@ void SplatSetManagerVk::processDescriptorsAndIndexTables(bool descriptorsNeedReb
     pendingRequests &= ~Request::eUpdateGlobalIndexTable;
   }
 
+  // transformDirtyCount > 0 triggers additional descriptor uploads for DLSS object motion vectors
+  for(const auto& instance : m_instances)
+  {
+    if(instance && instance->transformDirtyCount > 0)
+    {
+      descriptorsNeedRebuild = true;
+      break;
+    }
+  }
+
   // 4b. Rebuild descriptors if needed
   if(descriptorsNeedRebuild || static_cast<uint32_t>(pendingRequests & Request::eUpdateDescriptors) || m_gpuDescriptorsDirty)
   {
@@ -809,8 +896,44 @@ void SplatSetManagerVk::processDescriptorsAndIndexTables(bool descriptorsNeedReb
 
     updateGpuDescriptorArray();
     uploadGpuDescriptorArray();
+
+    // 4c. Propagate changes (material, transforms, data addresses) to RTX descriptor array.
+    // Phase 3 rebuilds the RTX array from scratch during BLAS/TLAS rebuilds, but when only
+    // descriptors change (e.g. material edit), Phase 3 is skipped. Refresh here to keep
+    // the RTX array in sync with the canonical descriptors.
+    if(m_useSplitBlasRtxDescriptors && !m_gpuRtxDescriptorArray.empty())
+    {
+      refreshRtxDescriptorsFromBase();
+      uploadRtxDescriptorArray();
+    }
+
     m_gpuDescriptorsDirty = false;
     pendingRequests &= ~Request::eUpdateDescriptors;
+
+    // DLSS object motion vectors: decrement counter after each descriptor upload.
+    // Count 2 → 1: uploaded old prevTransform, sync CPU prevTransform = transform for next round.
+    // Count 1 → 0: uploaded prevTransform == transform (zero object motion), clear flag.
+    for(const auto& instance : m_instances)
+    {
+      if(!instance || instance->transformDirtyCount <= 0)
+        continue;
+      instance->transformDirtyCount--;
+      if(instance->transformDirtyCount == 1)
+        instance->prevTransform = instance->transform;
+      if(instance->transformDirtyCount <= 0)
+        instance->flags &= ~SplatSetInstanceVk::Flags::eTransformChanged;
+    }
+
+    // Keep pendingRequests alive if any instance still needs descriptor uploads,
+    // so AssetManagerVk::processVramUpdates calls us again next frame.
+    for(const auto& instance : m_instances)
+    {
+      if(instance && instance->transformDirtyCount > 0)
+      {
+        pendingRequests |= Request::eUpdateDescriptors;
+        break;
+      }
+    }
   }
 }
 
@@ -845,6 +968,14 @@ bool SplatSetManagerVk::processRtxAccelerationStructures(bool processRtx, bool h
     // 3c. TLAS update only (fast path for transform changes)
     else if(static_cast<uint32_t>(pendingRequests & Request::eUpdateTransformsOnly))
     {
+      if(prmRtxData.useTlasInstances)
+      {
+        // Per-particle instanced mode: transforms are NOT baked into TLAS instances, so no TLAS
+        // rebuild/refit is needed. Only update the descriptor arrays (per-instance + per-chunk).
+        // Skip the m_tlasNeedsFullRebuild counter entirely.
+        if(!rtxUpdateTlasTransforms(descriptorsNeedRebuild))
+          return false;
+      }
       // WORKAROUND: Use counter to force multiple rebuilds before allowing update path
       //
       // The update path (cmdUpdateAccelerationStructure/refit) requires the TLAS to be rebuilt
@@ -853,7 +984,7 @@ bool SplatSetManagerVk::processRtxAccelerationStructures(bool processRtx, bool h
       // transforms after copy/import operations.
       //
       // See rtxRebuildBlasAndTlas() for where the counter is initialized.
-      if(m_tlasNeedsFullRebuild > 0)
+      else if(m_tlasNeedsFullRebuild > 0)
       {
         pendingRequests &= ~Request::eUpdateTransformsOnly;
         pendingRequests |= Request::eRebuildTLAS;
@@ -889,6 +1020,7 @@ bool SplatSetManagerVk::processRtxAccelerationStructures(bool processRtx, bool h
 void SplatSetManagerVk::handleRtxBuildFailure(const char* reason)
 {
   LOGE("%s\n", reason);
+  queryVRAMInfo(m_app->getPhysicalDevice());
   for(auto& splatSet : m_splatSets)
   {
     if(splatSet)
@@ -901,6 +1033,14 @@ void SplatSetManagerVk::handleRtxBuildFailure(const char* reason)
   pendingRequests &= ~Request::eRebuildBLAS;
   pendingRequests &= ~Request::eRebuildTLAS;
   pendingRequests &= ~Request::eUpdateTransformsOnly;
+
+  // Raster fallback will need the global index table and up-to-date descriptors.
+  // Enable eagerly so Phase 4 can build/upload them while VRAM freed by the failed
+  // RTX build is still available (before sorting buffers claim it).
+  m_needsGlobalIndexTable = true;
+  m_globalIndexTableDirty = true;
+  pendingRequests |= Request::eUpdateGlobalIndexTable;
+  pendingRequests |= Request::eUpdateDescriptors;
 }
 
 //-----------------------------------------------------------------------------
@@ -910,6 +1050,7 @@ void SplatSetManagerVk::handleRtxBuildFailure(const char* reason)
 void SplatSetManagerVk::clearRtxDescriptorArray()
 {
   m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
   if(m_rtxDescriptorBuffer.buffer != VK_NULL_HANDLE)
   {
     m_alloc->destroyBuffer(m_rtxDescriptorBuffer);
@@ -953,6 +1094,7 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlas()
     m_rtxDescriptorBuffer = {};
   }
   m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
 
   // Early exit if no instances — nothing to build regardless of mode
   if(m_instances.empty())
@@ -1008,7 +1150,8 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlas()
     {
       if(!splatSet)
         continue;
-      const uint32_t maxSplats = computeMaxSplatsPerGpuBlas(prmRtxData.useAABBs, blasFlags, splatSet->splatCount);
+      const uint32_t maxSplats =
+          computeMaxSplatsPerGpuBlas(prmRtxData.useAABBs, prmRtxData.useSpheres, blasFlags, splatSet->splatCount);
       if(maxSplats < splatSet->splatCount)
       {
         needsSplit = true;
@@ -1057,35 +1200,65 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlas()
 }
 
 //-----------------------------------------------------------------------------
+// Per-particle instanced mode: builds one TLAS per unique splat set asset with
+// local-only particle transforms. The per-instance global transform is applied
+// to the ray at trace time by the raygen shader, allowing TLAS reuse.
+//-----------------------------------------------------------------------------
 bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerSplat()
 {
-  // Per-splat TLAS path does not use split-BLAS descriptors.
   clearRtxDescriptorArray();
   m_useGpuBlasForSplatSets = false;
+  m_sharedTlasAssetMap.clear();
 
-  uint64_t totalSplats = 0;
-  for(const auto& instance : m_instances)
+  // Collect unique assets and the first instance index for each
+  struct AssetInfo
   {
-    if(instance && instance->splatSet)
-      totalSplats += instance->splatSet->splatCount;
+    SplatSetVk* asset;
+    uint32_t    firstDescriptorIndex;
+    uint32_t    splatCount;
+    uint32_t    tlasHelperBase;  // Starting index in m_particleAsTlasHelpers
+    uint32_t    tlasChunkCount;  // Number of TLAS chunks for this asset
+  };
+  std::vector<AssetInfo> uniqueAssets;
+
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    SplatSetVk* asset = inst->splatSet.get();
+    if(m_sharedTlasAssetMap.find(asset) == m_sharedTlasAssetMap.end())
+    {
+      m_sharedTlasAssetMap[asset] = uniqueAssets.size();
+      uniqueAssets.push_back({asset, static_cast<uint32_t>(i), asset->splatCount, 0, 0});
+    }
   }
-  const uint32_t maxInstances = static_cast<uint32_t>(m_accelStructProps->maxInstanceCount);
 
-  if(totalSplats == 0)
+  if(uniqueAssets.empty())
   {
-    LOGW("GPU particle AS path disabled (totalSplats=0). RTX disabled.\n");
+    LOGW("GPU particle AS shared TLAS path disabled (no assets). RTX disabled.\n");
     rtxDeinitAccelerationStructures();
     m_rtxState = RtxState::eRtxNone;
     return false;
   }
 
-  LOGD("GPU particle AS build path enabled (mode=%s, totalSplats=%u, maxInstanceCount=%u)\n",
-       prmRtxData.useAABBs ? "AABB" : "Icosahedron", static_cast<uint32_t>(totalSplats), maxInstances);
+  const uint32_t maxInstances = static_cast<uint32_t>(m_accelStructProps->maxInstanceCount);
 
-  // Deinitialize old acceleration structures (both BLAS and TLAS)
+  // Compute chunk counts and TLAS helper indices for each asset
+  uint32_t totalTlasHelpers = 0;
+  for(auto& info : uniqueAssets)
+  {
+    info.tlasChunkCount = (info.splatCount + maxInstances - 1) / maxInstances;
+    info.tlasHelperBase = totalTlasHelpers;
+    totalTlasHelpers += info.tlasChunkCount;
+  }
+
+  LOGI("GPU particle AS shared TLAS build (uniqueAssets=%zu, instances=%zu, tlasChunks=%u)\n", uniqueAssets.size(),
+       m_instances.size(), totalTlasHelpers);
+
   rtxDeinitAccelerationStructures();
 
-  // Ensure global index tables are up to date for GPU instance generation
+  // Rebuild global index tables (still needed for post-trace evaluation in raygen)
   if(static_cast<uint32_t>(pendingRequests & Request::eUpdateGlobalIndexTable) || m_globalIndexTableDirty)
   {
     rebuildGlobalIndexTables();
@@ -1094,18 +1267,27 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerSplat()
     pendingRequests &= ~Request::eUpdateGlobalIndexTable;
   }
 
-  // Ensure GPU descriptor array exists (for splat data addresses and transforms)
+  // Descriptors (first pass — buffer addresses + transforms, blasAddress not yet set)
   updateGpuDescriptorArray();
   uploadGpuDescriptorArray();
   m_gpuDescriptorsDirty = false;
 
-  // Build BLAS (unit AABB or unit icosahedron) on GPU
+  // Build unit BLAS (single AABB, unit icosahedron, or unit sphere) — same as standard per-splat mode
   ParticleAccelerationStructureHelperGpu::BlasCreateInfo blasInfo{};
   if(prmRtxData.useAABBs)
   {
     blasInfo.geometryType   = ParticleAccelerationStructureHelperGpu::GeometryType::eAabbs;
     blasInfo.aabbBufferSize = sizeof(VkAabbPositionsKHR);
     blasInfo.aabbCount      = 1;
+  }
+  else if(prmRtxData.useSpheres)
+  {
+    blasInfo.geometryType     = ParticleAccelerationStructureHelperGpu::GeometryType::eSpheres;
+    blasInfo.vertexBufferSize = sizeof(glm::vec3);
+    blasInfo.radiusBufferSize = sizeof(float);
+    blasInfo.sphereCount      = 1;
+    blasInfo.vertexStride     = sizeof(glm::vec3);
+    blasInfo.vertexFormat     = VK_FORMAT_R32G32B32_SFLOAT;
   }
   else
   {
@@ -1133,8 +1315,9 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerSplat()
     pc.aabbBufferAddress         = m_particleAsHelper.getAabbBufferAddress();
     pc.vertexBufferAddress       = m_particleAsHelper.getVertexBufferAddress();
     pc.indexBufferAddress        = m_particleAsHelper.getIndexBufferAddress();
+    pc.radiusBufferAddress       = m_particleAsHelper.getRadiusBufferAddress();
     pc.instanceCount             = 1;
-    pc.geometryType              = prmRtxData.useAABBs ? 1u : 0u;
+    pc.geometryType              = prmRtxData.useSpheres ? 2u : (prmRtxData.useAABBs ? 1u : 0u);
     pc.writeGeometry             = 1u;
     pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
     pc.kernelMinResponse         = prmRtx.kernelMinResponse;
@@ -1150,90 +1333,150 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerSplat()
   VkResult blasResult = m_particleAsHelper.createBlasOnly(blasInfo, recordComputeBlas);
   if(blasResult != VK_SUCCESS)
   {
-    handleRtxBuildFailure("GPU particle BLAS build failed.");
+    handleRtxBuildFailure("GPU particle BLAS build failed (shared TLAS mode).");
     return false;
   }
 
-  // Build TLAS array (multi-TLAS if needed)
-  const uint64_t tlasCount = (totalSplats + maxInstances - 1) / maxInstances;
-  LOGD("GPU particle AS TLAS build (count=%llu)\n", static_cast<unsigned long long>(tlasCount));
+  // Build TLAS chunks for each unique asset (one or more per asset if splitting needed)
   m_particleAsTlasHelpers.clear();
-  m_particleAsTlasHelpers.resize(tlasCount);
+  m_particleAsTlasHelpers.resize(totalTlasHelpers);
 
   m_rtAccelerationStructures.tlasList.clear();
   m_rtAccelerationStructures.tlasInstancesArrays.clear();
-
-  m_rtAccelerationStructures.tlasCount      = static_cast<uint32_t>(tlasCount);
+  m_rtAccelerationStructures.tlasCount      = totalTlasHelpers;
   m_rtAccelerationStructures.totalSizeBytes = 0;
 
-  std::vector<uint64_t> tlasAddresses(tlasCount);
-  std::vector<uint32_t> tlasOffsets(tlasCount);
-
-  for(uint64_t tlasIdx = 0; tlasIdx < tlasCount; ++tlasIdx)
+  for(size_t assetIdx = 0; assetIdx < uniqueAssets.size(); ++assetIdx)
   {
-    uint32_t baseIndex     = static_cast<uint32_t>(tlasIdx * maxInstances);
-    uint32_t instanceCount = static_cast<uint32_t>(std::min<uint64_t>(maxInstances, totalSplats - baseIndex));
+    const auto& assetInfo = uniqueAssets[assetIdx];
 
-    auto& tlasHelper = m_particleAsTlasHelpers[tlasIdx];
-    tlasHelper.init(m_alloc, m_app->getQueue(0));
-
-    ParticleAccelerationStructureHelperGpu::TlasCreateInfo tlasInfo{};
-    tlasInfo.instanceCount = instanceCount;
-    tlasInfo.tlasBuildFlags =
-        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-
-    auto recordComputeTlas = [&](VkCommandBuffer cmd) {
-      if(m_particleAsComputePipeline == VK_NULL_HANDLE || m_particleAsPipelineLayout == VK_NULL_HANDLE)
-        return;
-
-      shaderio::ParticleAsBuildPushConstants pc{};
-      pc.splatSetDescriptorAddress = getGPUDescriptorArrayAddress();
-      pc.globalIndexTableAddress   = getGlobalIndexTableAddress();
-      pc.tlasInstanceBufferAddress = tlasHelper.getInstanceBufferAddress();
-      pc.aabbBufferAddress         = m_particleAsHelper.getAabbBufferAddress();
-      pc.blasAddress               = m_particleAsHelper.getBlas().address;
-      pc.vertexBufferAddress       = m_particleAsHelper.getVertexBufferAddress();
-      pc.indexBufferAddress        = m_particleAsHelper.getIndexBufferAddress();
-      pc.instanceCount             = instanceCount;
-      pc.instanceBaseIndex         = baseIndex;
-      pc.geometryType              = prmRtxData.useAABBs ? 1u : 0u;
-      pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
-      pc.kernelMinResponse         = prmRtx.kernelMinResponse;
-      pc.kernelAdaptiveClamping    = prmRtx.kernelAdaptiveClamping ? 1u : 0u;
-
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsComputePipeline);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsPipelineLayout, 0, 1,
-                              &m_particleAsDescriptorSet, 0, nullptr);
-      vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-
-      const uint32_t groupCount = (instanceCount + 255) / 256;
-      vkCmdDispatch(cmd, groupCount, 1, 1);
-    };
-
-    VkResult tlasResult = tlasHelper.createTlasOnly(tlasInfo, recordComputeTlas);
-    if(tlasResult != VK_SUCCESS)
+    for(uint32_t chunkIdx = 0; chunkIdx < assetInfo.tlasChunkCount; ++chunkIdx)
     {
-      handleRtxBuildFailure("GPU particle TLAS build failed.");
-      return false;
-    }
+      const uint32_t chunkBase  = chunkIdx * maxInstances;
+      const uint32_t chunkCount = std::min(maxInstances, assetInfo.splatCount - chunkBase);
+      const uint32_t helperIdx  = assetInfo.tlasHelperBase + chunkIdx;
 
-    tlasAddresses[tlasIdx] = tlasHelper.getTlas().address;
-    tlasOffsets[tlasIdx]   = baseIndex;
-    m_rtAccelerationStructures.totalSizeBytes += tlasHelper.getTlas().buffer.bufferSize;
+      auto& tlasHelper = m_particleAsTlasHelpers[helperIdx];
+      tlasHelper.init(m_alloc, m_app->getQueue(0));
+
+      ParticleAccelerationStructureHelperGpu::TlasCreateInfo tlasInfo{};
+      tlasInfo.instanceCount = chunkCount;
+      tlasInfo.tlasBuildFlags =
+          VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_LOW_MEMORY_BIT_KHR;
+
+      auto recordComputeTlas = [&](VkCommandBuffer cmd) {
+        if(m_particleAsComputePipeline == VK_NULL_HANDLE || m_particleAsPipelineLayout == VK_NULL_HANDLE)
+          return;
+
+        shaderio::ParticleAsBuildPushConstants pc{};
+        pc.splatSetDescriptorAddress = getGPUDescriptorArrayAddress();
+        pc.tlasInstanceBufferAddress = tlasHelper.getInstanceBufferAddress();
+        pc.aabbBufferAddress         = m_particleAsHelper.getAabbBufferAddress();
+        pc.blasAddress               = m_particleAsHelper.getBlas().address;
+        pc.vertexBufferAddress       = m_particleAsHelper.getVertexBufferAddress();
+        pc.indexBufferAddress        = m_particleAsHelper.getIndexBufferAddress();
+        pc.radiusBufferAddress       = m_particleAsHelper.getRadiusBufferAddress();
+        pc.instanceCount             = chunkCount;
+        pc.instanceBaseIndex         = chunkBase;
+        pc.instanceMode              = 2u;  // Shared TLAS: local transform only
+        pc.splatSetDescIndex         = assetInfo.firstDescriptorIndex;
+        pc.geometryType              = prmRtxData.useSpheres ? 2u : (prmRtxData.useAABBs ? 1u : 0u);
+        pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
+        pc.kernelMinResponse         = prmRtx.kernelMinResponse;
+        pc.kernelAdaptiveClamping    = prmRtx.kernelAdaptiveClamping ? 1u : 0u;
+        // Billboard bounding requires: billboard depth AND (AABBs OR stochastic any-hit)
+        bool billboardBoundingAllowed = (prmRtx.particleDepth == PARTICLE_DEPTH_BILLBOARD)
+                                        && (prmRtxData.useAABBs || prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
+        pc.billboardBoundingMode = billboardBoundingAllowed ? static_cast<uint32_t>(prmRtxData.billboardBoundingMode) : 0u;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsComputePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsPipelineLayout, 0, 1,
+                                &m_particleAsDescriptorSet, 0, nullptr);
+        vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+        const uint32_t groupCount = (chunkCount + 255) / 256;
+        vkCmdDispatch(cmd, groupCount, 1, 1);
+      };
+
+      VkResult tlasResult = tlasHelper.createTlasOnly(tlasInfo, recordComputeTlas);
+      if(tlasResult != VK_SUCCESS)
+      {
+        handleRtxBuildFailure("GPU particle shared TLAS build failed.");
+        return false;
+      }
+
+      // Release scratch and instance buffers immediately after each chunk's TLAS build.
+      // createTlasOnly() submits and waits, so these buffers are no longer in use.
+      // Releasing eagerly avoids accumulating N chunks' worth of build buffers in VRAM
+      // before later chunks can allocate their own.
+      tlasHelper.releaseTlasBuildBuffers();
+
+      m_rtAccelerationStructures.totalSizeBytes += tlasHelper.getTlas().buffer.bufferSize;
+    }
   }
 
+  // Update per-instance descriptors with the TLAS address of the first chunk (for non-chunked access)
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    auto it = m_sharedTlasAssetMap.find(inst->splatSet.get());
+    if(it != m_sharedTlasAssetMap.end())
+    {
+      const auto& assetInfo               = uniqueAssets[it->second];
+      m_gpuDescriptorArray[i].blasAddress = m_particleAsTlasHelpers[assetInfo.tlasHelperBase].getTlas().address;
+    }
+  }
+  uploadGpuDescriptorArray();
+
+  // Build per-chunk RTX descriptor array: one entry per (instance × chunk).
+  // The raygen iterates over this array; each entry has per-instance transform + per-chunk TLAS address.
+  m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    auto it = m_sharedTlasAssetMap.find(inst->splatSet.get());
+    if(it == m_sharedTlasAssetMap.end())
+      continue;
+    const auto& assetInfo = uniqueAssets[it->second];
+
+    for(uint32_t chunkIdx = 0; chunkIdx < assetInfo.tlasChunkCount; ++chunkIdx)
+    {
+      const uint32_t         helperIdx = assetInfo.tlasHelperBase + chunkIdx;
+      shaderio::SplatSetDesc desc      = m_gpuDescriptorArray[i];
+      desc.blasAddress                 = m_particleAsTlasHelpers[helperIdx].getTlas().address;
+      desc.splatBase                   = chunkIdx * maxInstances;
+      m_gpuRtxDescriptorArray.push_back(desc);
+      m_rtxToBaseDescriptorMap.push_back(static_cast<uint32_t>(i));
+    }
+  }
+
+  uploadRtxDescriptorArray();
+
+  // We don't need the TLAS address/offset arrays for shared TLAS mode (raygen reads from descriptors),
+  // but we still allocate minimal buffers to avoid null dereference in SceneAssets population.
   if(m_rtAccelerationStructures.tlasAddressBuffer.buffer != VK_NULL_HANDLE)
     m_alloc->destroyBuffer(m_rtAccelerationStructures.tlasAddressBuffer);
   if(m_rtAccelerationStructures.tlasOffsetBuffer.buffer != VK_NULL_HANDLE)
     m_alloc->destroyBuffer(m_rtAccelerationStructures.tlasOffsetBuffer);
 
-  const VkDeviceSize tlasAddressBufferSize = tlasCount * sizeof(uint64_t);
+  // Populate TLAS address/offset buffers (not used by shared TLAS shader path, but keeps SceneAssets consistent)
+  std::vector<uint64_t> tlasAddresses(totalTlasHelpers);
+  std::vector<uint32_t> tlasOffsets(totalTlasHelpers, 0);
+  for(uint32_t i = 0; i < totalTlasHelpers; ++i)
+    tlasAddresses[i] = m_particleAsTlasHelpers[i].getTlas().address;
+
+  const VkDeviceSize tlasAddressBufferSize = totalTlasHelpers * sizeof(uint64_t);
   NVVK_CHECK(m_alloc->createBuffer(m_rtAccelerationStructures.tlasAddressBuffer, tlasAddressBufferSize,
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
   NVVK_DBG_NAME(m_rtAccelerationStructures.tlasAddressBuffer.buffer);
 
-  const VkDeviceSize tlasOffsetBufferSize = tlasCount * sizeof(uint32_t);
+  const VkDeviceSize tlasOffsetBufferSize = totalTlasHelpers * sizeof(uint32_t);
   NVVK_CHECK(m_alloc->createBuffer(m_rtAccelerationStructures.tlasOffsetBuffer, tlasOffsetBufferSize,
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
@@ -1246,7 +1489,6 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerSplat()
   m_app->submitAndWaitTempCmdBuffer(uploadCmd);
   m_uploader->releaseStaging();
 
-  // Update per-splat set status (single BLAS used for all instances)
   for(auto& splatSet : m_splatSets)
   {
     if(splatSet)
@@ -1295,12 +1537,21 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceSingleBlas(VkBuildAccele
     ParticleAccelerationStructureHelperGpu::BlasCreateInfo blasInfo{};
     const uint32_t                                         splatCount = splatSet->splatCount;
     LOGD("GPU particle BLAS build (per-splat-set, splatSet=%zu, splats=%u, mode=%s)\n", splatSetIdx, splatCount,
-         prmRtxData.useAABBs ? "AABB" : "Icosahedron");
+         prmRtxData.useSpheres ? "Sphere" : (prmRtxData.useAABBs ? "AABB" : "Icosahedron"));
     if(prmRtxData.useAABBs)
     {
       blasInfo.geometryType   = ParticleAccelerationStructureHelperGpu::GeometryType::eAabbs;
       blasInfo.aabbBufferSize = sizeof(VkAabbPositionsKHR) * splatCount;
       blasInfo.aabbCount      = splatCount;
+    }
+    else if(prmRtxData.useSpheres)
+    {
+      blasInfo.geometryType     = ParticleAccelerationStructureHelperGpu::GeometryType::eSpheres;
+      blasInfo.vertexBufferSize = sizeof(glm::vec3) * splatCount;
+      blasInfo.radiusBufferSize = sizeof(float) * splatCount;
+      blasInfo.sphereCount      = splatCount;
+      blasInfo.vertexStride     = sizeof(glm::vec3);
+      blasInfo.vertexFormat     = VK_FORMAT_R32G32B32_SFLOAT;
     }
     else
     {
@@ -1323,22 +1574,28 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceSingleBlas(VkBuildAccele
       pc.aabbBufferAddress         = blasHelper.getAabbBufferAddress();
       pc.vertexBufferAddress       = blasHelper.getVertexBufferAddress();
       pc.indexBufferAddress        = blasHelper.getIndexBufferAddress();
+      pc.radiusBufferAddress       = blasHelper.getRadiusBufferAddress();
       pc.instanceCount             = splatCount;
       pc.instanceBaseIndex         = static_cast<uint32_t>(splatSetIdx);
-      pc.geometryType              = prmRtxData.useAABBs ? 1u : 0u;
+      pc.geometryType              = prmRtxData.useSpheres ? 2u : (prmRtxData.useAABBs ? 1u : 0u);
       pc.writeGeometry             = 1u;
       pc.geometryMode              = 2u;
       pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
       pc.kernelMinResponse         = prmRtx.kernelMinResponse;
       pc.kernelAdaptiveClamping    = prmRtx.kernelAdaptiveClamping ? 1u : 0u;
+      {
+        bool billboardBoundingAllowed = (prmRtx.particleDepth == PARTICLE_DEPTH_BILLBOARD)
+                                        && (prmRtxData.useAABBs || prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
+        pc.billboardBoundingMode = billboardBoundingAllowed ? static_cast<uint32_t>(prmRtxData.billboardBoundingMode) : 0u;
+      }
 
       vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsComputePipeline);
       vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsPipelineLayout, 0, 1,
                               &m_particleAsDescriptorSet, 0, nullptr);
       vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-      const uint32_t totalVerts = prmRtxData.useAABBs ? splatCount : (splatCount * 12);
-      const uint32_t totalInds  = prmRtxData.useAABBs ? 0u : (splatCount * 60);
+      const uint32_t totalVerts = (prmRtxData.useAABBs || prmRtxData.useSpheres) ? splatCount : (splatCount * 12);
+      const uint32_t totalInds  = (prmRtxData.useAABBs || prmRtxData.useSpheres) ? 0u : (splatCount * 60);
       const uint32_t totalCount = totalVerts > totalInds ? totalVerts : totalInds;
       const uint32_t groupCount = (totalCount + 255) / 256;
       vkCmdDispatch(cmd, groupCount, 1, 1);
@@ -1506,7 +1763,7 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
     if(!splatSet)
       continue;
     const uint32_t splatCount       = splatSet->splatCount;
-    const uint32_t maxSplatsPerBlas = computeMaxSplatsPerGpuBlas(prmRtxData.useAABBs, blasFlags, splatCount);
+    const uint32_t maxSplatsPerBlas = computeMaxSplatsPerGpuBlas(prmRtxData.useAABBs, prmRtxData.useSpheres, blasFlags, splatCount);
     const uint32_t chunkCount       = (splatCount + maxSplatsPerBlas - 1) / maxSplatsPerBlas;
     totalChunkCount += chunkCount;
   }
@@ -1519,7 +1776,7 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
       continue;
 
     const uint32_t splatCount       = splatSet->splatCount;
-    const uint32_t maxSplatsPerBlas = computeMaxSplatsPerGpuBlas(prmRtxData.useAABBs, blasFlags, splatCount);
+    const uint32_t maxSplatsPerBlas = computeMaxSplatsPerGpuBlas(prmRtxData.useAABBs, prmRtxData.useSpheres, blasFlags, splatCount);
     const uint32_t chunkCount       = (splatCount + maxSplatsPerBlas - 1) / maxSplatsPerBlas;
 
     LOGD("GPU particle BLAS split (splatSet=%zu, splats=%u, maxSplatsPerBLAS=%u, chunks=%u)\n", splatSetIdx, splatCount,
@@ -1549,6 +1806,15 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
         blasInfo.aabbBufferSize = sizeof(VkAabbPositionsKHR) * chunkCountSplats;
         blasInfo.aabbCount      = chunkCountSplats;
       }
+      else if(prmRtxData.useSpheres)
+      {
+        blasInfo.geometryType     = ParticleAccelerationStructureHelperGpu::GeometryType::eSpheres;
+        blasInfo.vertexBufferSize = sizeof(glm::vec3) * chunkCountSplats;
+        blasInfo.radiusBufferSize = sizeof(float) * chunkCountSplats;
+        blasInfo.sphereCount      = chunkCountSplats;
+        blasInfo.vertexStride     = sizeof(glm::vec3);
+        blasInfo.vertexFormat     = VK_FORMAT_R32G32B32_SFLOAT;
+      }
       else
       {
         blasInfo.geometryType     = ParticleAccelerationStructureHelperGpu::GeometryType::eTriangles;
@@ -1563,8 +1829,9 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
 
       // --- VRAM budget pre-check: bail out before GPU build if insufficient free VRAM ---
       {
-        auto         blasSizes     = estimateBlasBuildSizes(prmRtxData.useAABBs, blasFlags, chunkCountSplats);
-        VkDeviceSize geometrySize  = blasInfo.aabbBufferSize + blasInfo.vertexBufferSize + blasInfo.indexBufferSize;
+        auto blasSizes = estimateBlasBuildSizes(prmRtxData.useAABBs, prmRtxData.useSpheres, blasFlags, chunkCountSplats);
+        VkDeviceSize geometrySize =
+            blasInfo.aabbBufferSize + blasInfo.vertexBufferSize + blasInfo.indexBufferSize + blasInfo.radiusBufferSize;
         VkDeviceSize estimatedPeak = geometrySize + blasSizes.accelerationStructureSize + blasSizes.buildScratchSize;
 
         VRAMSummary  vram     = queryVRAMSummary(m_app->getPhysicalDevice());
@@ -1596,10 +1863,11 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
         pc.aabbBufferAddress         = chunk.helper.getAabbBufferAddress();
         pc.vertexBufferAddress       = chunk.helper.getVertexBufferAddress();
         pc.indexBufferAddress        = chunk.helper.getIndexBufferAddress();
+        pc.radiusBufferAddress       = chunk.helper.getRadiusBufferAddress();
         pc.instanceCount             = chunkCountSplats;
         pc.instanceBaseIndex         = static_cast<uint32_t>(splatSetIdx);
         pc.splatBaseIndex            = chunkBase;
-        pc.geometryType              = prmRtxData.useAABBs ? 1u : 0u;
+        pc.geometryType              = prmRtxData.useSpheres ? 2u : (prmRtxData.useAABBs ? 1u : 0u);
         pc.writeGeometry             = 1u;
         pc.geometryMode              = 2u;
         pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
@@ -1611,8 +1879,8 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
                                 &m_particleAsDescriptorSet, 0, nullptr);
         vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
 
-        const uint32_t totalVerts = prmRtxData.useAABBs ? chunkCountSplats : (chunkCountSplats * 12);
-        const uint32_t totalInds  = prmRtxData.useAABBs ? 0u : (chunkCountSplats * 60);
+        const uint32_t totalVerts = (prmRtxData.useAABBs || prmRtxData.useSpheres) ? chunkCountSplats : (chunkCountSplats * 12);
+        const uint32_t totalInds  = (prmRtxData.useAABBs || prmRtxData.useSpheres) ? 0u : (chunkCountSplats * 60);
         const uint32_t totalCount = totalVerts > totalInds ? totalVerts : totalInds;
         const uint32_t groupCount = (totalCount + 255) / 256;
         vkCmdDispatch(cmd, groupCount, 1, 1);
@@ -1640,6 +1908,7 @@ bool SplatSetManagerVk::rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAcceler
   // Build per-TLAS-instance RTX descriptor array (one descriptor per BLAS chunk).
   // This removes the need for descIndex/globalOffset mapping buffers.
   m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
 
   // Build/upload RTX descriptor array for the split-BLAS path.
   rebuildRtxDescriptorArrayFromChunks();
@@ -1821,15 +2090,51 @@ bool SplatSetManagerVk::rtxRebuildTlas()
 }
 
 //-----------------------------------------------------------------------------
+// Per-particle instanced TLAS rebuild: one TLAS per unique asset, local-only
+// transforms. BLAS already exists. Rebuilds TLASes from current particle data.
+//-----------------------------------------------------------------------------
 bool SplatSetManagerVk::rtxRebuildTlasPerSplat()
 {
-  LOGD("GPU AS TLAS rebuild (per-splat)\n");
+  m_sharedTlasAssetMap.clear();
 
-  const uint32_t totalSplats  = getTotalGlobalSplatCount();
+  struct AssetInfo
+  {
+    SplatSetVk* asset;
+    uint32_t    firstDescriptorIndex;
+    uint32_t    splatCount;
+    uint32_t    tlasHelperBase;
+    uint32_t    tlasChunkCount;
+  };
+  std::vector<AssetInfo> uniqueAssets;
+
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    SplatSetVk* asset = inst->splatSet.get();
+    if(m_sharedTlasAssetMap.find(asset) == m_sharedTlasAssetMap.end())
+    {
+      m_sharedTlasAssetMap[asset] = uniqueAssets.size();
+      uniqueAssets.push_back({asset, static_cast<uint32_t>(i), asset->splatCount, 0, 0});
+    }
+  }
+
+  if(uniqueAssets.empty())
+    return true;
+
   const uint32_t maxInstances = static_cast<uint32_t>(m_accelStructProps->maxInstanceCount);
-  const uint64_t tlasCount    = (totalSplats + maxInstances - 1) / maxInstances;
 
-  // Ensure global index tables are up to date for GPU instance generation
+  uint32_t totalTlasHelpers = 0;
+  for(auto& info : uniqueAssets)
+  {
+    info.tlasChunkCount = (info.splatCount + maxInstances - 1) / maxInstances;
+    info.tlasHelperBase = totalTlasHelpers;
+    totalTlasHelpers += info.tlasChunkCount;
+  }
+
+  LOGI("GPU AS TLAS rebuild (per-splat shared, uniqueAssets=%zu, tlasChunks=%u)\n", uniqueAssets.size(), totalTlasHelpers);
+
   if(static_cast<uint32_t>(pendingRequests & Request::eUpdateGlobalIndexTable) || m_globalIndexTableDirty)
   {
     rebuildGlobalIndexTables();
@@ -1838,7 +2143,6 @@ bool SplatSetManagerVk::rtxRebuildTlasPerSplat()
     pendingRequests &= ~Request::eUpdateGlobalIndexTable;
   }
 
-  // Ensure GPU descriptor array exists (for splat data addresses and transforms)
   updateGpuDescriptorArray();
   uploadGpuDescriptorArray();
   m_gpuDescriptorsDirty = false;
@@ -1849,82 +2153,137 @@ bool SplatSetManagerVk::rtxRebuildTlasPerSplat()
     tlasHelper.deinit();
   }
   m_particleAsTlasHelpers.clear();
-  m_particleAsTlasHelpers.resize(tlasCount);
+  m_particleAsTlasHelpers.resize(totalTlasHelpers);
 
   m_rtAccelerationStructures.tlasList.clear();
   m_rtAccelerationStructures.tlasInstancesArrays.clear();
-  m_rtAccelerationStructures.tlasCount      = static_cast<uint32_t>(tlasCount);
+  m_rtAccelerationStructures.tlasCount      = totalTlasHelpers;
   m_rtAccelerationStructures.totalSizeBytes = 0;
 
-  std::vector<uint64_t> tlasAddresses(tlasCount);
-  std::vector<uint32_t> tlasOffsets(tlasCount);
-
-  for(uint64_t tlasIdx = 0; tlasIdx < tlasCount; ++tlasIdx)
+  for(size_t assetIdx = 0; assetIdx < uniqueAssets.size(); ++assetIdx)
   {
-    uint32_t baseIndex     = static_cast<uint32_t>(tlasIdx * maxInstances);
-    uint32_t instanceCount = static_cast<uint32_t>(std::min<uint64_t>(maxInstances, totalSplats - baseIndex));
+    const auto& assetInfo = uniqueAssets[assetIdx];
 
-    auto& tlasHelper = m_particleAsTlasHelpers[tlasIdx];
-    tlasHelper.init(m_alloc, m_app->getQueue(0));
-
-    ParticleAccelerationStructureHelperGpu::TlasCreateInfo tlasInfo{};
-    tlasInfo.instanceCount = instanceCount;
-    tlasInfo.tlasBuildFlags =
-        VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
-
-    auto recordComputeTlas = [&](VkCommandBuffer cmd) {
-      if(m_particleAsComputePipeline == VK_NULL_HANDLE || m_particleAsPipelineLayout == VK_NULL_HANDLE)
-        return;
-
-      shaderio::ParticleAsBuildPushConstants pc{};
-      pc.splatSetDescriptorAddress = getGPUDescriptorArrayAddress();
-      pc.globalIndexTableAddress   = getGlobalIndexTableAddress();
-      pc.tlasInstanceBufferAddress = tlasHelper.getInstanceBufferAddress();
-      pc.aabbBufferAddress         = m_particleAsHelper.getAabbBufferAddress();
-      pc.blasAddress               = m_particleAsHelper.getBlas().address;
-      pc.vertexBufferAddress       = m_particleAsHelper.getVertexBufferAddress();
-      pc.indexBufferAddress        = m_particleAsHelper.getIndexBufferAddress();
-      pc.instanceCount             = instanceCount;
-      pc.instanceBaseIndex         = baseIndex;
-      pc.geometryType              = prmRtxData.useAABBs ? 1u : 0u;
-      pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
-      pc.kernelMinResponse         = prmRtx.kernelMinResponse;
-      pc.kernelAdaptiveClamping    = prmRtx.kernelAdaptiveClamping ? 1u : 0u;
-
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsComputePipeline);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsPipelineLayout, 0, 1,
-                              &m_particleAsDescriptorSet, 0, nullptr);
-      vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-
-      const uint32_t groupCount = (instanceCount + 255) / 256;
-      vkCmdDispatch(cmd, groupCount, 1, 1);
-    };
-
-    VkResult tlasResult = tlasHelper.createTlasOnly(tlasInfo, recordComputeTlas);
-    if(tlasResult != VK_SUCCESS)
+    for(uint32_t chunkIdx = 0; chunkIdx < assetInfo.tlasChunkCount; ++chunkIdx)
     {
-      LOGE("GPU particle TLAS rebuild failed: %s\n", string_VkResult(tlasResult));
-      m_rtxState = RtxState::eRtxError;
-      return false;
-    }
+      const uint32_t chunkBase  = chunkIdx * maxInstances;
+      const uint32_t chunkCount = std::min(maxInstances, assetInfo.splatCount - chunkBase);
+      const uint32_t helperIdx  = assetInfo.tlasHelperBase + chunkIdx;
 
-    tlasAddresses[tlasIdx] = tlasHelper.getTlas().address;
-    tlasOffsets[tlasIdx]   = baseIndex;
-    m_rtAccelerationStructures.totalSizeBytes += tlasHelper.getTlas().buffer.bufferSize;
+      auto& tlasHelper = m_particleAsTlasHelpers[helperIdx];
+      tlasHelper.init(m_alloc, m_app->getQueue(0));
+
+      ParticleAccelerationStructureHelperGpu::TlasCreateInfo tlasInfo{};
+      tlasInfo.instanceCount  = chunkCount;
+      tlasInfo.tlasBuildFlags = VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
+                                | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR;
+
+      auto recordComputeTlas = [&](VkCommandBuffer cmd) {
+        if(m_particleAsComputePipeline == VK_NULL_HANDLE || m_particleAsPipelineLayout == VK_NULL_HANDLE)
+          return;
+
+        shaderio::ParticleAsBuildPushConstants pc{};
+        pc.splatSetDescriptorAddress = getGPUDescriptorArrayAddress();
+        pc.tlasInstanceBufferAddress = tlasHelper.getInstanceBufferAddress();
+        pc.aabbBufferAddress         = m_particleAsHelper.getAabbBufferAddress();
+        pc.blasAddress               = m_particleAsHelper.getBlas().address;
+        pc.vertexBufferAddress       = m_particleAsHelper.getVertexBufferAddress();
+        pc.indexBufferAddress        = m_particleAsHelper.getIndexBufferAddress();
+        pc.radiusBufferAddress       = m_particleAsHelper.getRadiusBufferAddress();
+        pc.instanceCount             = chunkCount;
+        pc.instanceBaseIndex         = chunkBase;
+        pc.instanceMode              = 2u;
+        pc.splatSetDescIndex         = assetInfo.firstDescriptorIndex;
+        pc.geometryType              = prmRtxData.useSpheres ? 2u : (prmRtxData.useAABBs ? 1u : 0u);
+        pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
+        pc.kernelMinResponse         = prmRtx.kernelMinResponse;
+        pc.kernelAdaptiveClamping    = prmRtx.kernelAdaptiveClamping ? 1u : 0u;
+        // Billboard bounding requires: billboard depth AND (AABBs OR stochastic any-hit)
+        bool billboardBoundingAllowed = (prmRtx.particleDepth == PARTICLE_DEPTH_BILLBOARD)
+                                        && (prmRtxData.useAABBs || prmRtx.rtxTraceStrategy == RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
+        pc.billboardBoundingMode = billboardBoundingAllowed ? static_cast<uint32_t>(prmRtxData.billboardBoundingMode) : 0u;
+
+        vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsComputePipeline);
+        vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsPipelineLayout, 0, 1,
+                                &m_particleAsDescriptorSet, 0, nullptr);
+        vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
+
+        const uint32_t groupCount = (chunkCount + 255) / 256;
+        vkCmdDispatch(cmd, groupCount, 1, 1);
+      };
+
+      VkResult tlasResult = tlasHelper.createTlasOnly(tlasInfo, recordComputeTlas);
+      if(tlasResult != VK_SUCCESS)
+      {
+        handleRtxBuildFailure("GPU particle shared TLAS rebuild failed.");
+        return false;
+      }
+
+      tlasHelper.releaseTlasBuildBuffers();
+
+      m_rtAccelerationStructures.totalSizeBytes += tlasHelper.getTlas().buffer.bufferSize;
+    }
   }
 
+  // Update per-instance descriptors
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    auto it = m_sharedTlasAssetMap.find(inst->splatSet.get());
+    if(it != m_sharedTlasAssetMap.end())
+    {
+      const auto& assetInfo               = uniqueAssets[it->second];
+      m_gpuDescriptorArray[i].blasAddress = m_particleAsTlasHelpers[assetInfo.tlasHelperBase].getTlas().address;
+    }
+  }
+  uploadGpuDescriptorArray();
+
+  // Build per-chunk RTX descriptor array
+  m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    auto it = m_sharedTlasAssetMap.find(inst->splatSet.get());
+    if(it == m_sharedTlasAssetMap.end())
+      continue;
+    const auto& assetInfo = uniqueAssets[it->second];
+
+    for(uint32_t chunkIdx = 0; chunkIdx < assetInfo.tlasChunkCount; ++chunkIdx)
+    {
+      const uint32_t         helperIdx = assetInfo.tlasHelperBase + chunkIdx;
+      shaderio::SplatSetDesc desc      = m_gpuDescriptorArray[i];
+      desc.blasAddress                 = m_particleAsTlasHelpers[helperIdx].getTlas().address;
+      desc.splatBase                   = chunkIdx * maxInstances;
+      m_gpuRtxDescriptorArray.push_back(desc);
+      m_rtxToBaseDescriptorMap.push_back(static_cast<uint32_t>(i));
+    }
+  }
+
+  uploadRtxDescriptorArray();
+
+  // Update TLAS address/offset buffers
   if(m_rtAccelerationStructures.tlasAddressBuffer.buffer != VK_NULL_HANDLE)
     m_alloc->destroyBuffer(m_rtAccelerationStructures.tlasAddressBuffer);
   if(m_rtAccelerationStructures.tlasOffsetBuffer.buffer != VK_NULL_HANDLE)
     m_alloc->destroyBuffer(m_rtAccelerationStructures.tlasOffsetBuffer);
 
-  const VkDeviceSize tlasAddressBufferSize = tlasCount * sizeof(uint64_t);
+  std::vector<uint64_t> tlasAddresses(totalTlasHelpers);
+  std::vector<uint32_t> tlasOffsets(totalTlasHelpers, 0);
+  for(uint32_t i = 0; i < totalTlasHelpers; ++i)
+    tlasAddresses[i] = m_particleAsTlasHelpers[i].getTlas().address;
+
+  const VkDeviceSize tlasAddressBufferSize = totalTlasHelpers * sizeof(uint64_t);
   NVVK_CHECK(m_alloc->createBuffer(m_rtAccelerationStructures.tlasAddressBuffer, tlasAddressBufferSize,
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
   NVVK_DBG_NAME(m_rtAccelerationStructures.tlasAddressBuffer.buffer);
 
-  const VkDeviceSize tlasOffsetBufferSize = tlasCount * sizeof(uint32_t);
+  const VkDeviceSize tlasOffsetBufferSize = totalTlasHelpers * sizeof(uint32_t);
   NVVK_CHECK(m_alloc->createBuffer(m_rtAccelerationStructures.tlasOffsetBuffer, tlasOffsetBufferSize,
                                    VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT,
                                    VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE));
@@ -1936,6 +2295,15 @@ bool SplatSetManagerVk::rtxRebuildTlasPerSplat()
   m_uploader->cmdUploadAppended(uploadCmd);
   m_app->submitAndWaitTempCmdBuffer(uploadCmd);
   m_uploader->releaseStaging();
+
+  memRaytracing.usedTlas             = m_rtAccelerationStructures.totalSizeBytes;
+  memRaytracing.tlasInstancesBuffers = 0;
+  memRaytracing.tlasScratchBuffers   = 0;
+  for(const auto& tlasHelper : m_particleAsTlasHelpers)
+  {
+    memRaytracing.tlasInstancesBuffers += tlasHelper.getInstanceBufferSize();
+    memRaytracing.tlasScratchBuffers += tlasHelper.getTlasScratchBufferSize();
+  }
 
   return true;
 }
@@ -2063,14 +2431,15 @@ bool SplatSetManagerVk::rtxUpdateTlasTransforms(bool& descriptorsNeedRebuild)
     return true;
   }
 
-  // Refresh descriptor array (transforms) if needed — common to all paths
+  // Refresh descriptor array (transforms) if needed — common to all paths.
+  // Counter decrement is NOT done here; Phase 4 handles it exclusively to avoid
+  // double-decrement (this function returns true → Phase 4 runs in the same frame).
   if(descriptorsNeedRebuild || static_cast<uint32_t>(pendingRequests & Request::eUpdateDescriptors) || m_gpuDescriptorsDirty)
   {
     LOGD("GPU AS TLAS update: refreshing descriptor array\n");
     updateGpuDescriptorArray();
     uploadGpuDescriptorArray();
-    m_gpuDescriptorsDirty = false;
-    pendingRequests &= ~Request::eUpdateDescriptors;
+    m_gpuDescriptorsDirty  = false;
     descriptorsNeedRebuild = false;
   }
 
@@ -2088,12 +2457,12 @@ bool SplatSetManagerVk::rtxUpdateTlasTransforms(bool& descriptorsNeedRebuild)
       result = rtxUpdateTlasPerInstanceSingleBlas();
   }
 
-  if(result)
+  if(result && !prmRtxData.useTlasInstances)
   {
-    // CRITICAL: Wait for device idle after TLAS update
+    // Wait for device idle after TLAS update (non-instanced modes only).
     // Ensures all GPU work is complete before returning control to main loop.
-    // Without this, continuous dragging can cause the GPU to fall behind, leading to
-    // race conditions and progressive performance degradation.
+    // Per-particle instanced mode skips this because it doesn't modify the TLAS — only
+    // descriptor buffers are updated, and those uploads already synchronize via submitAndWaitTempCmdBuffer.
     vkDeviceWaitIdle(m_app->getDevice());
   }
 
@@ -2102,72 +2471,100 @@ bool SplatSetManagerVk::rtxUpdateTlasTransforms(bool& descriptorsNeedRebuild)
 }
 
 //-----------------------------------------------------------------------------
+// Per-particle instanced mode: transform-only update. Since the global transform is
+// NOT baked into TLAS instances, no TLAS rebuild/update is needed. The descriptors
+// (which carry the per-instance transforms) have already been refreshed by the caller.
+//-----------------------------------------------------------------------------
 bool SplatSetManagerVk::rtxUpdateTlasPerSplat()
 {
-  // Ensure RTX does not use a stale split-BLAS descriptor array in per-splat TLAS mode.
-  // Even though chunks don't exist in per-splat mode, calling this ensures proper cleanup:
-  // clears m_gpuRtxDescriptorArray, destroys m_rtxDescriptorBuffer if it exists, and sets
-  // m_useSplitBlasRtxDescriptors = false.
-  rebuildRtxDescriptorArrayFromChunks();
-  LOGD("GPU AS TLAS update (per-splat, count=%zu)\n", m_particleAsTlasHelpers.size());
+  LOGD("GPU AS TLAS update (per-splat shared) — no TLAS work needed, updating descriptors\n");
 
-  // Note: Global index tables and TLAS address/offset buffers are not updated here because:
-  // - A rebuild always happens before any update (copy/import triggers eRebuildBLAS)
-  // - The rebuild path already updates global index tables and creates TLAS address/offset buffers
-  // - During a refit (update), only instance transforms change; TLAS addresses remain the same
-  // - Therefore, these buffers are already correct and don't need to be refreshed
-
-  const uint32_t totalSplats  = getTotalGlobalSplatCount();
-  const uint32_t maxInstances = static_cast<uint32_t>(m_accelStructProps->maxInstanceCount);
-  if(totalSplats == 0)
-    return true;
-
-  for(size_t tlasIdx = 0; tlasIdx < m_particleAsTlasHelpers.size(); ++tlasIdx)
+  // Collect unique assets for chunk info (needed to rebuild RTX descriptor array)
+  struct AssetInfo
   {
-    uint32_t baseIndex     = static_cast<uint32_t>(tlasIdx * maxInstances);
-    uint32_t instanceCount = static_cast<uint32_t>(std::min<uint64_t>(maxInstances, totalSplats - baseIndex));
+    SplatSetVk* asset;
+    uint32_t    tlasHelperBase;
+    uint32_t    tlasChunkCount;
+  };
+  std::vector<AssetInfo> uniqueAssets;
+  const uint32_t         maxInstances = static_cast<uint32_t>(m_accelStructProps->maxInstanceCount);
 
-    if(instanceCount == 0)
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
       continue;
+    SplatSetVk* asset = inst->splatSet.get();
+    auto        it    = m_sharedTlasAssetMap.find(asset);
+    if(it != m_sharedTlasAssetMap.end() && it->second == uniqueAssets.size())
+      continue;  // Already added
+    if(it != m_sharedTlasAssetMap.end())
+      continue;
+  }
 
-    auto& tlasHelper    = m_particleAsTlasHelpers[tlasIdx];
-    auto  recordCompute = [&](VkCommandBuffer cmd) {
-      if(m_particleAsComputePipeline == VK_NULL_HANDLE || m_particleAsPipelineLayout == VK_NULL_HANDLE)
-        return;
+  // Use existing m_sharedTlasAssetMap to rebuild RTX descriptors with updated transforms
+  // Rebuild per-instance descriptors' blasAddress
+  std::unordered_map<SplatSetVk*, uint32_t> assetChunkCounts;
+  std::unordered_map<SplatSetVk*, uint32_t> assetHelperBases;
 
-      shaderio::ParticleAsBuildPushConstants pc{};
-      pc.splatSetDescriptorAddress = getGPUDescriptorArrayAddress();
-      pc.globalIndexTableAddress   = getGlobalIndexTableAddress();
-      pc.tlasInstanceBufferAddress = tlasHelper.getInstanceBufferAddress();
-      pc.aabbBufferAddress         = m_particleAsHelper.getAabbBufferAddress();
-      pc.blasAddress               = m_particleAsHelper.getBlas().address;
-      pc.vertexBufferAddress       = m_particleAsHelper.getVertexBufferAddress();
-      pc.indexBufferAddress        = m_particleAsHelper.getIndexBufferAddress();
-      pc.instanceCount             = instanceCount;
-      pc.instanceBaseIndex         = baseIndex;
-      pc.geometryType              = prmRtxData.useAABBs ? 1u : 0u;
-      pc.kernelDegree              = static_cast<uint32_t>(prmRtx.kernelDegree);
-      pc.kernelMinResponse         = prmRtx.kernelMinResponse;
-      pc.kernelAdaptiveClamping    = prmRtx.kernelAdaptiveClamping ? 1u : 0u;
-
-      vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsComputePipeline);
-      vkCmdBindDescriptorSets(cmd, VK_PIPELINE_BIND_POINT_COMPUTE, m_particleAsPipelineLayout, 0, 1,
-                               &m_particleAsDescriptorSet, 0, nullptr);
-      vkCmdPushConstants(cmd, m_particleAsPipelineLayout, VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(pc), &pc);
-
-      const uint32_t groupCount = (instanceCount + 255) / 256;
-      vkCmdDispatch(cmd, groupCount, 1, 1);
-    };
-
-    // Check for errors from updateTlasOnly
-    VkResult updateResult = tlasHelper.updateTlasOnly(recordCompute);
-    if(updateResult != VK_SUCCESS)
+  // Reconstruct chunk info from existing TLAS helpers
+  {
+    uint32_t                              helperIdx = 0;
+    std::unordered_map<SplatSetVk*, bool> seen;
+    for(size_t i = 0; i < m_instances.size(); ++i)
     {
-      LOGE("GPU particle TLAS update failed: %s\n", string_VkResult(updateResult));
-      m_rtxState = RtxState::eRtxError;
-      return false;
+      auto& inst = m_instances[i];
+      if(!inst || !inst->splatSet)
+        continue;
+      SplatSetVk* asset = inst->splatSet.get();
+      if(seen.count(asset))
+        continue;
+      seen[asset] = true;
+
+      uint32_t chunkCount     = (asset->splatCount + maxInstances - 1) / maxInstances;
+      assetChunkCounts[asset] = chunkCount;
+      assetHelperBases[asset] = helperIdx;
+      helperIdx += chunkCount;
     }
   }
+
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    SplatSetVk* asset = inst->splatSet.get();
+    auto        it    = assetHelperBases.find(asset);
+    if(it != assetHelperBases.end())
+    {
+      m_gpuDescriptorArray[i].blasAddress = m_particleAsTlasHelpers[it->second].getTlas().address;
+    }
+  }
+  uploadGpuDescriptorArray();
+
+  // Rebuild per-chunk RTX descriptor array with updated transforms
+  m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
+  for(size_t i = 0; i < m_instances.size(); ++i)
+  {
+    auto& inst = m_instances[i];
+    if(!inst || !inst->splatSet)
+      continue;
+    SplatSetVk* asset      = inst->splatSet.get();
+    uint32_t    chunkCount = assetChunkCounts[asset];
+    uint32_t    helperBase = assetHelperBases[asset];
+
+    for(uint32_t chunkIdx = 0; chunkIdx < chunkCount; ++chunkIdx)
+    {
+      shaderio::SplatSetDesc desc = m_gpuDescriptorArray[i];
+      desc.blasAddress            = m_particleAsTlasHelpers[helperBase + chunkIdx].getTlas().address;
+      desc.splatBase              = chunkIdx * maxInstances;
+      m_gpuRtxDescriptorArray.push_back(desc);
+      m_rtxToBaseDescriptorMap.push_back(static_cast<uint32_t>(i));
+    }
+  }
+
+  uploadRtxDescriptorArray();
 
   return true;
 }
@@ -2301,6 +2698,163 @@ VkDeviceAddress SplatSetManagerVk::getSplatSetGlobalIndexTableAddress() const
   return m_splatSetGlobalIndexTableBuffer.address;
 }
 
+void SplatSetManagerVk::setNeedsGlobalIndexTable(bool needs)
+{
+  if(m_needsGlobalIndexTable == needs)
+    return;
+
+  m_needsGlobalIndexTable = needs;
+
+  if(needs)
+  {
+    // Transitioning to hybrid/raster: mark table dirty so it gets rebuilt
+    m_globalIndexTableDirty = true;
+    pendingRequests |= Request::eUpdateGlobalIndexTable;
+    LOGI("Global index table: enabled (hybrid/raster pipeline active)\n");
+  }
+  else
+  {
+    LOGI("Global index table: disabled (pure RTX pipeline active)\n");
+  }
+}
+
+void SplatSetManagerVk::releaseGlobalIndexTableBuffers()
+{
+  if(m_globalIndexTableBuffer.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyLargeBuffer(m_globalIndexTableBuffer);
+    m_globalIndexTableBuffer = {};
+  }
+  if(m_splatSetGlobalIndexTableBuffer.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyLargeBuffer(m_splatSetGlobalIndexTableBuffer);
+    m_splatSetGlobalIndexTableBuffer = {};
+  }
+
+  m_globalIndexTable.clear();
+  m_splatSetGlobalIndexTable.clear();
+
+  memModels.globalIndexTableBuffer   = 0;
+  memModels.splatSetIndexTableBuffer = 0;
+
+  LOGI("Released global index table GPU buffers\n");
+}
+
+void SplatSetManagerVk::setNeedsCovarianceData(bool needs)
+{
+  m_needsCovarianceData = needs;
+}
+
+void SplatSetManagerVk::updateBindingSplatTextures(VkDescriptorSet descriptorSet)
+{
+  if(descriptorSet == VK_NULL_HANDLE)
+    return;
+
+  std::vector<VkDescriptorImageInfo> textureDescriptors;
+
+  for(const auto& splatSet : m_splatSets)
+  {
+    if(!splatSet)
+      continue;
+
+    if(splatSet->dataStorage == STORAGE_TEXTURES)
+    {
+      // Push order must match SplatTexIndex enum (shaderio.h):
+      // centers, scales, rotations, colors, SH, [covariances]
+      textureDescriptors.push_back(splatSet->centersMap.descriptor);
+      textureDescriptors.push_back(splatSet->scalesMap.descriptor);
+      textureDescriptors.push_back(splatSet->rotationsMap.descriptor);
+      textureDescriptors.push_back(splatSet->colorsMap.descriptor);
+      textureDescriptors.push_back(splatSet->sphericalHarmonicsMap.descriptor);
+      if(splatSet->hasCovarianceTexture())
+        textureDescriptors.push_back(splatSet->covariancesMap.descriptor);
+    }
+  }
+
+  if(!textureDescriptors.empty())
+  {
+    VkWriteDescriptorSet writeSet{};
+    writeSet.sType            = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+    writeSet.dstSet           = descriptorSet;
+    writeSet.dstBinding       = BINDING_SPLAT_TEXTURES;
+    writeSet.dstArrayElement  = 0;
+    writeSet.descriptorCount  = static_cast<uint32_t>(textureDescriptors.size());
+    writeSet.descriptorType   = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER;
+    writeSet.pImageInfo       = textureDescriptors.data();
+    writeSet.pBufferInfo      = nullptr;
+    writeSet.pTexelBufferView = nullptr;
+
+    vkUpdateDescriptorSets(m_alloc->getDevice(), 1, &writeSet, 0, nullptr);
+  }
+}
+
+void SplatSetManagerVk::releaseCovarianceData()
+{
+  if(m_covarianceDataReleased)
+    return;
+
+  uint64_t freedBytes = 0;
+  for(auto& splatSet : m_splatSets)
+  {
+    if(!splatSet)
+      continue;
+    freedBytes += splatSet->memoryStats.deviceAllocCov;
+    splatSet->deinitCovarianceBuffer();
+    splatSet->deinitCovarianceTexture();
+  }
+  m_covarianceDataReleased = true;
+
+  m_gpuDescriptorsDirty = true;
+  pendingRequests |= Request::eUpdateDescriptors;
+  updateConsolidatedMemoryStats();
+
+  LOGI("Released covariance data (freed %.1f MB VRAM)\n", freedBytes / (1024.0 * 1024.0));
+}
+
+void SplatSetManagerVk::allocateCovarianceData()
+{
+  if(!m_covarianceDataReleased)
+    return;
+
+  uint64_t allocBytes = 0;
+  for(auto& splatSet : m_splatSets)
+  {
+    if(!splatSet)
+      continue;
+    if(splatSet->dataStorage == STORAGE_BUFFERS)
+      splatSet->initCovarianceBuffer();
+    else
+      splatSet->initCovarianceTexture();
+    allocBytes += splatSet->memoryStats.deviceAllocCov;
+  }
+  m_covarianceDataReleased = false;
+
+  m_gpuDescriptorsDirty = true;
+  pendingRequests |= Request::eUpdateDescriptors;
+  updateConsolidatedMemoryStats();
+
+  LOGI("Allocated covariance data (%.1f MB VRAM)\n", allocBytes / (1024.0 * 1024.0));
+}
+
+uint32_t SplatSetManagerVk::getPendingGlobalSplatCount() const
+{
+  uint32_t total = 0;
+  for(const auto& instance : m_instances)
+  {
+    if(!instance || !instance->splatSet || !instance->shouldRender())
+      continue;
+    total += instance->splatSet->splatCount;
+  }
+  return total;
+}
+
+uint32_t SplatSetManagerVk::getEffectiveGlobalSplatCount() const
+{
+  if(m_totalGlobalSplatCount > 0)
+    return m_totalGlobalSplatCount;
+  return getPendingGlobalSplatCount();
+}
+
 void SplatSetManagerVk::rebuildGlobalIndexTables()
 {
   SCOPED_TIMER(std::string(__FUNCTION__) + "\n");
@@ -2325,13 +2879,16 @@ void SplatSetManagerVk::rebuildGlobalIndexTables()
   {
     if(!instance || !instance->splatSet)
       continue;
+    if(!instance->shouldRender())
+    {
+      ++splatSetIdx;  // Keep descriptor array alignment
+      continue;
+    }
     m_instanceInfos.push_back({splatSetIdx, instance->splatSet->splatCount, totalSplats});
     totalSplats += instance->splatSet->splatCount;
     ++splatSetIdx;
   }
 
-  // Resize tables to exact size (avoids repeated push_back reallocations)
-  m_globalIndexTable.resize(totalSplats);
   m_splatSetGlobalIndexTable.resize(m_instanceInfos.size());
   m_totalGlobalSplatCount = totalSplats;
 
@@ -2340,6 +2897,19 @@ void SplatSetManagerVk::rebuildGlobalIndexTables()
   {
     m_splatSetGlobalIndexTable[i] = m_instanceInfos[i].globalOffset;
   }
+
+  // Skip building the per-splat table when pure RTX (not needed; saves memory and CPU time).
+  // The resize of m_globalIndexTable is deferred to below to avoid a multi-GB CPU allocation
+  // that would be immediately discarded (e.g. 2.5B splats × 8B = ~20 GB).
+  if(!m_needsGlobalIndexTable)
+  {
+    m_globalIndexTable.clear();
+    LOGD("Global Index Tables: offsets only (pure RTX), %zu instances, %u total splats\n", m_instances.size(), m_totalGlobalSplatCount);
+    return;
+  }
+
+  // Resize per-splat table (only when actually needed)
+  m_globalIndexTable.resize(totalSplats);
 
   // Third pass: fill globalIndexTable in parallel (one parallel batch per instance)
   for(const auto& info : m_instanceInfos)
@@ -2362,35 +2932,43 @@ void SplatSetManagerVk::rebuildGlobalIndexTables()
 void SplatSetManagerVk::uploadGlobalIndexTablesToGPU()
 {
   // CRITICAL: Destroy old buffers BEFORE creating new ones to avoid address reuse issues
-  // These are large buffers (~400 MB each for 100M splats), same as sorting buffers
+  // These are LargeBuffers (sparse-backed) to support >4GB allocations (e.g. 1.9B splats × 8B = ~15GB)
   if(m_globalIndexTableBuffer.buffer != VK_NULL_HANDLE)
   {
-    m_alloc->destroyBuffer(m_globalIndexTableBuffer);
+    m_alloc->destroyLargeBuffer(m_globalIndexTableBuffer);
   }
   if(m_splatSetGlobalIndexTableBuffer.buffer != VK_NULL_HANDLE)
   {
-    m_alloc->destroyBuffer(m_splatSetGlobalIndexTableBuffer);
+    m_alloc->destroyLargeBuffer(m_splatSetGlobalIndexTableBuffer);
   }
 
   m_globalIndexTableBuffer         = {};
   m_splatSetGlobalIndexTableBuffer = {};
+
+  // Pure RTX: table not needed, just release buffers (already destroyed above)
+  if(!m_needsGlobalIndexTable)
+  {
+    memModels.globalIndexTableBuffer   = 0;
+    memModels.splatSetIndexTableBuffer = 0;
+    return;
+  }
+
+  VkQueue sparseQueue = m_app->getQueue(0).queue;
 
   // Upload globalIndexTable
   if(!m_globalIndexTable.empty())
   {
     VkDeviceSize requiredSize = m_globalIndexTable.size() * sizeof(GlobalSplatIndexEntry);
 
-    NVVK_CHECK(m_alloc->createBuffer(m_globalIndexTableBuffer, requiredSize,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
+    NVVK_CHECK(m_alloc->createLargeBuffer(m_globalIndexTableBuffer, requiredSize,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, sparseQueue));
 
-    // Upload data
     VkCommandBuffer cmdBuf = m_app->createTempCmdBuffer();
-    NVVK_CHECK(m_uploader->appendBuffer(m_globalIndexTableBuffer, 0, std::span(m_globalIndexTable)));
+    NVVK_CHECK(m_uploader->appendLargeBuffer(m_globalIndexTableBuffer, 0, std::span(m_globalIndexTable)));
     m_uploader->cmdUploadAppended(cmdBuf);
     m_app->submitAndWaitTempCmdBuffer(cmdBuf);
     m_uploader->releaseStaging();
 
-    // Track memory
     memModels.globalIndexTableBuffer = requiredSize;
   }
   else
@@ -2403,17 +2981,15 @@ void SplatSetManagerVk::uploadGlobalIndexTablesToGPU()
   {
     VkDeviceSize requiredSize = m_splatSetGlobalIndexTable.size() * sizeof(uint32_t);
 
-    NVVK_CHECK(m_alloc->createBuffer(m_splatSetGlobalIndexTableBuffer, requiredSize,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
+    NVVK_CHECK(m_alloc->createLargeBuffer(m_splatSetGlobalIndexTableBuffer, requiredSize,
+                                          VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT, sparseQueue));
 
-    // Upload data
     VkCommandBuffer cmdBuf = m_app->createTempCmdBuffer();
-    NVVK_CHECK(m_uploader->appendBuffer(m_splatSetGlobalIndexTableBuffer, 0, std::span(m_splatSetGlobalIndexTable)));
+    NVVK_CHECK(m_uploader->appendLargeBuffer(m_splatSetGlobalIndexTableBuffer, 0, std::span(m_splatSetGlobalIndexTable)));
     m_uploader->cmdUploadAppended(cmdBuf);
     m_app->submitAndWaitTempCmdBuffer(cmdBuf);
     m_uploader->releaseStaging();
 
-    // Track memory
     memModels.splatSetIndexTableBuffer = requiredSize;
   }
   else
@@ -2421,100 +2997,282 @@ void SplatSetManagerVk::uploadGlobalIndexTablesToGPU()
     memModels.splatSetIndexTableBuffer = 0;
   }
 
-  // Update sorting buffers (same lifetime as global index tables)
-  // Check if we need to resize sorting buffers
-  if(m_totalGlobalSplatCount != m_sortingBuffersAllocatedCount)
+  // Resize sorting buffers when splat count changed.
+  // Skip if sorting buffers were explicitly freed by releaseSortingBuffers() (pure RTX mode) —
+  // releaseUnusedBuffers / updateSortingBuffers in gaussian_splatting.cpp manage that lifecycle.
+  if(!m_sortingBuffersReleased && m_totalGlobalSplatCount != m_sortingBuffersAllocatedCount)
   {
-    LOGD("Updating sorting buffers (%u -> %u splats)\n", m_sortingBuffersAllocatedCount, m_totalGlobalSplatCount);
+    updateSortingBuffers(m_createVrdxSorter);
+  }
+}
 
-    // Destroy old VRDX sorter first (must be destroyed before buffers)
-    if(m_splatSortingVrdxSorter != VK_NULL_HANDLE)
+//-----------------------------------------------------------------------------
+void SplatSetManagerVk::releaseSortingBuffers()
+{
+  if(m_sortingBuffersAllocatedCount == 0)
+  {
+    m_sortingBuffersReleased = true;
+    return;
+  }
+
+  LOGI("Releasing sorting buffers (%u splats)\n", m_sortingBuffersAllocatedCount);
+
+  if(m_splatSortingVrdxSorter != VK_NULL_HANDLE)
+  {
+    vrdxDestroySorter(m_splatSortingVrdxSorter);
+    m_splatSortingVrdxSorter = VK_NULL_HANDLE;
+  }
+  if(m_splatSortingIndicesHost.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyBuffer(m_splatSortingIndicesHost);
+    m_splatSortingIndicesHost = {};
+  }
+  if(m_splatSortingIndicesDevice.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyLargeBuffer(m_splatSortingIndicesDevice);
+    m_splatSortingIndicesDevice = {};
+  }
+  if(m_splatSortingDistancesDevice.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyLargeBuffer(m_splatSortingDistancesDevice);
+    m_splatSortingDistancesDevice = {};
+  }
+  if(m_splatSortingVrdxStorageBuffer.buffer != VK_NULL_HANDLE)
+  {
+    m_alloc->destroyLargeBuffer(m_splatSortingVrdxStorageBuffer);
+    m_splatSortingVrdxStorageBuffer = {};
+  }
+
+  memRasterization.hostAllocIndices        = 0;
+  memRasterization.hostAllocDistances      = 0;
+  memRasterization.deviceAllocIndices      = 0;
+  memRasterization.deviceAllocDistances    = 0;
+  memRasterization.deviceAllocVrdxInternal = 0;
+
+  m_sortingBuffersAllocatedCount = 0;
+  m_sortingBuffersReleased       = true;
+  m_cpuSortIndicesOnGpu          = false;
+}
+
+//-----------------------------------------------------------------------------
+bool SplatSetManagerVk::ensureSortingBackend(bool createVrdxSorter, bool* backendChanged)
+{
+  if(backendChanged)
+    *backendChanged = false;
+
+  m_createVrdxSorter = createVrdxSorter;
+
+  if(m_totalGlobalSplatCount == 0)
+    return true;
+
+  if(m_sortingBuffersAllocatedCount != m_totalGlobalSplatCount || m_sortingBuffersReleased)
+  {
+    const bool ok = updateSortingBuffers(createVrdxSorter);
+    if(ok && backendChanged)
+      *backendChanged = true;
+    return ok;
+  }
+
+  const bool hasVrdx = m_splatSortingVrdxSorter != VK_NULL_HANDLE;
+  if(createVrdxSorter == hasVrdx)
+    return true;
+
+  if(createVrdxSorter && !hasVrdx)
+  {
+    LOGI("Creating VRDX sorter for existing sorting buffers (%u splats)\n", m_totalGlobalSplatCount);
+
+    VkQueue              sparseQueue = m_app->getQueue(0).queue;
+    VrdxSorterCreateInfo gpuSorterInfo{.physicalDevice = m_app->getPhysicalDevice(), .device = m_app->getDevice()};
+    vrdxCreateSorter(&gpuSorterInfo, &m_splatSortingVrdxSorter);
+
+    VrdxSorterStorageRequirements requirements{};
+    vrdxGetSorterKeyValueStorageRequirements(m_splatSortingVrdxSorter, m_totalGlobalSplatCount, &requirements);
+
+    const VkResult result =
+        m_alloc->createLargeBuffer(m_splatSortingVrdxStorageBuffer, requirements.size, requirements.usage, sparseQueue);
+    if(result != VK_SUCCESS)
     {
+      LOGE("VRDX storage allocation failed (%llu bytes).\n", static_cast<unsigned long long>(requirements.size));
       vrdxDestroySorter(m_splatSortingVrdxSorter);
       m_splatSortingVrdxSorter = VK_NULL_HANDLE;
+      return false;
     }
 
-    if(m_splatSortingIndicesHost.buffer != VK_NULL_HANDLE)
-    {
-      m_alloc->destroyBuffer(m_splatSortingIndicesHost);
-    }
-    if(m_splatSortingIndicesDevice.buffer != VK_NULL_HANDLE)
-    {
-      m_alloc->destroyLargeBuffer(m_splatSortingIndicesDevice);
-    }
-    if(m_splatSortingDistancesDevice.buffer != VK_NULL_HANDLE)
-    {
-      m_alloc->destroyLargeBuffer(m_splatSortingDistancesDevice);
-    }
+    memRasterization.deviceAllocVrdxInternal = requirements.size;
+    if(backendChanged)
+      *backendChanged = true;
+    return true;
+  }
+
+  if(!createVrdxSorter && hasVrdx)
+  {
+    LOGI("Destroying VRDX sorter (switching away from GPU radix sort)\n");
+    vrdxDestroySorter(m_splatSortingVrdxSorter);
+    m_splatSortingVrdxSorter = VK_NULL_HANDLE;
     if(m_splatSortingVrdxStorageBuffer.buffer != VK_NULL_HANDLE)
     {
       m_alloc->destroyLargeBuffer(m_splatSortingVrdxStorageBuffer);
+      m_splatSortingVrdxStorageBuffer = {};
     }
-
-    m_splatSortingIndicesHost       = {};
-    m_splatSortingIndicesDevice     = {};
-    m_splatSortingDistancesDevice   = {};
-    m_splatSortingVrdxStorageBuffer = {};
-
-    // Create new sorting buffers if we have splats
-    if(m_totalGlobalSplatCount > 0)
-    {
-      const VkDeviceSize minBufferSize = 16;  // Minimum allocation (avoid 0-size buffers)
-      const VkDeviceSize bufferSize =
-          m_totalGlobalSplatCount > 0 ? ((m_totalGlobalSplatCount * sizeof(uint32_t) + 15) / 16) * 16 : minBufferSize;
-
-      // Host buffer for CPU sorting (mapped, host visible)
-      NVVK_CHECK(m_alloc->createBuffer(m_splatSortingIndicesHost, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
-                                       VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT));
-
-      // Device indices buffer (used by shaders and CPU/GPU sorting)
-      VkQueue sparseQueue = m_app->getQueue(0).queue;
-      NVVK_CHECK(m_alloc->createLargeBuffer(m_splatSortingIndicesDevice, bufferSize,
-                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                                                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                            sparseQueue));
-
-      // Device distances buffer (written by dist.comp.slang)
-      NVVK_CHECK(m_alloc->createLargeBuffer(m_splatSortingDistancesDevice, bufferSize,
-                                            VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
-                                                | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
-                                            sparseQueue));
-
-      // Create VRDX sorter
-      VrdxSorterCreateInfo gpuSorterInfo{.physicalDevice = m_app->getPhysicalDevice(), .device = m_app->getDevice()};
-      vrdxCreateSorter(&gpuSorterInfo, &m_splatSortingVrdxSorter);
-
-      // Create VRDX storage buffer
-      const uint32_t                vrdxSplatCount = m_totalGlobalSplatCount;  // VRDX uses uint32_t
-      VrdxSorterStorageRequirements requirements;
-      vrdxGetSorterKeyValueStorageRequirements(m_splatSortingVrdxSorter, vrdxSplatCount, &requirements);
-
-      NVVK_CHECK(m_alloc->createLargeBuffer(m_splatSortingVrdxStorageBuffer, requirements.size, requirements.usage, sparseQueue));
-
-      LOGD("Created sorting buffers: %llu bytes each, VRDX storage: %llu bytes\n",
-           static_cast<unsigned long long>(bufferSize), static_cast<unsigned long long>(requirements.size));
-
-      // Update sorting memory statistics (allocation sizes)
-      memRasterization.hostAllocIndices        = bufferSize;
-      memRasterization.hostAllocDistances      = 0;  // Distances not on host
-      memRasterization.deviceAllocIndices      = bufferSize;
-      memRasterization.deviceAllocDistances    = bufferSize;
-      memRasterization.deviceAllocVrdxInternal = requirements.size;
-
-      // Usage will be updated per-frame by updateRenderingMemoryStatistics()
-    }
-    else
-    {
-      // No splats: clear statistics
-      memRasterization.hostAllocIndices        = 0;
-      memRasterization.hostAllocDistances      = 0;
-      memRasterization.deviceAllocIndices      = 0;
-      memRasterization.deviceAllocDistances    = 0;
-      memRasterization.deviceAllocVrdxInternal = 0;
-    }
-
-    m_sortingBuffersAllocatedCount = m_totalGlobalSplatCount;
+    memRasterization.deviceAllocVrdxInternal = 0;
+    if(backendChanged)
+      *backendChanged = true;
   }
+
+  return true;
+}
+
+//-----------------------------------------------------------------------------
+bool SplatSetManagerVk::updateSortingBuffers(bool createVrdxSorter)
+{
+  if(m_totalGlobalSplatCount == 0)
+    return true;
+
+  if(m_sortingBuffersAllocatedCount == m_totalGlobalSplatCount && !m_sortingBuffersReleased)
+    return ensureSortingBackend(createVrdxSorter);
+
+  LOGI("Reallocating sorting buffers for %u splats\n", m_totalGlobalSplatCount);
+
+  releaseSortingBuffers();
+
+  // Buffer size used for the device indices/distances buffers (and host staging).
+  //
+  // VRDX binds these buffers as the radix-sort keys/values with a descriptor range of
+  // AlignSize(count * 4, minStorageBufferOffsetAlignment) (see InoutSize in vk_radix_sort.cc).
+  // Sizing the allocation to that same queried alignment keeps the bound range within the buffer on
+  // every device: e.g. Intel Arc reports minStorageBufferOffsetAlignment == 64, where a 16-byte
+  // padding would be too small and trigger VUID-VkDescriptorBufferInfo-range-00342; NVIDIA/AMD
+  // typically report 16/32, matching the previous behavior. std::max with 16 keeps the historical
+  // floor for tiny/empty scenes.
+  VkPhysicalDeviceProperties physicalDeviceProperties{};
+  vkGetPhysicalDeviceProperties(m_app->getPhysicalDevice(), &physicalDeviceProperties);
+  const VkDeviceSize storageAlignment = std::max<VkDeviceSize>(16, physicalDeviceProperties.limits.minStorageBufferOffsetAlignment);
+  const VkDeviceSize minBufferSize = storageAlignment;
+  const VkDeviceSize bufferSize =
+      m_totalGlobalSplatCount > 0 ?
+          ((m_totalGlobalSplatCount * sizeof(uint32_t) + storageAlignment - 1) / storageAlignment) * storageAlignment :
+          minBufferSize;
+
+  VkQueue  sparseQueue = m_app->getQueue(0).queue;
+  VkResult result      = VK_SUCCESS;
+
+  // Host buffer is only needed for CPU sorting (memcpy of sorted indices).
+  // Skip when bufferSize exceeds maxMemoryAllocationSize — CPU sorting is impractical
+  // at that scale anyway (GPU VRDX sorting handles it).
+  if(bufferSize <= m_alloc->getMaxMemoryAllocationSize())
+  {
+    result = m_alloc->createBuffer(m_splatSortingIndicesHost, bufferSize, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                   VMA_MEMORY_USAGE_AUTO_PREFER_HOST,
+                                   VMA_ALLOCATION_CREATE_MAPPED_BIT | VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+    if(result != VK_SUCCESS)
+    {
+      LOGE("Sorting buffer allocation failed (host indices, %llu bytes).\n", static_cast<unsigned long long>(bufferSize));
+      queryVRAMInfo(m_app->getPhysicalDevice());
+      releaseSortingBuffers();
+      return false;
+    }
+  }
+  else
+  {
+    LOGI("Skipping host sorting buffer allocation (%llu bytes > maxMemoryAllocationSize) — CPU sorting disabled, GPU sorting only.\n",
+         static_cast<unsigned long long>(bufferSize));
+  }
+
+  result = m_alloc->createLargeBuffer(m_splatSortingIndicesDevice, bufferSize,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                          | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                      sparseQueue);
+  if(result != VK_SUCCESS)
+  {
+    LOGE("Sorting buffer allocation failed (device indices, %llu bytes).\n", static_cast<unsigned long long>(bufferSize));
+    queryVRAMInfo(m_app->getPhysicalDevice());
+    releaseSortingBuffers();
+    return false;
+  }
+
+  result = m_alloc->createLargeBuffer(m_splatSortingDistancesDevice, bufferSize,
+                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                          | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+                                      sparseQueue);
+  if(result != VK_SUCCESS)
+  {
+    LOGE("Sorting buffer allocation failed (device distances, %llu bytes).\n", static_cast<unsigned long long>(bufferSize));
+    queryVRAMInfo(m_app->getPhysicalDevice());
+    releaseSortingBuffers();
+    return false;
+  }
+
+  VrdxSorterCreateInfo gpuSorterInfo{.physicalDevice = m_app->getPhysicalDevice(), .device = m_app->getDevice()};
+  VkDeviceSize         vrdxStorageSize = 0;
+
+  if(createVrdxSorter)
+  {
+    vrdxCreateSorter(&gpuSorterInfo, &m_splatSortingVrdxSorter);
+
+    const uint32_t                vrdxSplatCount = m_totalGlobalSplatCount;
+    VrdxSorterStorageRequirements requirements;
+    vrdxGetSorterKeyValueStorageRequirements(m_splatSortingVrdxSorter, vrdxSplatCount, &requirements);
+    vrdxStorageSize = requirements.size;
+
+    result = m_alloc->createLargeBuffer(m_splatSortingVrdxStorageBuffer, requirements.size, requirements.usage, sparseQueue);
+    if(result != VK_SUCCESS)
+    {
+      LOGE("Sorting buffer allocation failed (VRDX storage, %llu bytes).\n",
+           static_cast<unsigned long long>(requirements.size));
+      queryVRAMInfo(m_app->getPhysicalDevice());
+      releaseSortingBuffers();
+      return false;
+    }
+  }
+
+  memRasterization.hostAllocIndices        = m_splatSortingIndicesHost.bufferSize;
+  memRasterization.hostAllocDistances      = 0;
+  memRasterization.deviceAllocIndices      = bufferSize;
+  memRasterization.deviceAllocDistances    = bufferSize;
+  memRasterization.deviceAllocVrdxInternal = vrdxStorageSize;
+
+  if(createVrdxSorter)
+  {
+    LOGI("Created sorting buffers: %llu bytes each, VRDX storage: %llu bytes\n",
+         static_cast<unsigned long long>(bufferSize), static_cast<unsigned long long>(vrdxStorageSize));
+  }
+  else
+  {
+    LOGI("Created sorting buffers: %llu bytes each (CPU sort, no VRDX)\n", static_cast<unsigned long long>(bufferSize));
+  }
+
+  // Seed identity indices whenever the host staging buffer exists. Required for CPU
+  // sort before the async sorter's first result, and as a safe draw order for the
+  // frame before the first GPU dist+radix pass (avoids reading uninitialized IDs).
+  if(m_splatSortingIndicesHost.buffer != VK_NULL_HANDLE)
+  {
+    m_splatIndices.resize(m_totalGlobalSplatCount);
+    uint32_t* hostIdx = reinterpret_cast<uint32_t*>(m_splatSortingIndicesHost.mapping);
+    for(uint32_t i = 0; i < m_totalGlobalSplatCount; ++i)
+    {
+      m_splatIndices[i] = i;
+      hostIdx[i]        = i;
+    }
+
+    const VkDeviceSize copySize = m_totalGlobalSplatCount * sizeof(uint32_t);
+    VkCommandBuffer    cmdBuf   = m_app->createTempCmdBuffer();
+    VkBufferCopy       bc{.srcOffset = 0, .dstOffset = 0, .size = copySize};
+    vkCmdCopyBuffer(cmdBuf, m_splatSortingIndicesHost.buffer, m_splatSortingIndicesDevice.buffer, 1, &bc);
+
+    VkMemoryBarrier barrier{VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmdBuf, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT
+                             | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT,
+                         0, 1, &barrier, 0, nullptr, 0, nullptr);
+    m_app->submitAndWaitTempCmdBuffer(cmdBuf);
+    m_cpuSortIndicesOnGpu = true;
+  }
+
+  m_sortingBuffersAllocatedCount = m_totalGlobalSplatCount;
+  m_sortingBuffersReleased       = false;
+  return true;
 }
 
 //-----------------------------------------------------------------------------
@@ -2568,12 +3326,18 @@ void SplatSetManagerVk::updateGpuDescriptorArray()
       if(splatSet->dataStorage == STORAGE_TEXTURES)
       {
         // This splat set uses textures - assign actual indices
-        splatSet->textureIndexCenters     = splatSetTextureIdx * 6 + 0;
-        splatSet->textureIndexScales      = splatSetTextureIdx * 6 + 1;
-        splatSet->textureIndexRotations   = splatSetTextureIdx * 6 + 2;
-        splatSet->textureIndexColors      = splatSetTextureIdx * 6 + 3;
-        splatSet->textureIndexCovariances = splatSetTextureIdx * 6 + 4;
-        splatSet->textureIndexSH          = splatSetTextureIdx * 6 + 5;
+        splatSet->textureIndexCenters =
+            splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexCenters);
+        splatSet->textureIndexScales =
+            splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexScales);
+        splatSet->textureIndexRotations =
+            splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexRotations);
+        splatSet->textureIndexColors =
+            splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexColors);
+        splatSet->textureIndexSH =
+            splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexSH);
+        splatSet->textureIndexCovariances =
+            splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexCovariances);
         ++splatSetTextureIdx;
       }
       else
@@ -2583,8 +3347,8 @@ void SplatSetManagerVk::updateGpuDescriptorArray()
         splatSet->textureIndexScales      = 0;
         splatSet->textureIndexRotations   = 0;
         splatSet->textureIndexColors      = 0;
-        splatSet->textureIndexCovariances = 0;
         splatSet->textureIndexSH          = 0;
+        splatSet->textureIndexCovariances = 0;
       }
     }
   }
@@ -2647,12 +3411,17 @@ void SplatSetManagerVk::updateGpuSplatSetDescriptorArray()
       continue;
     if(splatSet->dataStorage == STORAGE_TEXTURES)
     {
-      splatSet->textureIndexCenters     = splatSetTextureIdx * 6 + 0;
-      splatSet->textureIndexScales      = splatSetTextureIdx * 6 + 1;
-      splatSet->textureIndexRotations   = splatSetTextureIdx * 6 + 2;
-      splatSet->textureIndexColors      = splatSetTextureIdx * 6 + 3;
-      splatSet->textureIndexCovariances = splatSetTextureIdx * 6 + 4;
-      splatSet->textureIndexSH          = splatSetTextureIdx * 6 + 5;
+      splatSet->textureIndexCenters =
+          splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexCenters);
+      splatSet->textureIndexScales =
+          splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexScales);
+      splatSet->textureIndexRotations =
+          splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexRotations);
+      splatSet->textureIndexColors =
+          splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexColors);
+      splatSet->textureIndexSH = splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexSH);
+      splatSet->textureIndexCovariances =
+          splatSetTextureIdx * uint32_t(SplatTexIndex::eSplatTexCount) + uint32_t(SplatTexIndex::eSplatTexCovariances);
       ++splatSetTextureIdx;
     }
     else
@@ -2661,8 +3430,8 @@ void SplatSetManagerVk::updateGpuSplatSetDescriptorArray()
       splatSet->textureIndexScales      = 0;
       splatSet->textureIndexRotations   = 0;
       splatSet->textureIndexColors      = 0;
-      splatSet->textureIndexCovariances = 0;
       splatSet->textureIndexSH          = 0;
+      splatSet->textureIndexCovariances = 0;
     }
   }
 
@@ -2766,11 +3535,79 @@ void SplatSetManagerVk::uploadGpuDescriptorArray()
   LOGD("uploadGPUDescriptorArray: Complete\n");
 }
 
+void SplatSetManagerVk::uploadRtxDescriptorArray()
+{
+  if(m_gpuRtxDescriptorArray.empty())
+  {
+    if(m_rtxDescriptorBuffer.buffer != VK_NULL_HANDLE)
+    {
+      m_alloc->destroyBuffer(m_rtxDescriptorBuffer);
+      m_rtxDescriptorBuffer = {};
+    }
+    m_useSplitBlasRtxDescriptors = false;
+    return;
+  }
+
+  const VkDeviceSize requiredSize = m_gpuRtxDescriptorArray.size() * sizeof(shaderio::SplatSetDesc);
+  if(m_rtxDescriptorBuffer.buffer != VK_NULL_HANDLE && m_rtxDescriptorBuffer.bufferSize < requiredSize)
+  {
+    m_alloc->destroyBuffer(m_rtxDescriptorBuffer);
+    m_rtxDescriptorBuffer = {};
+  }
+  if(m_rtxDescriptorBuffer.buffer == VK_NULL_HANDLE)
+  {
+    NVVK_CHECK(m_alloc->createBuffer(m_rtxDescriptorBuffer, requiredSize,
+                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
+    NVVK_DBG_NAME(m_rtxDescriptorBuffer.buffer);
+  }
+
+  VkCommandBuffer mapCmd = m_app->createTempCmdBuffer();
+  m_uploader->appendBuffer(m_rtxDescriptorBuffer, 0, std::span(m_gpuRtxDescriptorArray));
+  m_uploader->cmdUploadAppended(mapCmd);
+  m_app->submitAndWaitTempCmdBuffer(mapCmd);
+  m_uploader->releaseStaging();
+
+  m_useSplitBlasRtxDescriptors = true;
+}
+
+void SplatSetManagerVk::refreshRtxDescriptorsFromBase()
+{
+  if(!m_useSplitBlasRtxDescriptors || m_gpuRtxDescriptorArray.empty())
+    return;
+
+  assert(m_gpuRtxDescriptorArray.size() == m_rtxToBaseDescriptorMap.size());
+
+  for(size_t i = 0; i < m_gpuRtxDescriptorArray.size(); ++i)
+  {
+    const uint32_t baseIdx = m_rtxToBaseDescriptorMap[i];
+    if(baseIdx >= m_gpuDescriptorArray.size())
+      continue;
+
+    auto& rtxDesc = m_gpuRtxDescriptorArray[i];
+
+    // Preserve RTX-specific overrides before bulk copy
+    const uint64_t savedBlasAddress     = rtxDesc.blasAddress;
+    const uint32_t savedSplatBase       = rtxDesc.splatBase;
+    const uint32_t savedGlobalSplatBase = rtxDesc.globalSplatBase;
+    const uint32_t savedSplatCount      = rtxDesc.splatCount;
+
+    // Bulk copy from canonical descriptor (picks up material, transforms, data addresses, etc.)
+    rtxDesc = m_gpuDescriptorArray[baseIdx];
+
+    // Restore RTX-specific overrides
+    rtxDesc.blasAddress     = savedBlasAddress;
+    rtxDesc.splatBase       = savedSplatBase;
+    rtxDesc.globalSplatBase = savedGlobalSplatBase;
+    rtxDesc.splatCount      = savedSplatCount;
+  }
+}
+
 void SplatSetManagerVk::rebuildRtxDescriptorArrayFromChunks()
 {
   // Build per-TLAS-instance descriptors for split-BLAS RTX path.
   // One descriptor per BLAS chunk, so InstanceID() maps directly to descriptor index.
   m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
 
   for(uint32_t instanceIdx = 0; instanceIdx < m_instances.size(); ++instanceIdx)
   {
@@ -2803,41 +3640,11 @@ void SplatSetManagerVk::rebuildRtxDescriptorArrayFromChunks()
       desc.blasAddress     = chunk.helper.getBlas().address;
 
       m_gpuRtxDescriptorArray.push_back(desc);
+      m_rtxToBaseDescriptorMap.push_back(instanceIdx);
     }
   }
 
-  if(m_gpuRtxDescriptorArray.empty())
-  {
-    if(m_rtxDescriptorBuffer.buffer != VK_NULL_HANDLE)
-    {
-      m_alloc->destroyBuffer(m_rtxDescriptorBuffer);
-      m_rtxDescriptorBuffer = {};
-    }
-    m_useSplitBlasRtxDescriptors = false;
-    return;
-  }
-
-  const VkDeviceSize requiredSize = m_gpuRtxDescriptorArray.size() * sizeof(shaderio::SplatSetDesc);
-  if(m_rtxDescriptorBuffer.buffer != VK_NULL_HANDLE && m_rtxDescriptorBuffer.bufferSize < requiredSize)
-  {
-    m_alloc->destroyBuffer(m_rtxDescriptorBuffer);
-    m_rtxDescriptorBuffer = {};
-  }
-  if(m_rtxDescriptorBuffer.buffer == VK_NULL_HANDLE)
-  {
-    NVVK_CHECK(m_alloc->createBuffer(m_rtxDescriptorBuffer, requiredSize,
-                                     VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT));
-    NVVK_DBG_NAME(m_rtxDescriptorBuffer.buffer);
-  }
-
-  VkCommandBuffer mapCmd = m_app->createTempCmdBuffer();
-  m_uploader->appendBuffer(m_rtxDescriptorBuffer, 0, std::span(m_gpuRtxDescriptorArray));
-  m_uploader->cmdUploadAppended(mapCmd);
-  m_app->submitAndWaitTempCmdBuffer(mapCmd);
-  m_uploader->releaseStaging();
-
-  // Mark RTX descriptors as active so ray tracing uses the per-TLAS-instance array.
-  m_useSplitBlasRtxDescriptors = true;
+  uploadRtxDescriptorArray();
 }
 
 void SplatSetManagerVk::uploadGpuSplatSetDescriptorArray()
@@ -2896,20 +3703,15 @@ void SplatSetManagerVk::clearSceneGpuBuffers()
     m_rtxDescriptorBuffer = {};
   }
   m_useSplitBlasRtxDescriptors = false;
-  if(m_rtxDescriptorBuffer.buffer != VK_NULL_HANDLE)
-  {
-    m_alloc->destroyBuffer(m_rtxDescriptorBuffer);
-    m_rtxDescriptorBuffer = {};
-  }
 
   if(m_globalIndexTableBuffer.buffer != VK_NULL_HANDLE)
   {
-    m_alloc->destroyBuffer(m_globalIndexTableBuffer);
+    m_alloc->destroyLargeBuffer(m_globalIndexTableBuffer);
     m_globalIndexTableBuffer = {};
   }
   if(m_splatSetGlobalIndexTableBuffer.buffer != VK_NULL_HANDLE)
   {
-    m_alloc->destroyBuffer(m_splatSetGlobalIndexTableBuffer);
+    m_alloc->destroyLargeBuffer(m_splatSetGlobalIndexTableBuffer);
     m_splatSetGlobalIndexTableBuffer = {};
   }
 
@@ -2939,9 +3741,11 @@ void SplatSetManagerVk::clearSceneGpuBuffers()
     m_splatSortingVrdxStorageBuffer = {};
   }
   m_sortingBuffersAllocatedCount = 0;
+  m_sortingBuffersReleased       = true;
 
   m_gpuDescriptorArray.clear();
   m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
   m_gpuSplatSetDescriptorArray.clear();
   m_globalIndexTable.clear();
   m_splatSetGlobalIndexTable.clear();
@@ -3060,6 +3864,7 @@ void SplatSetManagerVk::rtxDeinitAccelerationStructures()
   m_useGpuBlasForSplatSets = false;
 
   m_gpuRtxDescriptorArray.clear();
+  m_rtxToBaseDescriptorMap.clear();
 
   m_rtAccelerationStructures.tlasCount      = 0;
   m_rtAccelerationStructures.totalSizeBytes = 0;
@@ -3143,6 +3948,13 @@ VkDeviceAddress SplatSetManagerVk::getGPUDescriptorArrayAddress() const
 // Internal Helpers
 //-----------------------------------------------------------------------------
 
+void SplatSetManagerVk::refreshModelBufferStats()
+{
+  memModels.globalIndexTableBuffer   = m_globalIndexTableBuffer.bufferSize;
+  memModels.splatSetIndexTableBuffer = m_splatSetGlobalIndexTableBuffer.bufferSize;
+  memModels.descriptorBuffer         = m_descriptorBuffer.bufferSize;
+}
+
 void SplatSetManagerVk::markGlobalIndexTableDirty()
 {
   m_globalIndexTableDirty = true;
@@ -3165,7 +3977,10 @@ void SplatSetManagerVk::updateMaxShDegree()
   }
 }
 
-uint32_t SplatSetManagerVk::computeMaxSplatsPerGpuBlas(bool useAabbs, VkBuildAccelerationStructureFlagsKHR blasBuildFlags, uint32_t splatCount) const
+uint32_t SplatSetManagerVk::computeMaxSplatsPerGpuBlas(bool                                 useAabbs,
+                                                       bool                                 useSpheres,
+                                                       VkBuildAccelerationStructureFlagsKHR blasBuildFlags,
+                                                       uint32_t                             splatCount) const
 {
   if(splatCount == 0 || !m_app)
   {
@@ -3188,6 +4003,11 @@ uint32_t SplatSetManagerVk::computeMaxSplatsPerGpuBlas(bool useAabbs, VkBuildAcc
     const VkDeviceSize bytesPerSplat = sizeof(VkAabbPositionsKHR);
     maxSplatsByBuffer                = static_cast<uint64_t>(maxAlloc / bytesPerSplat);
   }
+  else if(useSpheres)
+  {
+    const VkDeviceSize bytesPerSplat = sizeof(glm::vec3) + sizeof(float);
+    maxSplatsByBuffer                = static_cast<uint64_t>(maxAlloc / bytesPerSplat);
+  }
   else
   {
     const VkDeviceSize vertexBytesPerSplat = sizeof(glm::vec3) * 12;
@@ -3207,7 +4027,7 @@ uint32_t SplatSetManagerVk::computeMaxSplatsPerGpuBlas(bool useAabbs, VkBuildAcc
   while(low < high)
   {
     uint32_t mid = low + (high - low + 1) / 2;
-    if(estimateBlasBuildSizes(useAabbs, blasBuildFlags, mid).accelerationStructureSize <= maxAlloc)
+    if(estimateBlasBuildSizes(useAabbs, useSpheres, blasBuildFlags, mid).accelerationStructureSize <= maxAlloc)
     {
       low = mid;
     }
@@ -3225,10 +4045,13 @@ uint32_t SplatSetManagerVk::computeMaxSplatsPerGpuBlas(bool useAabbs, VkBuildAcc
 // Pure CPU query to the driver via vkGetAccelerationStructureBuildSizesKHR.
 //-----------------------------------------------------------------------------
 VkAccelerationStructureBuildSizesInfoKHR SplatSetManagerVk::estimateBlasBuildSizes(bool useAabbs,
+                                                                                   bool useSpheres,
                                                                                    VkBuildAccelerationStructureFlagsKHR blasBuildFlags,
                                                                                    uint32_t splatCount) const
 {
   VkAccelerationStructureGeometryKHR geometry{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_KHR};
+  VkAccelerationStructureGeometrySpheresDataNV sphereData{};
+
   if(useAabbs)
   {
     VkAccelerationStructureGeometryAabbsDataKHR aabbs{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_AABBS_DATA_KHR};
@@ -3236,6 +4059,21 @@ VkAccelerationStructureBuildSizesInfoKHR SplatSetManagerVk::estimateBlasBuildSiz
     aabbs.stride             = sizeof(VkAabbPositionsKHR);
     geometry.geometryType    = VK_GEOMETRY_TYPE_AABBS_KHR;
     geometry.geometry.aabbs  = aabbs;
+  }
+  else if(useSpheres)
+  {
+    sphereData.sType                    = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_SPHERES_DATA_NV;
+    sphereData.vertexFormat             = VK_FORMAT_R32G32B32_SFLOAT;
+    sphereData.vertexData.deviceAddress = 0;
+    sphereData.vertexStride             = sizeof(glm::vec3);
+    sphereData.radiusFormat             = VK_FORMAT_R32_SFLOAT;
+    sphereData.radiusData.deviceAddress = 0;
+    sphereData.radiusStride             = sizeof(float);
+    sphereData.indexType                = VK_INDEX_TYPE_NONE_KHR;
+    sphereData.indexData                = {};
+    sphereData.indexStride              = 0;
+    geometry.geometryType               = VK_GEOMETRY_TYPE_SPHERES_NV;
+    geometry.pNext                      = &sphereData;
   }
   else
   {
@@ -3257,7 +4095,7 @@ VkAccelerationStructureBuildSizesInfoKHR SplatSetManagerVk::estimateBlasBuildSiz
   buildInfo.geometryCount = 1;
   buildInfo.pGeometries   = &geometry;
 
-  uint32_t                                 primitiveCount = useAabbs ? splatCount : (splatCount * 20);
+  uint32_t                                 primitiveCount = (useAabbs || useSpheres) ? splatCount : (splatCount * 20);
   VkAccelerationStructureBuildSizesInfoKHR sizeInfo{VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_BUILD_SIZES_INFO_KHR};
   vkGetAccelerationStructureBuildSizesKHR(m_app->getDevice(), VK_ACCELERATION_STRUCTURE_BUILD_TYPE_DEVICE_KHR,
                                           &buildInfo, &primitiveCount, &sizeInfo);
@@ -3342,76 +4180,80 @@ void SplatSetManagerVk::tryConsumeAndUploadCpuSortingResult(VkCommandBuffer     
 {
   NVVK_DBG_SCOPE(cmd);
 
-  // upload CPU sorted indices to the GPU if needed
-  bool newIndexAvailable = false;
-
-  if(!opacityGaussianDisabled)
+  // CPU sorting path: sort on CPU, upload via host staging buffer.
+  // Skipped entirely when the host buffer wasn't allocated (buffer too large for a single
+  // allocation, e.g. >4GB). In that case GPU sorting (VRDX) is the only active path.
+  if(m_splatSortingIndicesHost.buffer != VK_NULL_HANDLE)
   {
-    // 1. Splatting/blending is on, we check for a newly sorted index table
-    auto status = m_cpuSorter.getStatus();
-    if(status != SplatSorterAsync::E_SORTING)
-    {
-      // sorter is sleeping, we can work on shared data
-      // we take into account the result of the sort
-      if(status == SplatSorterAsync::E_SORTED)
-      {
-        m_cpuSorter.consume(m_splatIndices);
-        newIndexAvailable = true;
-      }
+    bool newIndexAvailable = false;
 
-      // Build per-instance sort inputs and trigger async sort
-      std::vector<SplatSorterAsync::InstanceSortInput> instanceData;
-      instanceData.reserve(m_instanceInfos.size());
-      uint32_t infoIdx = 0;
-      for(const auto& instance : m_instances)
-      {
-        if(!instance || !instance->splatSet)
-          continue;
-        const auto& info = m_instanceInfos[infoIdx++];
-        instanceData.push_back({&instance->splatSet->positions, instance->transform, info.globalOffset, info.splatCount});
-      }
-      m_cpuSorter.sortAsync(viewDir, eyePos, instanceData, getTotalGlobalSplatCount(), cpuLazySort, frontToBack);
-    }
-  }
-  else
-  {
-    // splatting off, we disable the sorting
-    // indices would not be needed for non splatted points
-    // however, using the same mechanism allows to use exactly the same shader
-    // so if splatting/blending is off we provide an ordered table of indices
-    // if not already filled by any other previous frames (sorted or not)
+    // Ensure valid indices exist before the async sorter's first result (identity fallback).
     const uint32_t totalGlobalSplatCount = getTotalGlobalSplatCount();
-    bool           refill                = (m_splatIndices.size() != totalGlobalSplatCount);
-    if(refill)
+    if(totalGlobalSplatCount > 0 && m_splatIndices.size() != totalGlobalSplatCount)
     {
       m_splatIndices.resize(totalGlobalSplatCount);
       for(uint32_t i = 0; i < totalGlobalSplatCount; ++i)
-      {
         m_splatIndices[i] = i;
-      }
       newIndexAvailable = true;
     }
-  }
 
-  // 2. upload to GPU if needed
-  if(newIndexAvailable)
-  {
-    const auto& hostBuffer   = m_splatSortingIndicesHost;
-    const auto& deviceBuffer = m_splatSortingIndicesDevice;
+    if(!opacityGaussianDisabled)
+    {
+      auto status = m_cpuSorter.getStatus();
+      if(status != SplatSorterAsync::E_SORTING)
+      {
+        if(status == SplatSorterAsync::E_SORTED)
+        {
+          m_cpuSorter.consume(m_splatIndices);
+          newIndexAvailable = true;
+        }
 
-    // Prepare buffer on host using sorted indices
-    memcpy(hostBuffer.mapping, m_splatIndices.data(), m_splatIndices.size() * sizeof(uint32_t));
-    // copy buffer to device
-    VkBufferCopy bc{.srcOffset = 0, .dstOffset = 0, .size = splatCount * sizeof(uint32_t)};
-    vkCmdCopyBuffer(cmd, hostBuffer.buffer, deviceBuffer.buffer, 1, &bc);
-    // sync with end of copy to device
-    VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
-    barrier.srcAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
-    barrier.dstAccessMask   = VK_ACCESS_SHADER_READ_BIT;
+        std::vector<SplatSorterAsync::InstanceSortInput> instanceData;
+        instanceData.reserve(m_instanceInfos.size());
+        uint32_t infoIdx = 0;
+        for(const auto& instance : m_instances)
+        {
+          if(!instance || !instance->splatSet)
+            continue;
+          const auto& info = m_instanceInfos[infoIdx++];
+          instanceData.push_back({&instance->splatSet->positions, instance->transform, info.globalOffset, info.splatCount});
+        }
+        m_cpuSorter.sortAsync(viewDir, eyePos, instanceData, getTotalGlobalSplatCount(), cpuLazySort, frontToBack);
+      }
+    }
+    else
+    {
+      const uint32_t totalGlobalSplatCount = getTotalGlobalSplatCount();
+      bool           refill                = (m_splatIndices.size() != totalGlobalSplatCount);
+      if(refill)
+      {
+        m_splatIndices.resize(totalGlobalSplatCount);
+        for(uint32_t i = 0; i < totalGlobalSplatCount; ++i)
+        {
+          m_splatIndices[i] = i;
+        }
+        newIndexAvailable = true;
+      }
+    }
 
-    vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
-                         VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
-                         0, 1, &barrier, 0, NULL, 0, NULL);
+    if(newIndexAvailable)
+    {
+      const auto& hostBuffer   = m_splatSortingIndicesHost;
+      const auto& deviceBuffer = m_splatSortingIndicesDevice;
+
+      memcpy(hostBuffer.mapping, m_splatIndices.data(), m_splatIndices.size() * sizeof(uint32_t));
+      VkBufferCopy bc{.srcOffset = 0, .dstOffset = 0, .size = splatCount * sizeof(uint32_t)};
+      vkCmdCopyBuffer(cmd, hostBuffer.buffer, deviceBuffer.buffer, 1, &bc);
+
+      VkMemoryBarrier barrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+      barrier.srcAccessMask   = VK_ACCESS_TRANSFER_WRITE_BIT;
+      barrier.dstAccessMask   = VK_ACCESS_SHADER_READ_BIT;
+
+      vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_2_TRANSFER_BIT,
+                           VK_PIPELINE_STAGE_2_VERTEX_SHADER_BIT | VK_PIPELINE_STAGE_2_FRAGMENT_SHADER_BIT | VK_PIPELINE_STAGE_2_MESH_SHADER_BIT_EXT,
+                           0, 1, &barrier, 0, NULL, 0, NULL);
+      m_cpuSortIndicesOnGpu = true;
+    }
   }
 }
 
@@ -3477,6 +4319,7 @@ void SplatSetManagerVk::dumpDebugState(const std::string& label) const
   ofs << "=== prmRtxData ===" << std::endl;
   ofs << "  compressBlas:     " << prmRtxData.compressBlas << std::endl;
   ofs << "  useAABBs:         " << prmRtxData.useAABBs << std::endl;
+  ofs << "  useSpheres:       " << prmRtxData.useSpheres << std::endl;
   ofs << "  useTlasInstances: " << prmRtxData.useTlasInstances << std::endl;
   ofs << std::endl;
 
@@ -3588,8 +4431,8 @@ void SplatSetManagerVk::dumpDebugState(const std::string& label) const
   dumpBuf("m_descriptorBuffer", m_descriptorBuffer);
   dumpBuf("m_rtxDescriptorBuffer", m_rtxDescriptorBuffer);
   dumpBuf("m_splatSetDescriptorBuffer", m_splatSetDescriptorBuffer);
-  dumpBuf("m_globalIndexTableBuffer", m_globalIndexTableBuffer);
-  dumpBuf("m_splatSetGlobalIndexTableBuffer", m_splatSetGlobalIndexTableBuffer);
+  dumpLargeBuf("m_globalIndexTableBuffer", m_globalIndexTableBuffer);
+  dumpLargeBuf("m_splatSetGlobalIndexTableBuffer", m_splatSetGlobalIndexTableBuffer);
   dumpBuf("m_splatSortingIndicesHost", m_splatSortingIndicesHost);
   dumpLargeBuf("m_splatSortingIndicesDevice", m_splatSortingIndicesDevice);
   dumpLargeBuf("m_splatSortingDistancesDevice", m_splatSortingDistancesDevice);

@@ -36,6 +36,7 @@
 #include "shaderio.h"
 #include "parameters.h"
 #include "utilities.h"
+#include "utilities_ui.h"
 
 namespace vk_gaussian_splatting {
 
@@ -128,251 +129,261 @@ void ShaderFeedbackUI::drawWindow(bool& show, bool showCursorTargetOverlay, cons
   if(!show)
     return;
 
-  if(ImGui::Begin("Shader feedback", &show))
+  if(ImGui::Begin("Shader Feedback", &show))
   {
     namespace PE = nvgui::PropertyEditor;
 
-    if(PE::begin())
+    if(PE::begin("##CursorTarget", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
     {
       PE::Text(showCursorTargetOverlay ? "Target" : "Mouse", fmt::format("{} {}", prmFrame.cursor.x, prmFrame.cursor.y));
       PE::end();
     }
 
-    if(ImGui::CollapsingHeader("Raygen - particles", ImGuiTreeNodeFlags_DefaultOpen))
     {
-      if(PE::begin())
+      bool open = beginCollapsibleGroup("Raygen - particles", true);
+      if(open)
       {
-        PE::Text("Splat Id (Global)", fmt::format("{}", readback.particleGlobalId));
-        PE::Text("Splat Set Index", fmt::format("{}", readback.splatSetId));
-        PE::Text("Local Splat Index", fmt::format("{}", readback.particleId));
-        PE::Text("Splat # Hits", fmt::format("{}", readback.particleHitCount));
+        if(PE::begin("##RaygenParticles", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+        {
+          PE::Text("Splat Id (Global)", fmt::format("{}", readback.particleGlobalId));
+          PE::Text("Splat Set Index", fmt::format("{}", readback.splatSetId));
+          PE::Text("Local Splat Index", fmt::format("{}", readback.particleId));
+          PE::Text("Splat # Hits", fmt::format("{}", readback.particleHitCount));
 
-        PE::Text("Splat Dist closest", formatFloatInf(readback.particleDist));
-        PE::Text("Splat Dist Iso surface", fmt::format("{}", readback.particleIntegratedDist));
+          PE::Text("Splat Dist closest", formatFloatInf(readback.particleDist));
+          PE::Text("Splat Dist Iso surface", fmt::format("{}", readback.particleIntegratedDist));
 
-        glm::vec3 nrm = readback.particleNormal;
-        PE::Text("Splat Norm closest", fmt::format("{:.3f} {:.3f} {:.3f}", nrm.x, nrm.y, nrm.z));
-        glm::vec3 nrmInt = readback.particleIntegratedNormal;
-        PE::Text("Splat Norm integrated", fmt::format("{:.3f} {:.3f} {:.3f}", nrmInt.x, nrmInt.y, nrmInt.z));
-        PE::Text("Splat length(Norm int)", fmt::format("{:.4f}", glm::length(nrmInt)));
+          glm::vec3 nrm = readback.particleNormal;
+          PE::Text("Splat Norm closest", fmt::format("{:.3f} {:.3f} {:.3f}", nrm.x, nrm.y, nrm.z));
+          glm::vec3 nrmInt = readback.particleIntegratedNormal;
+          PE::Text("Splat Norm integrated", fmt::format("{:.3f} {:.3f} {:.3f}", nrmInt.x, nrmInt.y, nrmInt.z));
+          PE::Text("Splat length(Norm int)", fmt::format("{:.4f}", glm::length(nrmInt)));
 
-        float alpha = readback.closestParticleAlpha;
-        PE::Text("Splat Alpha closest", fmt::format("{:.3f}", alpha));
-        glm::vec3 cpw = readback.closestParticleWeight;
-        PE::Text("Splat Weight closest", fmt::format("{:.3f} {:.3f} {:.3f}", cpw.x, cpw.y, cpw.z));
-        glm::dvec3 cpt = readback.closestParticleTransmittance;
-        PE::Text("Transmittance after closest", fmt::format("{:.5f} {:.5f} {:.5f}", cpt.x, cpt.y, cpt.z));
-        glm::dvec3 trnsm = readback.particleTransmittance;
-        PE::Text("Transmittance after all", fmt::format("{:.3f} {:.3f} {:.3f}", trnsm.x, trnsm.y, trnsm.z));
+          float alpha = readback.closestParticleAlpha;
+          PE::Text("Splat Alpha closest", fmt::format("{:.3f}", alpha));
+          glm::vec3 cpw = readback.closestParticleWeight;
+          PE::Text("Splat Weight closest", fmt::format("{:.3f} {:.3f} {:.3f}", cpw.x, cpw.y, cpw.z));
+          glm::dvec3 cpt = readback.closestParticleTransmittance;
+          PE::Text("Transmittance after closest", fmt::format("{:.5f} {:.5f} {:.5f}", cpt.x, cpt.y, cpt.z));
+          glm::vec3 trnsm = readback.particleTransmittance;
+          PE::Text("Transmittance after all", fmt::format("{:.3f} {:.3f} {:.3f}", trnsm.x, trnsm.y, trnsm.z));
 
-        PE::end();
+          PE::end();
+        }
       }
+      endCollapsibleGroup(open);
     }
 
-    if(ImGui::CollapsingHeader("Trace profile", ImGuiTreeNodeFlags_DefaultOpen))
     {
-      // Toggle drives compile-time macro TRACE_PROFILE (shader rebuild required)
-      if(ImGui::Checkbox("Enable##TraceProfileShaderFeedback", &prmRtx.traceProfile))
+      bool open = beginCollapsibleGroup("Trace profile", true);
+      if(open)
       {
-        requestUpdateShaders = true;
-      }
-      if(ImGui::IsItemHovered())
-      {
-        ImGui::SetTooltip("%s", "Recompile shaders with TRACE_PROFILE and collect hit samples.");
-      }
-
-      if(prmRtx.traceProfile)
-      {
-        const uint32_t hitCountTotal = readback.traceProfileHitCount;
-        const uint32_t hitCount      = std::min(hitCountTotal, uint32_t(200));
-
-        ImGui::Text("%s", fmt::format("Hits recorded: {} (showing {}){}", hitCountTotal, hitCount,
-                                      (hitCountTotal > 200) ? " [overflow]" : "")
-                              .c_str());
-
-        if(hitCount > 0)
+        // Toggle drives compile-time macro TRACE_PROFILE (shader rebuild required)
+        if(ImGui::Checkbox("Enable##TraceProfileShaderFeedback", &prmRtx.traceProfile))
         {
-          // Build shared X-axis data (distance) once per frame
-          m_xs.resize(hitCount);
-          for(uint32_t i = 0; i < hitCount; ++i)
-            m_xs[i] = readback.traceProfileHits[i].dist;
+          requestUpdateShaders = true;
+        }
+        if(ImGui::IsItemHovered())
+        {
+          ImGui::SetTooltip("%s", "Recompile shaders with TRACE_PROFILE and collect hit samples.");
+        }
 
-          // Iso-surface distance for red marker
-          const double isoX = (double)readback.particleIntegratedDist;
+        if(prmRtx.traceProfile)
+        {
+          const uint32_t hitCountTotal = readback.traceProfileHitCount;
+          const uint32_t hitCount      = std::min(hitCountTotal, uint32_t(200));
 
-          m_ys.resize(hitCount);
+          ImGui::Text("%s", fmt::format("Hits recorded: {} (showing {}){}", hitCountTotal, hitCount,
+                                        (hitCountTotal > 200) ? " [overflow]" : "")
+                                .c_str());
 
-          // --- Draw each active graph node ---
-          int deleteIdx = -1;  // deferred deletion (avoid iterator invalidation)
-
-          // Toggle icon helper: green background when active, gray when inactive
-          // (matches the menu bar icon button style)
-          auto toggleIcon = [](const char* icon, const char* id, bool& flag, const char* tooltip) {
-            ImGui::SameLine();
-            if(flag)
-            {
-              ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
-              ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
-              ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.5f, 0.1f, 1.0f));
-            }
-            else
-            {
-              ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
-              ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
-              ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
-            }
-            if(ImGui::SmallButton(fmt::format("{}##{}", icon, id).c_str()))
-              flag = !flag;
-            ImGui::PopStyleColor(3);
-            if(ImGui::IsItemHovered())
-              ImGui::SetTooltip("%s", tooltip);
-          };
-
-          for(int n = 0; n < (int)m_plots.size(); ++n)
+          if(hitCount > 0)
           {
-            PlotState&       plot = m_plots[n];
-            const GraphDesc& desc = kGraphDescs[plot.graphIdx];
+            // Build shared X-axis data (distance) once per frame
+            m_xs.resize(hitCount);
+            for(uint32_t i = 0; i < hitCount; ++i)
+              m_xs[i] = readback.traceProfileHits[i].dist;
 
-            ImGui::PushID(n);  // unique ID scope per node position
+            // Iso-surface distance for red marker
+            const double isoX = (double)readback.particleIntegratedDist;
 
-            ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_DefaultOpen;
+            m_ys.resize(hitCount);
 
-            bool nodeOpen = ImGui::TreeNodeEx(desc.label, nodeFlags);
+            // --- Draw each active graph node ---
+            int deleteIdx = -1;  // deferred deletion (avoid iterator invalidation)
 
-            // --- Toggle icons (after name, not right-aligned) ---
-            toggleIcon(ICON_MS_BAR_CHART, "bars", plot.showBars, "Toggle bars");
-            toggleIcon(ICON_MS_SHOW_CHART, "lines", plot.showLines, "Toggle lines");
-            toggleIcon(ICON_MS_LAST_PAGE, "iso", plot.showIso, "Toggle iso-threshold line");
-
-            // Delete button on the same line (right-aligned)
-            ImGui::SameLine(ImGui::GetContentRegionAvail().x - 10);
-            if(ImGui::SmallButton(ICON_MS_DELETE))
-            {
-              deleteIdx = n;
-            }
-            if(ImGui::IsItemHovered())
-            {
-              ImGui::SetTooltip("Remove this graph");
-            }
-
-            if(nodeOpen)
-            {
-              // Extract Y values
-              for(uint32_t i = 0; i < hitCount; ++i)
-                m_ys[i] = extractGraphValue(plot.graphIdx, readback.traceProfileHits[i]);
-
-              const std::string plotId = fmt::format("##TraceProfile_{}", n);
-              if(ImPlot::BeginPlot(plotId.c_str(), ImVec2(-1, 150), ImPlotFlags_NoLegend | ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText))
+            // Toggle icon helper: green background when active, gray when inactive
+            // (matches the menu bar icon button style)
+            auto toggleIcon = [](const char* icon, const char* id, bool& flag, const char* tooltip) {
+              ImGui::SameLine();
+              if(flag)
               {
-                ImPlot::SetupAxes("Distance", nullptr, ImPlotAxisFlags_AutoFit, 0);
-                ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 1.0, ImPlotCond_Once);
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.2f, 0.6f, 0.2f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.3f, 0.7f, 0.3f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.1f, 0.5f, 0.1f, 1.0f));
+              }
+              else
+              {
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.3f, 0.3f, 0.3f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.2f, 0.2f, 0.2f, 1.0f));
+              }
+              if(ImGui::SmallButton(fmt::format("{}##{}", icon, id).c_str()))
+                flag = !flag;
+              ImGui::PopStyleColor(3);
+              if(ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", tooltip);
+            };
 
-                // Iso-surface depth marker (red vertical line) - plotted first so it appears behind the data
-                if(plot.showIso && isoX > 0.0 && isoX < DBL_MAX)
+            for(int n = 0; n < (int)m_plots.size(); ++n)
+            {
+              PlotState&       plot = m_plots[n];
+              const GraphDesc& desc = kGraphDescs[plot.graphIdx];
+
+              ImGui::PushID(n);  // unique ID scope per node position
+
+              ImGuiTreeNodeFlags nodeFlags = ImGuiTreeNodeFlags_DefaultOpen;
+
+              bool nodeOpen = ImGui::TreeNodeEx(desc.label, nodeFlags);
+
+              // --- Toggle icons (after name, not right-aligned) ---
+              toggleIcon(ICON_MS_BAR_CHART, "bars", plot.showBars, "Toggle bars");
+              toggleIcon(ICON_MS_SHOW_CHART, "lines", plot.showLines, "Toggle lines");
+              toggleIcon(ICON_MS_LAST_PAGE, "iso", plot.showIso, "Toggle iso-threshold line");
+
+              // Delete button on the same line (right-aligned)
+              ImGui::SameLine(ImGui::GetContentRegionAvail().x - 10);
+              if(ImGui::SmallButton(ICON_MS_DELETE))
+              {
+                deleteIdx = n;
+              }
+              if(ImGui::IsItemHovered())
+              {
+                ImGui::SetTooltip("Remove this graph");
+              }
+
+              if(nodeOpen)
+              {
+                // Extract Y values
+                for(uint32_t i = 0; i < hitCount; ++i)
+                  m_ys[i] = extractGraphValue(plot.graphIdx, readback.traceProfileHits[i]);
+
+                const std::string plotId = fmt::format("##TraceProfile_{}", n);
+                if(ImPlot::BeginPlot(plotId.c_str(), ImVec2(-1, 150), ImPlotFlags_NoLegend | ImPlotFlags_NoTitle | ImPlotFlags_NoMouseText))
                 {
-                  const float isoXVal = (float)isoX;
-                  ImPlot::PushStyleColor(ImPlotCol_Line, ImVec4(1.0f, 0.24f, 0.24f, 1.0f));
-                  ImPlot::PushStyleVar(ImPlotStyleVar_LineWeight, 2.0f);
-                  ImPlot::PlotInfLines("##iso", &isoXVal, 1);
-                  ImPlot::PopStyleVar();
-                  ImPlot::PopStyleColor();
-                }
+                  ImPlot::SetupAxes("Distance", nullptr, ImPlotAxisFlags_AutoFit, 0);
+                  ImPlot::SetupAxisLimits(ImAxis_Y1, 0.0, 1.0, ImPlotCond_Once);
 
-                const ImVec4 plotColor = ImGui::ColorConvertU32ToFloat4(desc.color);
-
-                if(plot.showBars)
-                {
-                  ImPlot::PushStyleColor(ImPlotCol_Line, plotColor);
-                  ImPlot::PlotStems("##hits", m_xs.data(), m_ys.data(), (int)hitCount, 0.0);
-                  ImPlot::PopStyleColor();
-                }
-
-                if(plot.showLines)
-                {
-                  ImPlot::PushStyleColor(ImPlotCol_Line, plotColor);
-                  ImPlot::PushStyleVar(ImPlotStyleVar_LineWeight, 1.5f);
-                  ImPlot::PlotLine("##line", m_xs.data(), m_ys.data(), (int)hitCount);
-                  ImPlot::PopStyleVar();
-                  ImPlot::PopStyleColor();
-                }
-
-                // Hover tooltip: find nearest sample by X distance and show its value
-                if(ImPlot::IsPlotHovered())
-                {
-                  ImPlotPoint mouse   = ImPlot::GetPlotMousePos();
-                  float       bestDx  = FLT_MAX;
-                  int         bestIdx = -1;
-                  for(uint32_t i = 0; i < hitCount; ++i)
+                  // Iso-surface depth marker (red vertical line) - plotted first so it appears behind the data
+                  if(plot.showIso && isoX > 0.0 && isoX < DBL_MAX)
                   {
-                    float dx = std::abs(m_xs[i] - (float)mouse.x);
-                    if(dx < bestDx)
+                    const float isoXVal = (float)isoX;
+                    ImPlotSpec  isoSpec;
+                    isoSpec.LineColor  = ImVec4(1.0f, 0.24f, 0.24f, 1.0f);
+                    isoSpec.LineWeight = 2.0f;
+                    ImPlot::PlotInfLines("##iso", &isoXVal, 1, isoSpec);
+                  }
+
+                  const ImVec4 plotColor = ImGui::ColorConvertU32ToFloat4(desc.color);
+
+                  if(plot.showBars)
+                  {
+                    ImPlotSpec stemSpec;
+                    stemSpec.LineColor = plotColor;
+                    ImPlot::PlotStems("##hits", m_xs.data(), m_ys.data(), (int)hitCount, 0.0, stemSpec);
+                  }
+
+                  if(plot.showLines)
+                  {
+                    ImPlotSpec lineSpec;
+                    lineSpec.LineColor  = plotColor;
+                    lineSpec.LineWeight = 1.5f;
+                    ImPlot::PlotLine("##line", m_xs.data(), m_ys.data(), (int)hitCount, lineSpec);
+                  }
+
+                  // Hover tooltip: find nearest sample by X distance and show its value
+                  if(ImPlot::IsPlotHovered())
+                  {
+                    ImPlotPoint mouse   = ImPlot::GetPlotMousePos();
+                    float       bestDx  = FLT_MAX;
+                    int         bestIdx = -1;
+                    for(uint32_t i = 0; i < hitCount; ++i)
                     {
-                      bestDx  = dx;
-                      bestIdx = (int)i;
+                      float dx = std::abs(m_xs[i] - (float)mouse.x);
+                      if(dx < bestDx)
+                      {
+                        bestDx  = dx;
+                        bestIdx = (int)i;
+                      }
+                    }
+                    if(bestIdx >= 0)
+                    {
+                      ImGui::BeginTooltip();
+                      ImGui::Text("Hit #%d", bestIdx);
+                      ImGui::Text("dist = %.5f", m_xs[bestIdx]);
+                      ImGui::Text("%s = %.5f", desc.label, m_ys[bestIdx]);
+                      ImGui::EndTooltip();
                     }
                   }
-                  if(bestIdx >= 0)
-                  {
-                    ImGui::BeginTooltip();
-                    ImGui::Text("Hit #%d", bestIdx);
-                    ImGui::Text("dist = %.5f", m_xs[bestIdx]);
-                    ImGui::Text("%s = %.5f", desc.label, m_ys[bestIdx]);
-                    ImGui::EndTooltip();
-                  }
+
+                  ImPlot::EndPlot();
                 }
 
-                ImPlot::EndPlot();
+                ImGui::TreePop();
               }
 
-              ImGui::TreePop();
+              ImGui::PopID();
             }
 
-            ImGui::PopID();
-          }
-
-          // Apply deferred deletion
-          if(deleteIdx >= 0)
-          {
-            m_plots.erase(m_plots.begin() + deleteIdx);
-          }
-
-          if(ImGui::SmallButton("Add plot"))
-          {
-            ImGui::OpenPopup("##AddPlotPopup");
-          }
-          if(ImGui::BeginPopup("##AddPlotPopup"))
-          {
-            for(int g = 0; g < kGraphCount; ++g)
+            // Apply deferred deletion
+            if(deleteIdx >= 0)
             {
-              if(ImGui::MenuItem(kGraphDescs[g].label))
-              {
-                m_plots.push_back({g, true, kGraphDescs[g].defaultShowLines, true});
-              }
+              m_plots.erase(m_plots.begin() + deleteIdx);
             }
-            ImGui::EndPopup();
+
+            if(ImGui::SmallButton("Add plot"))
+            {
+              ImGui::OpenPopup("##AddPlotPopup");
+            }
+            if(ImGui::BeginPopup("##AddPlotPopup"))
+            {
+              for(int g = 0; g < kGraphCount; ++g)
+              {
+                if(ImGui::MenuItem(kGraphDescs[g].label))
+                {
+                  m_plots.push_back({g, true, kGraphDescs[g].defaultShowLines, true});
+                }
+              }
+              ImGui::EndPopup();
+            }
           }
-        }
-        else
-        {
-          ImGui::TextUnformatted("No hits recorded (move cursor or target overlay\nover splats and ensure RTX is active).");
+          else
+          {
+            ImGui::TextUnformatted("No hits recorded (move cursor or target overlay\nover splats and ensure RTX is active).");
+          }
         }
       }
+      endCollapsibleGroup(open);
     }
 #ifndef NDEBUG
-    if(ImGui::CollapsingHeader("Debugging"))
     {
-      if(PE::begin())
+      bool open = beginCollapsibleGroup("Debugging", false);
+      if(open)
       {
-        PE::Text("val1", std::to_string(readback.val1));
-        PE::Text("val2", std::to_string(readback.val2));
-        PE::Text("val3", std::to_string(readback.val3));
-        PE::Text("val4", std::to_string(readback.val4));
-        PE::Text("val5", std::to_string(readback.val5));
-        PE::Text("val6", std::to_string(readback.val6));
-        PE::Text("val7", std::to_string(readback.val7));
+        if(PE::begin("##Debugging", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame))
+        {
+          PE::Text("val1", std::to_string(readback.val1));
+          PE::Text("val2", std::to_string(readback.val2));
+          PE::Text("val3", std::to_string(readback.val3));
+          PE::Text("val4", std::to_string(readback.val4));
+          PE::Text("val5", std::to_string(readback.val5));
+          PE::Text("val6", std::to_string(readback.val6));
+          PE::Text("val7", std::to_string(readback.val7));
 
-        PE::end();
+          PE::end();
+        }
       }
+      endCollapsibleGroup(open);
     }
 #endif
   }

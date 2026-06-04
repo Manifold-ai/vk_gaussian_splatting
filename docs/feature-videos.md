@@ -14,7 +14,7 @@
 
 ## Ray Tracing Lighting and Shadows on the 106M Particles City Model
 
-Requires 48GB of VRAM to raytrace.
+Requires 48GB (22GB after recent updates) of VRAM to raytrace.
 
 <video controls width="100%">
   <source src="https://github.com/user-attachments/assets/e5c32cbc-f1ae-4109-88ec-88fa47cce71f" type="video/mp4">

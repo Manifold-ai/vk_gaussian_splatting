@@ -114,7 +114,7 @@ void storeSh(int format, float* srcBuffer, uint64_t srcIndex, void* dstBuffer, u
 ///////////////////
 // class definition
 
-void SplatSetVk::initDataStorage(uint32_t _shFormat, uint32_t _rgbaFormat)
+void SplatSetVk::initDataStorage(uint32_t _shFormat, uint32_t _rgbaFormat, bool skipCovariance)
 {
   // store the parameters for further usage
   shFormat   = _shFormat;
@@ -125,21 +125,21 @@ void SplatSetVk::initDataStorage(uint32_t _shFormat, uint32_t _rgbaFormat)
   shDegree   = static_cast<uint32_t>(maxShDegree());
 
   // Initialize default material: fully emissive, no lighting interaction
-  splatMaterial.ambient       = glm::vec3(0.0f);
-  splatMaterial.diffuse       = glm::vec3(0.0f);
-  splatMaterial.specular      = glm::vec3(0.0f);
-  splatMaterial.transmittance = glm::vec3(0.0f);
-  splatMaterial.emission      = glm::vec3(1.0f);  // Fully emissive
-  splatMaterial.shininess     = 0.0f;
-  splatMaterial.ior           = 1.0f;
-  splatMaterial.illum         = 0;
+  splatMaterial.baseColor    = glm::vec3(0.0f);
+  splatMaterial.metallic     = 0.0f;
+  splatMaterial.roughness    = 0.5f;
+  splatMaterial.emissive     = glm::vec3(1.0f);  // Fully emissive
+  splatMaterial.ior          = 1.5f;
+  splatMaterial.transmission = 0.0f;
+  splatMaterial.opacity      = 1.0f;
+  splatMaterial.maxBounces   = 3;
 
   // Note: Material is now stored per-instance in SplatSetInstanceVk::descriptor
   // This splatMaterial serves as the default for new instances
 
   if(dataStorage == STORAGE_BUFFERS)
   {
-    initDataBuffers();
+    initDataBuffers(skipCovariance);
   }
   else if(dataStorage == STORAGE_TEXTURES)
   {
@@ -158,12 +158,12 @@ void SplatSetVk::initDataStorage(uint32_t _shFormat, uint32_t _rgbaFormat)
 
         // Fall back to buffer storage
         dataStorage = STORAGE_BUFFERS;
-        initDataBuffers();
+        initDataBuffers(skipCovariance);
         return;
       }
     }
 
-    initDataTextures();
+    initDataTextures(skipCovariance);
   }
   else
     LOGE("Invalid storage format");
@@ -185,7 +185,7 @@ void SplatSetVk::deinitDataStorage()
 ///////////////////
 // using data buffers to store splatset in VRAM
 
-void SplatSetVk::initDataBuffers()
+void SplatSetVk::initDataBuffers(bool skipCovariance)
 {
   if(false)
   {
@@ -250,49 +250,10 @@ void SplatSetVk::initDataBuffers()
     memoryStats.deviceAllocRotations = bufferSize4Comp;
   }
 
-  // covariances (for raster only)
+  // Covariances (raster only — skipped in pure RTX mode)
+  if(!skipCovariance)
   {
-    const VkDeviceSize bufferSize = VkDeviceSize(splatCount) * 2 * 3 * sizeof(float);
-
-    LOGD("Allocating covariance buffers: %llu B (%u splats)\n", static_cast<unsigned long long>(bufferSize), splatCount);
-
-    NVVK_CHECK(m_alloc->createLargeBuffer(covariancesBuffer, bufferSize, deviceBufferUsageFlags, queue));
-    NVVK_DBG_NAME(covariancesBuffer.buffer);
-
-    // Compute covariances into temporary CPU buffer
-    std::vector<float> covData(size_t(splatCount) * 6);
-
-    START_PAR_LOOP(splatCount, splatIdx)
-    {
-      const auto stride3 = splatIdx * 3;
-      const auto stride4 = splatIdx * 4;
-      const auto stride6 = splatIdx * 6;
-      glm::vec3  scl{std::exp(scale[stride3 + 0]), std::exp(scale[stride3 + 1]), std::exp(scale[stride3 + 2])};
-
-      glm::quat rot{rotation[stride4 + 0], rotation[stride4 + 1], rotation[stride4 + 2], rotation[stride4 + 3]};
-      rot = glm::normalize(rot);
-
-      const glm::mat3 scaleMatrix           = glm::mat3(glm::scale(scl));
-      const glm::mat3 rotationMatrix        = glm::mat3_cast(rot);
-      const glm::mat3 covarianceMatrix      = rotationMatrix * scaleMatrix;
-      glm::mat3       transformedCovariance = covarianceMatrix * glm::transpose(covarianceMatrix);
-
-      covData[stride6 + 0] = glm::value_ptr(transformedCovariance)[0];
-      covData[stride6 + 1] = glm::value_ptr(transformedCovariance)[3];
-      covData[stride6 + 2] = glm::value_ptr(transformedCovariance)[6];
-
-      covData[stride6 + 3] = glm::value_ptr(transformedCovariance)[4];
-      covData[stride6 + 4] = glm::value_ptr(transformedCovariance)[7];
-      covData[stride6 + 5] = glm::value_ptr(transformedCovariance)[8];
-    }
-    END_PAR_LOOP();
-
-    NVVK_CHECK(m_uploader->appendLargeBuffer(covariancesBuffer, 0, bufferSize, covData.data()));
-
-    // memory statistics
-    memoryStats.hostCov        = (splatCount * (4 + 3)) * sizeof(float);
-    memoryStats.deviceUsedCov  = bufferSize;
-    memoryStats.deviceAllocCov = bufferSize;
+    initCovarianceBuffer();
   }
 
   // Colors. SH degree 0 is not view dependent, so we directly transform to base color
@@ -381,8 +342,7 @@ void SplatSetVk::initDataBuffers()
 
     const VkDeviceSize bufferSize = VkDeviceSize(splatCount) * splatStride * formatSize(shFormat);
 
-    LOGD("Allocating SH buffers: %llu B (%u splats, stride=%zu)\n", static_cast<unsigned long long>(bufferSize),
-         splatCount, splatStride);
+    LOGD("Allocating SH buffers: %llu B (%u splats, stride=%d)\n", static_cast<unsigned long long>(bufferSize), splatCount, splatStride);
 
     NVVK_CHECK(m_alloc->createLargeBuffer(sphericalHarmonicsBuffer, bufferSize, deviceBufferUsageFlags, queue));
     NVVK_DBG_NAME(sphericalHarmonicsBuffer.buffer);
@@ -479,6 +439,73 @@ void SplatSetVk::initDataBuffers()
   LOGD("Data buffers updated in %lldms\n", buildTime);
 }
 
+void SplatSetVk::initCovarianceBuffer()
+{
+  if(covariancesBuffer.buffer)
+    return;
+
+  const auto splatCount = static_cast<uint32_t>(size());
+  if(splatCount == 0)
+    return;
+
+  VkQueue                queue = m_app->getQueue(0).queue;
+  VkBufferUsageFlagBits2 deviceBufferUsageFlags =
+      VK_BUFFER_USAGE_2_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_2_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_2_TRANSFER_DST_BIT
+      | VK_BUFFER_USAGE_2_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_2_VERTEX_BUFFER_BIT;
+
+  const VkDeviceSize bufferSize = VkDeviceSize(splatCount) * 2 * 3 * sizeof(float);
+
+  LOGD("Allocating covariance buffer: %llu B (%u splats)\n", static_cast<unsigned long long>(bufferSize), splatCount);
+
+  NVVK_CHECK(m_alloc->createLargeBuffer(covariancesBuffer, bufferSize, deviceBufferUsageFlags, queue));
+  NVVK_DBG_NAME(covariancesBuffer.buffer);
+
+  std::vector<float> covData(size_t(splatCount) * 6);
+
+  START_PAR_LOOP(splatCount, splatIdx)
+  {
+    const auto stride3 = splatIdx * 3;
+    const auto stride4 = splatIdx * 4;
+    const auto stride6 = splatIdx * 6;
+    glm::vec3  scl{std::exp(scale[stride3 + 0]), std::exp(scale[stride3 + 1]), std::exp(scale[stride3 + 2])};
+
+    glm::quat rot{rotation[stride4 + 0], rotation[stride4 + 1], rotation[stride4 + 2], rotation[stride4 + 3]};
+    rot = glm::normalize(rot);
+
+    const glm::mat3 scaleMatrix           = glm::mat3(glm::scale(scl));
+    const glm::mat3 rotationMatrix        = glm::mat3_cast(rot);
+    const glm::mat3 covarianceMatrix      = rotationMatrix * scaleMatrix;
+    glm::mat3       transformedCovariance = covarianceMatrix * glm::transpose(covarianceMatrix);
+
+    covData[stride6 + 0] = glm::value_ptr(transformedCovariance)[0];
+    covData[stride6 + 1] = glm::value_ptr(transformedCovariance)[3];
+    covData[stride6 + 2] = glm::value_ptr(transformedCovariance)[6];
+
+    covData[stride6 + 3] = glm::value_ptr(transformedCovariance)[4];
+    covData[stride6 + 4] = glm::value_ptr(transformedCovariance)[7];
+    covData[stride6 + 5] = glm::value_ptr(transformedCovariance)[8];
+  }
+  END_PAR_LOOP();
+
+  NVVK_CHECK(m_uploader->appendLargeBuffer(covariancesBuffer, 0, bufferSize, covData.data()));
+
+  memoryStats.hostCov        = (splatCount * (4 + 3)) * sizeof(float);
+  memoryStats.deviceUsedCov  = bufferSize;
+  memoryStats.deviceAllocCov = bufferSize;
+}
+
+void SplatSetVk::deinitCovarianceBuffer()
+{
+  if(covariancesBuffer.buffer)
+  {
+    m_alloc->destroyLargeBuffer(covariancesBuffer);
+    covariancesBuffer = {};
+  }
+  memoryStats.hostCov        = 0;
+  memoryStats.deviceUsedCov  = 0;
+  memoryStats.deviceAllocCov = 0;
+}
+
 void SplatSetVk::deinitDataBuffers()
 {
   if(centersBuffer.buffer)
@@ -489,8 +516,7 @@ void SplatSetVk::deinitDataBuffers()
     m_alloc->destroyLargeBuffer(rotationsBuffer);
   if(colorsBuffer.buffer)
     m_alloc->destroyLargeBuffer(colorsBuffer);
-  if(covariancesBuffer.buffer)
-    m_alloc->destroyLargeBuffer(covariancesBuffer);
+  deinitCovarianceBuffer();
   if(sphericalHarmonicsBuffer.buffer)
     m_alloc->destroyLargeBuffer(sphericalHarmonicsBuffer);
 
@@ -498,14 +524,13 @@ void SplatSetVk::deinitDataBuffers()
   scalesBuffer             = {};
   rotationsBuffer          = {};
   colorsBuffer             = {};
-  covariancesBuffer        = {};
   sphericalHarmonicsBuffer = {};
 }
 
 ///////////////////
 // using texture maps to store splatset in VRAM
 
-void SplatSetVk::initDataTextures()
+void SplatSetVk::initDataTextures(bool skipCovariance)
 {
   auto startTime = std::chrono::high_resolution_clock::now();
 
@@ -560,44 +585,10 @@ void SplatSetVk::initDataTextures()
     memoryStats.deviceUsedRotations  = splatCount * 4 * sizeof(float);
     memoryStats.deviceAllocRotations = rotationsMapSize.x * rotationsMapSize.y * 4 * sizeof(float);
   }
-  // covariances
+  // Covariances (raster only — skipped in pure RTX mode)
+  if(!skipCovariance)
   {
-    glm::ivec2         mapSize = computeDataTextureSize(4, 6, splatCount);
-    std::vector<float> covariances(mapSize.x * mapSize.y * 4, 0.0f);
-    //for(uint32_t splatIdx = 0; splatIdx < splatCount; ++splatIdx)
-    START_PAR_LOOP(splatCount, splatIdx)
-    {
-      const auto stride3 = splatIdx * 3;
-      const auto stride4 = splatIdx * 4;
-      const auto stride6 = splatIdx * 6;
-      glm::vec3  scl{std::exp(scale[stride3 + 0]), std::exp(scale[stride3 + 1]), std::exp(scale[stride3 + 2])};
-
-      glm::quat rot{rotation[stride4 + 0], rotation[stride4 + 1], rotation[stride4 + 2], rotation[stride4 + 3]};
-      rot = glm::normalize(rot);
-
-      // computes the covariance
-      const glm::mat3 scaleMatrix           = glm::mat3(glm::scale(scl));
-      const glm::mat3 rotationMatrix        = glm::mat3_cast(rot);  // where rotation is a quaternion
-      const glm::mat3 covarianceMatrix      = rotationMatrix * scaleMatrix;
-      glm::mat3       transformedCovariance = covarianceMatrix * glm::transpose(covarianceMatrix);
-
-      covariances[stride6 + 0] = glm::value_ptr(transformedCovariance)[0];
-      covariances[stride6 + 1] = glm::value_ptr(transformedCovariance)[3];
-      covariances[stride6 + 2] = glm::value_ptr(transformedCovariance)[6];
-
-      covariances[stride6 + 3] = glm::value_ptr(transformedCovariance)[4];
-      covariances[stride6 + 4] = glm::value_ptr(transformedCovariance)[7];
-      covariances[stride6 + 5] = glm::value_ptr(transformedCovariance)[8];
-    }
-    END_PAR_LOOP()
-
-    // place the result in the dedicated texture map
-    initTexture(mapSize.x, mapSize.y, (uint32_t)covariances.size() * sizeof(float), (void*)covariances.data(),
-                VK_FORMAT_R32G32B32A32_SFLOAT, *m_sampler, covariancesMap);
-    // memory statistics
-    memoryStats.hostCov        = (splatCount * (4 + 3)) * sizeof(float);
-    memoryStats.deviceUsedCov  = splatCount * 6 * sizeof(float);  // covariance takes less space than rotation + scale
-    memoryStats.deviceAllocCov = mapSize.x * mapSize.y * 4 * sizeof(float);
+    initCovarianceTexture();
   }
   // SH degree 0 is not view dependent, so we directly transform to base color
   // this will make some economy of processing in the shader at each frame
@@ -771,13 +762,65 @@ void SplatSetVk::initDataTextures()
 
   // Store texture indices for bindless texture array access
   // In single-instance mode, we use a simple sequential scheme starting from 0
-  // TODO Use enums
-  textureIndexCenters     = 0;
-  textureIndexScales      = 1;
-  textureIndexRotations   = 2;
-  textureIndexColors      = 3;
-  textureIndexCovariances = 4;
-  textureIndexSH          = 5;
+  textureIndexCenters     = uint32_t(SplatTexIndex::eSplatTexCenters);
+  textureIndexScales      = uint32_t(SplatTexIndex::eSplatTexScales);
+  textureIndexRotations   = uint32_t(SplatTexIndex::eSplatTexRotations);
+  textureIndexColors      = uint32_t(SplatTexIndex::eSplatTexColors);
+  textureIndexSH          = uint32_t(SplatTexIndex::eSplatTexSH);
+  textureIndexCovariances = uint32_t(SplatTexIndex::eSplatTexCovariances);
+}
+
+void SplatSetVk::initCovarianceTexture()
+{
+  if(covariancesMap.image != VK_NULL_HANDLE)
+    return;
+
+  const auto splatCount = static_cast<uint32_t>(size());
+  if(splatCount == 0 || !m_sampler)
+    return;
+
+  glm::ivec2         mapSize = computeDataTextureSize(4, 6, splatCount);
+  std::vector<float> covariances(mapSize.x * mapSize.y * 4, 0.0f);
+
+  START_PAR_LOOP(splatCount, splatIdx)
+  {
+    const auto stride3 = splatIdx * 3;
+    const auto stride4 = splatIdx * 4;
+    const auto stride6 = splatIdx * 6;
+    glm::vec3  scl{std::exp(scale[stride3 + 0]), std::exp(scale[stride3 + 1]), std::exp(scale[stride3 + 2])};
+
+    glm::quat rot{rotation[stride4 + 0], rotation[stride4 + 1], rotation[stride4 + 2], rotation[stride4 + 3]};
+    rot = glm::normalize(rot);
+
+    const glm::mat3 scaleMatrix           = glm::mat3(glm::scale(scl));
+    const glm::mat3 rotationMatrix        = glm::mat3_cast(rot);
+    const glm::mat3 covarianceMatrix      = rotationMatrix * scaleMatrix;
+    glm::mat3       transformedCovariance = covarianceMatrix * glm::transpose(covarianceMatrix);
+
+    covariances[stride6 + 0] = glm::value_ptr(transformedCovariance)[0];
+    covariances[stride6 + 1] = glm::value_ptr(transformedCovariance)[3];
+    covariances[stride6 + 2] = glm::value_ptr(transformedCovariance)[6];
+
+    covariances[stride6 + 3] = glm::value_ptr(transformedCovariance)[4];
+    covariances[stride6 + 4] = glm::value_ptr(transformedCovariance)[7];
+    covariances[stride6 + 5] = glm::value_ptr(transformedCovariance)[8];
+  }
+  END_PAR_LOOP()
+
+  initTexture(mapSize.x, mapSize.y, (uint32_t)covariances.size() * sizeof(float), (void*)covariances.data(),
+              VK_FORMAT_R32G32B32A32_SFLOAT, *m_sampler, covariancesMap);
+
+  memoryStats.hostCov        = (splatCount * (4 + 3)) * sizeof(float);
+  memoryStats.deviceUsedCov  = splatCount * 6 * sizeof(float);
+  memoryStats.deviceAllocCov = mapSize.x * mapSize.y * 4 * sizeof(float);
+}
+
+void SplatSetVk::deinitCovarianceTexture()
+{
+  deinitTexture(covariancesMap);
+  memoryStats.hostCov        = 0;
+  memoryStats.deviceUsedCov  = 0;
+  memoryStats.deviceAllocCov = 0;
 }
 
 void SplatSetVk::deinitDataTextures()
@@ -785,7 +828,7 @@ void SplatSetVk::deinitDataTextures()
   deinitTexture(centersMap);
   deinitTexture(scalesMap);
   deinitTexture(rotationsMap);
-  deinitTexture(covariancesMap);
+  deinitCovarianceTexture();
 
   deinitTexture(colorsMap);
   deinitTexture(sphericalHarmonicsMap);

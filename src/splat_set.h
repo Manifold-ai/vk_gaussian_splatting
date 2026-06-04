@@ -77,7 +77,11 @@ struct SplatSet
   // This is performed in-place.
   void convertCoordinates(spz::CoordinateSystem from, spz::CoordinateSystem to)
   {
-    spz::CoordinateConverter c = coordinateConverter(from, to);
+    // The upgraded spz coordinateConverter takes the SH degree so it can build the per-band
+    // SH flips. RDF<->RUB is a within-family conversion (needRotation == false), so flipP/flipQ/
+    // flipSh stay populated and the manual in-place application below remains valid.
+    const int32_t            deg = maxShDegree();
+    spz::CoordinateConverter c   = coordinateConverter(from, to, deg < 0 ? 0 : deg);
 
     const auto numPoints = size();
 

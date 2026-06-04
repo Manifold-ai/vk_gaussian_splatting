@@ -823,8 +823,11 @@ void TransformHelperVk::updateDrag(const glm::vec2& mousePos,
         // Project delta onto axis to get movement along axis only
         float projection = glm::dot(dragDelta, axis);
 
-        // Apply relative translation
-        *m_attachedPosition = m_dragStartPosition + axis * projection;
+        // Apply relative translation with optional snapping
+        glm::vec3 delta = axis * projection;
+        if(m_enableSnapping)
+          delta = glm::round(delta / m_snapTranslate) * m_snapTranslate;
+        *m_attachedPosition = m_dragStartPosition + delta;
 
         // Notify callback
         if(m_onTransformChange)
@@ -848,8 +851,9 @@ void TransformHelperVk::updateDrag(const glm::vec2& mousePos,
 
         // Calculate delta from initial hit point to current hit point (relative dragging)
         glm::vec3 dragDelta = currentHitPoint - m_dragStartHitPoint;
+        if(m_enableSnapping)
+          dragDelta = glm::round(dragDelta / m_snapTranslate) * m_snapTranslate;
 
-        // Apply full delta (movement is already constrained to plane by the plane intersection)
         *m_attachedPosition = m_dragStartPosition + dragDelta;
 
         // Notify callback
@@ -893,7 +897,9 @@ void TransformHelperVk::updateDrag(const glm::vec2& mousePos,
           if(glm::dot(cross, axis) < 0.0f)
             angleDeg = -angleDeg;
 
-          // Apply rotation
+          // Apply rotation with optional snapping
+          if(m_enableSnapping)
+            angleDeg = glm::round(angleDeg / m_snapRotate) * m_snapRotate;
           *m_attachedRotation = m_dragStartRotation + axis * angleDeg;
 
           // Notify callback
@@ -917,7 +923,11 @@ void TransformHelperVk::updateDrag(const glm::vec2& mousePos,
                       (m_draggedComponent == GizmoComponent::eScaleY) ? 1 :
                                                                         2;
 
-      // Apply scale only to the selected axis
+      // Apply scale only to the selected axis with optional snapping
+      if(m_enableSnapping)
+        scaleFactor = glm::round(scaleFactor / m_snapScale) * m_snapScale;
+      scaleFactor = glm::max(0.01f, scaleFactor);
+
       *m_attachedScale              = m_dragStartScale;
       (*m_attachedScale)[axisIndex] = m_dragStartScale[axisIndex] * scaleFactor;
 
@@ -932,7 +942,10 @@ void TransformHelperVk::updateDrag(const glm::vec2& mousePos,
       // Calculate uniform scale based on total mouse movement from drag start
       glm::vec2 totalDelta  = mousePos - m_dragStartPosMouse;
       float     scaleFactor = 1.0f + totalDelta.y * 0.005f;  // 0.5% per pixel
-      scaleFactor           = glm::max(0.01f, scaleFactor);  // Clamp to prevent negative/zero scale
+
+      if(m_enableSnapping)
+        scaleFactor = glm::round(scaleFactor / m_snapScale) * m_snapScale;
+      scaleFactor = glm::max(0.01f, scaleFactor);
 
       *m_attachedScale = m_dragStartScale * scaleFactor;
 

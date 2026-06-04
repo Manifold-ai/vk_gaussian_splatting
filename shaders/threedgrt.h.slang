@@ -23,36 +23,15 @@
 #include "quaternions.h.slang"
 #include "shaderio.h"
 #include "threedgs_particle_storage.h.slang"
+#include "threedgs.h.slang"
 
 static const float INF_DISTANCE = asfloat(0x7F7FFFFF);
 
-struct ThreedgrtParticle
-{
-  int      id;           // particle Index
-  float3   position;     // particle position (mean)
-  float3   scale;        // particle scale
-  quat     quaternion;   // particle rotation as a quaternion
-  float3x3 invRotation;  // inverse of particle rotation matrix
-  float4   color;        // particle color (Non view dependent RGB + density/opacity in alpha channel)
-
-  // Indexed constructor
-  // Fetch non view dependent data from storage via SplatSetDesc
-  // If psrOnly is true, color is skipped, and only
-  // Position Scale Rotations are loaded
-  __init(SplatSetDesc splatSetDesc, int index, bool psrOnly = false)
-  {
-    id          = index;
-    position    = fetchCenter(splatSetDesc, id);
-    scale       = exp(fetchScale(splatSetDesc, id));
-    quaternion  = vec4toQuat(normalize(fetchRotation(splatSetDesc, id)));
-    invRotation = quatToMat3Transpose(quaternion);
-
-    if(!psrOnly)
-    {
-      color = fetchColor(splatSetDesc, id);
-    }
-  }
-}
+// ThreedgsParticle struct and computeEllipsoidNormalMaxDensityPlane() are now
+// defined in threedgs.h.slang (included above) so that the raster mesh shaders
+// can use them without pulling in this header (which contains `double`-using
+// helpers like threedgrtIntegrate that would otherwise force the Float64 SPIR-V
+// capability into raster modules on devices that don't support shaderFloat64).
 
 void particleCannonicalRay(in float3   rayOrigin,
                            in float3   rayDirection,
@@ -146,13 +125,12 @@ float particleRayDistance(in float3 particleRayOrigin, in float3 particleRayDire
 #define USE_MAX_DENSITY_PLANE_NORMAL (NORMAL_METHOD == NORMAL_METHOD_MAX_DENSITY_PLANE)
 
 // compute alpha + radiance, and optionally normal, for the particle
-bool particleProcessHit<let kNormals : bool>(in FrameInfo    frameInfo,
+bool threedgrtProcessHit<let kNormals : bool>(in FrameInfo    frameInfo,
                                              in SplatSetDesc splatSetDesc,
                                              in float3       modelRayOrigin,
                                              in float3       modelRayDirection,
                                              in float3x3     modelMatrixRotScaleInverse,
                                              in int          splatId,
-                                             in float        hitT,
                                              out float       alpha,
                                              out float3      particleRad,
                                              out float3      normalWorld)
@@ -161,7 +139,7 @@ bool particleProcessHit<let kNormals : bool>(in FrameInfo    frameInfo,
   particleRad = float3(0.0);
   normalWorld = float3(0.0);
 
-  ThreedgrtParticle particle = { splatSetDesc, splatId };  // fetch the data, incl. color and opacity in color field
+  ThreedgsParticle particle = { splatSetDesc, splatId };  // fetch the data, incl. color and opacity in color field
 
   // particle density culling
   const float particleDensity = particle.color.w;
@@ -222,8 +200,129 @@ bool particleProcessHit<let kNormals : bool>(in FrameInfo    frameInfo,
   return acceptHit;
 }
 
+// 3DGS billboard hit processing: evaluates alpha using 2D projected covariance
+// (matching the 3DGS raster training objective) instead of the 3D ellipsoidal kernel.
+// This replicates the raster pipeline's alpha model: project the 3D covariance to 2D
+// screen space via the Jacobian approximation, then evaluate the Gaussian at the
+// ray-billboard intersection point using the conic (inverse 2D covariance).
+bool threedgsProcessHit<let kNormals : bool>(in FrameInfo    frameInfo,
+                                             in SplatSetDesc splatSetDesc,
+                                             in float3       modelRayOrigin,
+                                             in float3       modelRayDirection,
+                                             in float3x3     modelMatrixRotScaleInverse,
+                                             in int          splatId,
+                                             in float        billboardDist,
+                                             out float       alpha,
+                                             out float3      particleRad,
+                                             out float3      normalWorld)
+{
+  alpha       = 0.0;
+  particleRad = float3(0.0);
+  normalWorld = float3(0.0);
+
+  ThreedgsParticle particle = { splatSetDesc, splatId };
+
+  float particleDensity = particle.color.w;
+  if(particleDensity <= frameInfo.alphaCullThreshold)
+#pragma warning(disable: 41018)
+    return false;
+#pragma warning(default: 41018)
+
+  // Build 3D covariance from scale + rotation: Σ = R * S² * R^T
+  // quatToMat3Transpose gives the standard (column-vector convention) rotation matrix,
+  // matching glm::mat3_cast used on the CPU side. Using its transpose (quatToMat3)
+  // would produce incorrect off-diagonal covariance terms.
+  const float3x3 R      = particle.invRotation;  // = quatToMat3Transpose(q)
+  const float3x3 RS     = float3x3(R[0] * particle.scale,
+                                    R[1] * particle.scale,
+                                    R[2] * particle.scale);
+  const float3x3 cov3Dm = mul(RS, transpose(RS));
+
+  // Model-view matrix and splat center in view space
+  const float4x4 modelViewMatrix = mul(splatSetDesc.transform, frameInfo.viewMatrix);
+  const float4   viewCenter      = mul(float4(particle.position, 1.0), modelViewMatrix);
+
+  // Project 3D covariance to 2D screen space (same Jacobian approximation as raster)
+  float3 cov2Dv = threedgsCovarianceProjection(cov3Dm, viewCenter, frameInfo.focal, modelViewMatrix);
+
+  // MipSplatting antialiasing: 2D covariance low-pass filter + opacity compensation.
+  // https://niujinshuchong.github.io/mip-splatting/
+#if MS_ANTIALIASING == 1
+  const float detOrig = cov2Dv[0] * cov2Dv[2] - cov2Dv[1] * cov2Dv[1];
+#endif
+  cov2Dv[0] += COVARIANCE_DILATION;
+  cov2Dv[2] += COVARIANCE_DILATION;
+#if MS_ANTIALIASING == 1
+  const float detBlur = cov2Dv[0] * cov2Dv[2] - cov2Dv[1] * cov2Dv[1];
+  particleDensity *= sqrt(max(detOrig / detBlur, 0.0));
+#endif
+
+  const float det = cov2Dv[0] * cov2Dv[2] - cov2Dv[1] * cov2Dv[1];
+  if(det <= 0.0)
+#pragma warning(disable: 41018)
+    return false;
+#pragma warning(default: 41018)
+
+  // Conic: inverse of the 2x2 projected covariance
+  const float  invDet = 1.0 / det;
+  const float3 conic  = float3(cov2Dv[2] * invDet, -cov2Dv[1] * invDet, cov2Dv[0] * invDet);
+
+  // Billboard hit point projected to screen space
+  const float3 hitPointModel = modelRayOrigin + billboardDist * modelRayDirection;
+  const float4 hitView       = mul(float4(hitPointModel, 1.0), modelViewMatrix);
+  const float2 hitScreen     = hitView.xy * frameInfo.focal / hitView.z;
+  const float2 centerScreen  = viewCenter.xy * frameInfo.focal / viewCenter.z;
+  const float2 d2d           = hitScreen - centerScreen;
+
+  // Evaluate 2D Gaussian: exp(-0.5 * (p-μ)^T * Σ^{-1} * (p-μ)) * opacity
+  const float mahal = d2d.x * d2d.x * conic.x + 2.0 * d2d.x * d2d.y * conic.y + d2d.y * d2d.y * conic.z;
+  // Match 3DGS raster quad extent: threedgsProjectedExtentBasis() uses stdDev = sqrt(8),
+  // so the quad boundary corresponds to Mahalanobis distance = stdDev² = 8.
+  if(mahal > 8.0)
+#pragma warning(disable: 41018)
+    return false;
+#pragma warning(default: 41018)
+
+  alpha = min(frameInfo.alphaClamp, exp(-0.5 * mahal) * particleDensity);
+
+  const bool acceptHit = (alpha > frameInfo.alphaCullThreshold);
+
+  if(acceptHit)
+  {
+#if DISABLE_OPACITY_GAUSSIAN
+    alpha = 1.0;
+#endif
+    const float3 vectorToParticleCenter = normalize(particle.position - modelRayOrigin);
+#if SHOW_SH_ONLY == 1
+    const float3 grad = float3(0.5) + fetchViewDependentRadiance(splatSetDesc, frameInfo.shDegree, splatId, vectorToParticleCenter);
+#else
+    const float3 grad =
+        particle.color.xyz + fetchViewDependentRadiance(splatSetDesc, frameInfo.shDegree, splatId, vectorToParticleCenter);
+#endif
+
+    particleRad = grad;
+
+    if(kNormals)
+    {
+      // Same normal computation as raster mesh shader and threedgrtProcessHit
+#if USE_MAX_DENSITY_PLANE_NORMAL
+      const float3 normalModel = computeEllipsoidNormalMaxDensityPlane(frameInfo, modelRayOrigin, modelRayDirection, particle);
+#else
+      float3 particleRayOrigin, particleRayDirection;
+      particleCannonicalRay(modelRayOrigin, modelRayDirection, particle.position, particle.scale, particle.invRotation,
+                            particleRayOrigin, particleRayDirection);
+      const float3 normalModel =
+          computeEllipsoidNormal(frameInfo, modelRayOrigin, modelRayDirection, particleRayOrigin, particleRayDirection, particle);
+#endif
+      normalWorld = normalize(mul(normalModel, transpose(modelMatrixRotScaleInverse)));
+    }
+  }
+
+  return acceptHit;
+}
+
 // Integrates particle hit
-void particleIntegrate(in float      alpha,
+void threedgrtIntegrate(in float      alpha,
                        in float3     particleRad,
                        inout double3 transmittance,  // updated
                        inout float3  radiance,       // integrated
@@ -234,188 +333,10 @@ void particleIntegrate(in float      alpha,
   transmittance *= (1.0 - double(alpha));
 }
 
-// Version used by 3DGUT.
-bool particleProcessHitGut(in FrameInfo frameInfo,
-                           in float3    modelRayOrigin,
-                           in float3    modelRayDirection,
-                           in int       splatId,
-                           in float4    splatColor,
-                           in float3    particlePosition,
-                           in float3    particleScale,
-                           in float3x3  particleInvRotation,
-                           out float    opacity)
 
-{
-  const float particleDensity = splatColor.a;
-  if(particleDensity <= frameInfo.alphaCullThreshold)
-#pragma warning(disable: 41018)
-    return false;
-#pragma warning(default: 41018)
-
-  float3 particleRayOrigin;
-  float3 particleRayDirection;
-  particleCannonicalRay(modelRayOrigin, modelRayDirection, particlePosition, particleScale, particleInvRotation,
-                        particleRayOrigin, particleRayDirection);
-
-  const float rayDist = particleRayMinSquaredDistance(particleRayOrigin, particleRayDirection);
-
-  const float maxResponse = particleRayMaxKernelResponse<KERNEL_DEGREE>(rayDist);
-  const float alpha       = min(frameInfo.alphaClamp, maxResponse * particleDensity);
-
-  const double minParticleAlpha = 1.0f / 255.0f;
-  const bool   acceptHit        = ((double)alpha > minParticleAlpha) && (maxResponse > KERNEL_MIN_RESPONSE);
-
-  if(acceptHit)
-  {
-#if DISABLE_OPACITY_GAUSSIAN
-    opacity = 1.0;
-#else
-    opacity = alpha;
-#endif
-  }
-
-  return acceptHit;
-}
-
-// Version used by 3DGUT with normal output for surface generation.
-bool particleProcessHitGutWithNormal(in FrameInfo frameInfo,
-                                     in float3    modelRayOrigin,
-                                     in float3    modelRayDirection,
-                                     in int       splatId,
-                                     in float4    splatColor,
-                                     in float3    particlePosition,
-                                     in float3    particleScale,
-                                     in float3x3  particleInvRotation,
-                                     in float4x4  splatSetTransform,  // For world space normal transform
-                                     out float    opacity,
-                                     out float3   normalWorld)  // Output: normal in world space
-
-{
-  const float particleDensity = splatColor.a;
-  if(particleDensity <= frameInfo.alphaCullThreshold)
-#pragma warning(disable: 41018)
-    return false;
-#pragma warning(default: 41018)
-
-  float3 particleRayOrigin;
-  float3 particleRayDirection;
-  particleCannonicalRay(modelRayOrigin, modelRayDirection, particlePosition, particleScale, particleInvRotation,
-                        particleRayOrigin, particleRayDirection);
-
-  const float rayDist = particleRayMinSquaredDistance(particleRayOrigin, particleRayDirection);
-
-  const float maxResponse = particleRayMaxKernelResponse<KERNEL_DEGREE>(rayDist);
-  const float alpha       = min(frameInfo.alphaClamp, maxResponse * particleDensity);
-
-  const double minParticleAlpha = 1.0f / 255.0f;
-  const bool   acceptHit        = ((double)alpha > minParticleAlpha) && (maxResponse > KERNEL_MIN_RESPONSE);
-
-  if(acceptHit)
-  {
-#if DISABLE_OPACITY_GAUSSIAN
-    opacity = 1.0;
-#else
-    opacity = alpha;
-#endif
-
-    // Compute normal using max density plane approximation
-    // Create a ThreedgrtParticle struct for the normal computation
-    ThreedgrtParticle particle;
-    particle.id          = splatId;
-    particle.position    = particlePosition;
-    particle.scale       = particleScale;
-    particle.invRotation = particleInvRotation;
-    // color not needed for normal computation
-
-#if USE_MAX_DENSITY_PLANE_NORMAL
-    float3 normalModel = computeEllipsoidNormalMaxDensityPlane(frameInfo, modelRayOrigin, modelRayDirection, particle);
-#else
-    float3 normalModel =
-        computeEllipsoidNormal(frameInfo, modelRayOrigin, modelRayDirection, particleRayOrigin, particleRayDirection, particle);
-#endif
-
-    // Transform normal from model space to world space
-    // For normals: use transpose(inverse(RS)) but for rotation-scale matrix this is simplified
-    // Extract upper-left 3x3 of splatSetTransform for the rotation-scale part
-    float3x3 modelToWorldRS = float3x3(splatSetTransform[0].xyz, splatSetTransform[1].xyz, splatSetTransform[2].xyz);
-    // For normals, we need inverse-transpose: transpose(inverse(RS))
-    // Since modelToWorldRS is RS, inverse(RS) = S^-1 * R^T, and transpose of that = R * S^-1
-    // However, for uniform scale or rotation-only, we can just use the matrix directly
-    // For correctness with non-uniform scale, we'd need proper inverse-transpose
-    // But the normal is already computed in model space accounting for scale
-    normalWorld = normalize(mul(normalModel, modelToWorldRS));
-  }
-
-  return acceptHit;
-}
-
-// Compute the ellipsoid normal using the maximum density plane approximation
-// Based on StochasticSplats approach: approximates the iso-density surface with a tangent plane
-// at the Gaussian center, then derives the normal from the plane equation.
-// Returns the normal in model space
-
-
-float3 computeEllipsoidNormalMaxDensityPlane(in FrameInfo frameInfo, in float3 modelRayOrigin, in float3 modelRayDirection, in ThreedgrtParticle particle)
-{
-  float3 normalModel;
-
-  // Check for degenerate scale components (very flat or line particles)
-  bool3 isSmall    = particle.scale < float3(frameInfo.thinParticleThreshold);
-  int         smallCount = (isSmall.x ? 1 : 0) + (isSmall.y ? 1 : 0) + (isSmall.z ? 1 : 0);
-
-  float3x3 rotMat      = transpose(particle.invRotation);
-  float3   localVector = modelRayOrigin - particle.position;
-
-  if(smallCount == 0)
-  {
-    // Maximum density plane approximation
-    // Theory: At the Gaussian center, the iso-density surface can be approximated by a tangent plane.
-    // See StochasticSplats https://github.com/ubc-vision/stochasticsplats
-
-    // Normal case: compute gradient-based normal
-    float3 invScaleSq = float3(1.0) / (particle.scale * particle.scale);
-
-    // Transform to canonical space, apply inverse scale squared, transform back
-    float3 canonicalVector = mul(localVector, particle.invRotation);
-    float3 scaledVector    = canonicalVector * invScaleSq;
-    // Transform back to model space using R
-    float3 gradient = mul(scaledVector, rotMat);
-
-    // The gradient points in the direction of maximum density increase
-    // For the normal, we want it pointing towards the ray origin (outward facing)
-    float gradientLengthSq = dot(gradient, gradient);
-
-    normalModel = gradient * rsqrt(gradientLengthSq);
-
-    // Ensure normal points towards ray origin (same side as view direction)
-    if(dot(normalModel, localVector) < 0.0)
-    {
-      normalModel = -normalModel;
-    }
-  }
-  else if(smallCount == 1)
-  {
-    // Exactly one scale is small: flat particle (disk/ellipse)
-    // Normal is perpendicular to the plane, along the small scale axis
-    float3 axisLocal = (isSmall.x) ? float3(1.0, 0.0, 0.0) : ((isSmall.y) ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0));
-
-    // Transform from canonical space to model space using rotation matrix
-    normalModel = mul(axisLocal, rotMat);
-
-    // Ensure normal points towards ray origin (outward facing)
-    if(dot(normalModel, localVector) < 0.0)
-    {
-      normalModel = -normalModel;
-    }
-  }
-  else
-  {
-    // Two or more scales are degenerate (line or point): fall back to view direction
-    normalModel = -modelRayDirection;
-  }
-
-  return normalModel;
-}
+// computeEllipsoidNormalMaxDensityPlane() lives in threedgs.h.slang now (see
+// note at the top of this file). The function below — computeEllipsoidNormal()
+// — uses the same smallCount decomposition.
 
 // Compute the ellipsoid normal using ray-sphere intersection in canonical space.
 // Uses the same smallCount decomposition as computeEllipsoidNormalMaxDensityPlane.
@@ -425,7 +346,7 @@ float3 computeEllipsoidNormal(in FrameInfo         frameInfo,
                               in float3            modelRayDirection,
                               in float3            particleRayOrigin,
                               in float3            particleRayDirection,
-                              in ThreedgrtParticle particle)
+                              in ThreedgsParticle particle)
 {
   float3 normalModel;
 

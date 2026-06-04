@@ -18,10 +18,12 @@
  */
 
 #include "mesh_manager_vk.h"
+#include "gltf_loader.h"
+#include "obj_loader.h"
 #include "utilities.h"
 
-//#define STB_IMAGE_IMPLEMENTATION
-//#include <stb/stb_image.h>
+#define STB_IMAGE_IMPLEMENTATION
+#include <stb/stb_image.h>
 
 #include <algorithm>  // for std::find
 #include <fmt/format.h>
@@ -43,22 +45,25 @@ namespace vk_gaussian_splatting {
 
 void MeshVk::initBuffers(nvvk::ResourceAllocator* alloc, nvvk::StagingUploader* uploader)
 {
+  gpuVertexCount = nbVertices();
+  gpuIndexCount  = nbIndices();
+
   // Allocate GPU buffers
   VkBufferUsageFlags flag            = VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
   VkBufferUsageFlags rayTracingFlags =  // used also for building acceleration structures
       flag | VK_BUFFER_USAGE_ACCELERATION_STRUCTURE_BUILD_INPUT_READ_ONLY_BIT_KHR | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
 
-  NVVK_CHECK(alloc->createBuffer(vertexBuffer, vertexData.size() * sizeof(ObjVertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | rayTracingFlags));
+  NVVK_CHECK(alloc->createBuffer(vertexBuffer, vertices.size() * sizeof(Vertex), VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | rayTracingFlags));
   NVVK_DBG_NAME(vertexBuffer.buffer);
 
-  NVVK_CHECK(alloc->createBuffer(indexBuffer, indexData.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | rayTracingFlags));
+  NVVK_CHECK(alloc->createBuffer(indexBuffer, indices.size() * sizeof(uint32_t), VK_BUFFER_USAGE_INDEX_BUFFER_BIT | rayTracingFlags));
   NVVK_DBG_NAME(indexBuffer.buffer);
 
-  NVVK_CHECK(alloc->createBuffer(materialsBuffer, materials.size() * sizeof(ObjMaterial),
+  NVVK_CHECK(alloc->createBuffer(materialsBuffer, materials.size() * sizeof(Material),
                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | rayTracingFlags));
   NVVK_DBG_NAME(materialsBuffer.buffer);
 
-  NVVK_CHECK(alloc->createBuffer(matIndexBuffer, matIndexData.size() * sizeof(uint32_t),
+  NVVK_CHECK(alloc->createBuffer(matIndexBuffer, matIndices.size() * sizeof(uint32_t),
                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | rayTracingFlags));
   NVVK_DBG_NAME(matIndexBuffer.buffer);
 
@@ -69,10 +74,10 @@ void MeshVk::initBuffers(nvvk::ResourceAllocator* alloc, nvvk::StagingUploader* 
   }
 
   // Upload data to GPU
-  NVVK_CHECK(uploader->appendBuffer(vertexBuffer, 0, std::span(vertexData)));
-  NVVK_CHECK(uploader->appendBuffer(indexBuffer, 0, std::span(indexData)));
+  NVVK_CHECK(uploader->appendBuffer(vertexBuffer, 0, std::span(vertices)));
+  NVVK_CHECK(uploader->appendBuffer(indexBuffer, 0, std::span(indices)));
   NVVK_CHECK(uploader->appendBuffer(materialsBuffer, 0, std::span(materials)));
-  NVVK_CHECK(uploader->appendBuffer(matIndexBuffer, 0, std::span(matIndexData)));
+  NVVK_CHECK(uploader->appendBuffer(matIndexBuffer, 0, std::span(matIndices)));
 
   // Note: uploader->cmdUploadAppended() and staging release handled by caller
 }
@@ -100,74 +105,284 @@ void MeshVk::deinitBuffers(nvvk::ResourceAllocator* alloc)
 std::shared_ptr<MeshVk> MeshManagerVk::loadModel(const std::filesystem::path& filename)
 {
   LOGI("Loading File:  %s \n", filename.string().c_str());
-  ObjLoader loader;
-  if(!loader.load(filename))
-    return nullptr;
 
-  // Converting from Srgb to linear
-  for(auto& m : loader.m_materials)
+  auto meshVk = std::make_shared<MeshVk>();
+
+  const std::string ext    = filename.extension().string();
+  bool              loaded = false;
+  if(ext == ".gltf" || ext == ".glb")
   {
-    m.ambient  = glm::pow(m.ambient, glm::vec3(2.2f));
-    m.diffuse  = glm::pow(m.diffuse, glm::vec3(2.2f));
-    m.specular = glm::pow(m.specular, glm::vec3(2.2f));
+    GltfLoader loader;
+    loaded = loader.load(filename, *meshVk);
+  }
+  else
+  {
+    ObjLoader loader;
+    loaded = loader.load(filename, *meshVk);
   }
 
-  // Create mesh using low-level API (reusable!)
-  auto mesh = createMesh(loader.filename.filename().string(),  // name
-                         loader.m_vertices,                    // vertices
-                         loader.m_indices,                     // indices
-                         loader.m_materials,                   // materials
-                         loader.m_matIndices                   // matIndices
-  );
+  if(!loaded)
+    return nullptr;
 
-  //
-  mesh->path = filename.string();
+  // OBJ stores color factors in sRGB space — convert to linear for shading.
+  // glTF factors are already linear per spec, so skip the conversion.
+  bool isOBJ = (ext == ".obj");
+  if(isOBJ)
+  {
+    for(auto& m : meshVk->materials)
+    {
+      m.baseColor = glm::pow(m.baseColor, glm::vec3(2.2f));
+      m.emissive  = glm::pow(m.emissive, glm::vec3(2.2f));
+    }
+  }
+
+  // Load textures referenced by materials and remap local indices to global
+  if(!meshVk->textures.empty())
+  {
+    const auto basePath = filename.parent_path();
+
+    // Build local-to-global index map
+    std::vector<int> localToGlobal(meshVk->textures.size(), -1);
+    for(size_t i = 0; i < meshVk->textures.size(); i++)
+    {
+      // Pass embedded image bytes if available (GLB embedded textures)
+      const auto& embedded = (i < meshVk->embeddedImages.size()) ? meshVk->embeddedImages[i] : std::vector<uint8_t>{};
+      bool        sRGB     = (i < meshVk->textureSRGB.size()) ? meshVk->textureSRGB[i] : false;
+      auto        tex      = loadTexture(meshVk->textures[i], basePath, sRGB, embedded);
+      if(tex)
+      {
+        localToGlobal[i] = static_cast<int>(tex->globalIndex);
+        meshVk->loadedTextures.push_back(tex);
+      }
+    }
+
+    // Free embedded image data — no longer needed after GPU upload
+    meshVk->embeddedImages.clear();
+    meshVk->embeddedImages.shrink_to_fit();
+
+    // Remap all material texture IDs from loader-local to global descriptor index
+    auto remap = [&](int& id) {
+      if(id >= 0 && id < static_cast<int>(localToGlobal.size()))
+        id = localToGlobal[id];
+      else
+        id = -1;
+    };
+    for(auto& mat : meshVk->materials)
+    {
+      remap(mat.baseColorTexture);
+      remap(mat.metallicRoughnessTexture);
+      remap(mat.normalTexture);
+      remap(mat.emissiveTexture);
+      remap(mat.occlusionTexture);
+      remap(mat.specularTexture);
+      remap(mat.specularColorTexture);
+      remap(mat.clearcoatTexture);
+      remap(mat.clearcoatRoughnessTexture);
+      remap(mat.pbrSgDiffuseTexture);
+      remap(mat.pbrSgSpecularGlossinessTexture);
+    }
+  }
+
+  meshVk->path = filename.string();
+  registerMesh(meshVk);
 
   // Create default instance at origin
-  m_lastCreatedInstance = createInstance(mesh);
+  m_lastCreatedInstance = createInstance(meshVk);
 
-  return mesh;
+  return meshVk;
 }
 
-// Low-level API: Create mesh from raw data (reusable for light proxies, procedural geometry, etc.)
-std::shared_ptr<MeshVk> MeshManagerVk::createMesh(const std::string&              name,
-                                                  const std::vector<ObjVertex>&   vertices,
-                                                  const std::vector<uint32_t>&    indices,
-                                                  const std::vector<ObjMaterial>& materials,
-                                                  const std::vector<uint32_t>&    matIndices)
+// ---------------------------------------------------------------------------
+// Texture loading with deduplication
+// ---------------------------------------------------------------------------
+
+std::shared_ptr<MeshTexture> MeshManagerVk::loadTexture(const std::filesystem::path& texturePath,
+                                                        const std::filesystem::path& basePath,
+                                                        bool                         sRGB,
+                                                        const std::vector<uint8_t>&  embeddedData)
 {
-  auto mesh        = std::make_shared<MeshVk>();
-  mesh->path       = "";  // Path is only meaningful for loaded files
-  mesh->nbIndices  = static_cast<uint32_t>(indices.size());
-  mesh->nbVertices = static_cast<uint32_t>(vertices.size());
-
-  // Store RAM copies - buffers will be allocated AND uploaded in processVramUpdates()
-  mesh->vertexData   = vertices;
-  mesh->indexData    = indices;
-  mesh->materials    = materials;
-  mesh->matIndexData = matIndices;
-
-  // Generate material names if not provided
-  mesh->matNames.resize(materials.size());
-  for(size_t i = 0; i < materials.size(); ++i)
+  // Build deduplication key (includes sRGB flag — same image as color vs data needs separate GPU resources)
+  std::string key;
+  if(texturePath.string().find("<embedded>:") == 0)
   {
-    mesh->matNames[i] = "material_" + std::to_string(i);
+    key = basePath.string() + "/" + texturePath.string();
+  }
+  else
+  {
+    auto            resolved = basePath / texturePath;
+    std::error_code ec;
+    auto            canonical = std::filesystem::weakly_canonical(resolved, ec);
+    key                       = ec ? resolved.string() : canonical.string();
+  }
+  if(sRGB)
+    key += ":srgb";
+
+  // Check cache
+  auto it = m_textureCache.find(key);
+  if(it != m_textureCache.end())
+  {
+    if(auto existing = it->second.lock())
+      return existing;
+    m_textureCache.erase(it);  // expired
+  }
+
+  // Load pixel data
+  int            width = 0, height = 0, channels = 0;
+  unsigned char* pixels = nullptr;
+
+  if(!embeddedData.empty())
+  {
+    pixels = stbi_load_from_memory(embeddedData.data(), static_cast<int>(embeddedData.size()), &width, &height, &channels, 4);
+  }
+  else if(texturePath.string().find("<embedded>:") != 0)
+  {
+    auto resolved = basePath / texturePath;
+    pixels        = stbi_load(resolved.string().c_str(), &width, &height, &channels, 4);
+  }
+
+  if(!pixels)
+  {
+    LOGW("Failed to load texture: %s", key.c_str());
+    return nullptr;
+  }
+
+  // Create VkImage and upload
+  auto meshTex  = std::make_shared<MeshTexture>();
+  meshTex->path = key;
+
+  VkImageCreateInfo imgInfo{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+  imgInfo.imageType   = VK_IMAGE_TYPE_2D;
+  imgInfo.format      = sRGB ? VK_FORMAT_R8G8B8A8_SRGB : VK_FORMAT_R8G8B8A8_UNORM;
+  imgInfo.extent      = {static_cast<uint32_t>(width), static_cast<uint32_t>(height), 1};
+  imgInfo.mipLevels   = 1;
+  imgInfo.arrayLayers = 1;
+  imgInfo.samples     = VK_SAMPLE_COUNT_1_BIT;
+  imgInfo.tiling      = VK_IMAGE_TILING_OPTIMAL;
+  imgInfo.usage       = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+
+  NVVK_CHECK(m_alloc->createImage(meshTex->image, imgInfo, DEFAULT_VkImageViewCreateInfo));
+
+  // Upload pixel data
+  size_t          dataSize = static_cast<size_t>(width) * height * 4;
+  VkCommandBuffer cmd      = m_app->createTempCmdBuffer();
+  NVVK_CHECK(m_uploader->appendImage(meshTex->image, std::span<uint8_t>(pixels, dataSize), VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL));
+  m_uploader->cmdUploadAppended(cmd);
+  m_app->submitAndWaitTempCmdBuffer(cmd);
+  m_uploader->releaseStaging();
+
+  stbi_image_free(pixels);
+
+  // Attach sampler to descriptor
+  meshTex->image.descriptor.sampler = *m_sampler;
+
+  // Assign global index and store
+  meshTex->globalIndex = static_cast<uint32_t>(m_meshTextures.size());
+  m_meshTextures.push_back(meshTex);
+  m_textureCache[key] = meshTex;
+  m_meshTexturesDirty = true;
+
+  LOGI("Loaded mesh texture [%u]: %s (%dx%d)\n", meshTex->globalIndex, texturePath.string().c_str(), width, height);
+
+  return meshTex;
+}
+
+void MeshManagerVk::pruneExpiredTextures()
+{
+  // Remove expired weak_ptrs from cache
+  for(auto it = m_textureCache.begin(); it != m_textureCache.end();)
+  {
+    if(it->second.expired())
+      it = m_textureCache.erase(it);
+    else
+      ++it;
+  }
+
+  // Build old → new index mapping while compacting the texture array
+  std::unordered_map<uint32_t, uint32_t>    oldToNew;
+  std::vector<std::shared_ptr<MeshTexture>> surviving;
+
+  for(auto& tex : m_meshTextures)
+  {
+    if(tex.use_count() > 1)  // >1 means a mesh still holds a reference
+    {
+      uint32_t oldIdx  = tex->globalIndex;
+      tex->globalIndex = static_cast<uint32_t>(surviving.size());
+      oldToNew[oldIdx] = tex->globalIndex;
+      surviving.push_back(tex);
+    }
+    else
+    {
+      m_alloc->destroyImage(tex->image);
+    }
+  }
+
+  if(surviving.size() == m_meshTextures.size())
+    return;  // nothing changed
+
+  m_meshTextures      = std::move(surviving);
+  m_meshTexturesDirty = true;
+
+  // Remap material texture IDs in all live meshes
+  auto remap = [&](int& id) {
+    if(id < 0)
+      return;
+    auto it = oldToNew.find(static_cast<uint32_t>(id));
+    id      = (it != oldToNew.end()) ? static_cast<int>(it->second) : -1;
+  };
+
+  for(auto& mesh : meshes)
+  {
+    if(!mesh)
+      continue;
+
+    // Also prune the mesh's own loadedTextures (remove expired shared_ptrs)
+    mesh->loadedTextures.erase(std::remove_if(mesh->loadedTextures.begin(), mesh->loadedTextures.end(),
+                                              [](const auto& t) { return !t; }),
+                               mesh->loadedTextures.end());
+
+    for(auto& mat : mesh->materials)
+    {
+      remap(mat.baseColorTexture);
+      remap(mat.metallicRoughnessTexture);
+      remap(mat.normalTexture);
+      remap(mat.emissiveTexture);
+      remap(mat.occlusionTexture);
+      remap(mat.specularTexture);
+      remap(mat.specularColorTexture);
+      remap(mat.clearcoatTexture);
+      remap(mat.clearcoatRoughnessTexture);
+      remap(mat.pbrSgDiffuseTexture);
+      remap(mat.pbrSgSpecularGlossinessTexture);
+    }
+    mesh->flags |= MeshVk::Flags::eMaterialsChanged;
+  }
+  pendingRequests |= Request::eUpdateMaterials;
+}
+
+std::shared_ptr<MeshVk> MeshManagerVk::registerMesh(std::shared_ptr<MeshVk> meshVk)
+{
+  // Generate default material names if not provided
+  if(meshVk->matNames.empty())
+  {
+    meshVk->matNames.resize(meshVk->materials.size());
+    for(size_t i = 0; i < meshVk->materials.size(); ++i)
+      meshVk->matNames[i] = "material_" + std::to_string(i);
   }
 
   // Set flag: needs GPU upload (buffers NOT allocated yet)
-  mesh->flags |= MeshVk::Flags::eNew;
+  meshVk->flags |= MeshVk::Flags::eNew;
 
   // Set index and store mesh
-  mesh->index = meshes.size();
-  meshes.push_back(mesh);
+  meshVk->index = meshes.size();
+  meshes.push_back(meshVk);
 
   // Request GPU sync (deferred to processVramUpdates)
   pendingRequests |= Request::eUpdateDescriptors;
   pendingRequests |= Request::eRebuildBLAS;
 
-  LOGD("createMesh: Created mesh '%s' (meshes.size=%zu)\n", name.c_str(), meshes.size());
+  LOGD("registerMesh: Registered mesh '%s' (meshes.size=%zu)\n", meshVk->path.c_str(), meshes.size());
 
-  return mesh;
+  return meshVk;
 }
 
 // Create instance of existing mesh (returns shared_ptr to instance)
@@ -290,7 +505,7 @@ std::shared_ptr<MeshInstanceVk> MeshManagerVk::duplicateInstance(std::shared_ptr
   return newInstance;
 }
 
-void MeshManagerVk::updateObjDescriptionBuffer()
+void MeshManagerVk::updateMeshDescriptionBuffer()
 {
   // Rebuild objectDescriptions from instances set
   objectDescriptions.clear();
@@ -303,15 +518,19 @@ void MeshManagerVk::updateObjDescriptionBuffer()
     shaderio::MeshDesc desc{};
 
     // Geometry addresses (from mesh)
-    desc.vertexAddress        = (shaderio::ObjVertex*)instance->mesh->vertexBuffer.address;
+    desc.vertexAddress        = (shaderio::Vertex*)instance->mesh->vertexBuffer.address;
     desc.indexAddress         = (uint32_t*)instance->mesh->indexBuffer.address;
-    desc.materialAddress      = (shaderio::ObjMaterial*)instance->mesh->materialsBuffer.address;
+    desc.materialAddress      = (shaderio::Material*)instance->mesh->materialsBuffer.address;
     desc.materialIndexAddress = (uint32_t*)instance->mesh->matIndexBuffer.address;
+
+    // Visibility
+    desc.show = instance->show ? 1 : 0;
 
     // Instance transform
     desc.transform                = instance->transform;
     desc.transformInverse         = instance->transformInverse;
     desc.transformRotScaleInverse = instance->transformRotScaleInverse;
+    desc.prevTransform            = instance->prevTransform;
 
     objectDescriptions.push_back(desc);
   }
@@ -377,11 +596,11 @@ nvvk::AccelerationStructureGeometryInfo MeshManagerVk::rtxCreateMeshVkKHR(const 
   triangles.sType                    = VK_STRUCTURE_TYPE_ACCELERATION_STRUCTURE_GEOMETRY_TRIANGLES_DATA_KHR;
   triangles.vertexFormat             = VK_FORMAT_R32G32B32_SFLOAT;
   triangles.vertexData.deviceAddress = model.vertexBuffer.address;
-  triangles.vertexStride             = sizeof(ObjVertex);
+  triangles.vertexStride             = sizeof(Vertex);
   triangles.indexType                = VK_INDEX_TYPE_UINT32;
   triangles.indexData.deviceAddress  = model.indexBuffer.address;
   triangles.transformData            = {};  // Identity
-  triangles.maxVertex                = model.nbVertices - 1;
+  triangles.maxVertex                = model.gpuVertexCount - 1;
 
   // Identify the above data as containing opaque triangles.
   VkAccelerationStructureGeometryKHR geometry{};
@@ -393,7 +612,7 @@ nvvk::AccelerationStructureGeometryInfo MeshManagerVk::rtxCreateMeshVkKHR(const 
   // The entire array will be used to build the BLAS.
   VkAccelerationStructureBuildRangeInfoKHR rangeInfo{};
   rangeInfo.firstVertex     = 0;
-  rangeInfo.primitiveCount  = model.nbIndices / 3;
+  rangeInfo.primitiveCount  = model.gpuIndexCount / 3;
   rangeInfo.primitiveOffset = 0;
   rangeInfo.transformOffset = 0;
 
@@ -446,7 +665,7 @@ void MeshManagerVk::rtxInitAccelerationStructures()
       asInst.flags                          = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
       // Use instance type for mask (MeshType enum values match RTX masks)
       asInst.mask                                   = static_cast<uint32_t>(instance->type);
-      asInst.instanceShaderBindingTableRecordOffset = 1;  // We will use the same closest hit hit group for all objects
+      asInst.instanceShaderBindingTableRecordOffset = meshSbtRecordOffset;
       tlasInstances.emplace_back(asInst);
       descriptorIndex++;
     }
@@ -482,7 +701,7 @@ void MeshManagerVk::rtxUpdateTopLevelAccelerationStructure()
       asInst.flags                          = VK_GEOMETRY_INSTANCE_TRIANGLE_FACING_CULL_DISABLE_BIT_KHR;
       // Use instance type for mask (MeshType enum values match RTX masks)
       asInst.mask                                   = static_cast<uint32_t>(instance->type);
-      asInst.instanceShaderBindingTableRecordOffset = 1;  // We will use the same closest hit hit group for all objects
+      asInst.instanceShaderBindingTableRecordOffset = meshSbtRecordOffset;
       tlasInstances.emplace_back(asInst);
       descriptorIndex++;
     }
@@ -573,6 +792,7 @@ void MeshManagerVk::updateInstanceTransform(std::shared_ptr<MeshInstanceVk> inst
 
   // Caller has already modified instance->transform in RAM
   // Just set flag and request GPU update
+  instance->transformDirtyCount = 2;  // Two descriptor uploads needed for DLSS motion vectors
   instance->flags |= MeshInstanceVk::Flags::eTransformChanged;
   pendingRequests |= Request::eUpdateTransformsOnly;
 }
@@ -595,6 +815,11 @@ void MeshManagerVk::updateMeshMaterials(std::shared_ptr<MeshVk> mesh)
   // Just mark for GPU upload
   mesh->flags |= MeshVk::Flags::eMaterialsChanged;
   pendingRequests |= Request::eUpdateMaterials;
+}
+
+void MeshManagerVk::setVisibilityDirty()
+{
+  pendingRequests |= Request::eUpdateDescriptors;
 }
 
 // =============================================================================
@@ -694,6 +919,9 @@ void MeshManagerVk::processVramUpdates(bool processRtx)
       pendingRequests |= Request::eRebuildTLAS;
     }
 
+    // Free GPU textures no longer referenced by any mesh
+    pruneExpiredTextures();
+
     pendingRequests &= ~Request::eProcessDeletions;
   }
 
@@ -712,12 +940,12 @@ void MeshManagerVk::processVramUpdates(bool processRtx)
       needsUpload = true;
 
       // Clear RAM copies after upload is queued (optional optimization)
-      mesh->vertexData.clear();
-      mesh->vertexData.shrink_to_fit();
-      mesh->indexData.clear();
-      mesh->indexData.shrink_to_fit();
-      mesh->matIndexData.clear();
-      mesh->matIndexData.shrink_to_fit();
+      mesh->vertices.clear();
+      mesh->vertices.shrink_to_fit();
+      mesh->indices.clear();
+      mesh->indices.shrink_to_fit();
+      mesh->matIndices.clear();
+      mesh->matIndices.shrink_to_fit();
 
       descriptorsNeedRebuild = true;
       pendingRequests |= Request::eRebuildBLAS;
@@ -741,8 +969,9 @@ void MeshManagerVk::processVramUpdates(bool processRtx)
     {
       // Mesh geometry already uploaded above or in previous frame
       // Just needs descriptor entry
-      instanceCountChanged   = true;
-      descriptorsNeedRebuild = true;
+      instance->prevTransform = instance->transform;  // No object motion on first frame
+      instanceCountChanged    = true;
+      descriptorsNeedRebuild  = true;
       instance->flags &= ~MeshInstanceVk::Flags::eNew;  // Clear flag
     }
   }
@@ -799,16 +1028,9 @@ void MeshManagerVk::processVramUpdates(bool processRtx)
       // Update TLAS with new transforms (for RTX pipeline - no rebuild, just update)
       rtxUpdateTopLevelAccelerationStructure();
 
-      // Transform changes also need descriptor updates (for raster pipeline)
-      // MeshDesc contains transform matrices that shaders read
+      // Transform changes also need descriptor updates
+      // (eTransformChanged instance flags are cleared in PHASE 4 post-upload)
       pendingRequests |= Request::eUpdateDescriptors;
-
-      // Clear flags
-      for(const auto& instance : instances)
-      {
-        instance->flags &= ~MeshInstanceVk::Flags::eTransformChanged;
-      }
-
       pendingRequests &= ~Request::eUpdateTransformsOnly;
     }
   }
@@ -822,18 +1044,23 @@ void MeshManagerVk::processVramUpdates(bool processRtx)
     // (raster shaders read MeshDesc transform matrices from descriptor buffer)
     if(static_cast<uint32_t>(pendingRequests & Request::eUpdateTransformsOnly))
     {
-      // Clear instance flags to prevent duplicate processing
-      for(const auto& instance : instances)
-      {
-        instance->flags &= ~MeshInstanceVk::Flags::eTransformChanged;
-      }
-
       // Trigger descriptor buffer update (needed for raster pipeline)
+      // (eTransformChanged instance flags are cleared in PHASE 4 post-upload)
       pendingRequests |= Request::eUpdateDescriptors;
 
       // Clear UpdateTransformsOnly (we've handled it by updating descriptors)
       // When switching to RTX, RebuildBLAS/RebuildTLAS flags will trigger full rebuild
       pendingRequests &= ~Request::eUpdateTransformsOnly;
+    }
+  }
+
+  // transformDirtyCount > 0 triggers additional descriptor uploads for DLSS object motion vectors
+  for(const auto& instance : instances)
+  {
+    if(instance && instance->transformDirtyCount > 0)
+    {
+      pendingRequests |= Request::eUpdateDescriptors;
+      break;
     }
   }
 
@@ -844,8 +1071,33 @@ void MeshManagerVk::processVramUpdates(bool processRtx)
   // Rebuild descriptors if needed (must be after BLAS/TLAS so addresses are valid)
   if(descriptorsNeedRebuild || static_cast<uint32_t>(pendingRequests & Request::eUpdateDescriptors))
   {
-    updateObjDescriptionBuffer();
+    updateMeshDescriptionBuffer();
     pendingRequests &= ~Request::eUpdateDescriptors;
+
+    // DLSS object motion vectors: decrement counter after each descriptor upload.
+    // Count 2 → 1: uploaded old prevTransform, sync CPU prevTransform = transform for next round.
+    // Count 1 → 0: uploaded prevTransform == transform (zero object motion), clear flag.
+    for(const auto& instance : instances)
+    {
+      if(!instance || instance->transformDirtyCount <= 0)
+        continue;
+      instance->transformDirtyCount--;
+      if(instance->transformDirtyCount == 1)
+        instance->prevTransform = instance->transform;
+      if(instance->transformDirtyCount <= 0)
+        instance->flags &= ~MeshInstanceVk::Flags::eTransformChanged;
+    }
+
+    // Keep pendingRequests alive if any instance still needs descriptor uploads,
+    // so AssetManagerVk::processVramUpdates calls us again next frame.
+    for(const auto& instance : instances)
+    {
+      if(instance && instance->transformDirtyCount > 0)
+      {
+        pendingRequests |= Request::eUpdateDescriptors;
+        break;
+      }
+    }
   }
 }
 

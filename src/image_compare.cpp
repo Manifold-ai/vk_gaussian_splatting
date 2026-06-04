@@ -778,8 +778,7 @@ void ImageCompare::computeMetrics(VkCommandBuffer cmd, VkExtent2D outputSize)
   // Push constants
   using namespace shaderio::imcmp;
 
-  // Pre-calculate divider for normalization (width * height * 3)
-  // This is used in shader to normalize before accumulation, preventing uint32 overflow
+  // Pre-calculate divider (width * height * 3) — used by FLIP normalization in shader
   float sampleDivider = float(m_captureSize.width * m_captureSize.height * 3);
 
   // Pixels Per Degree (PPD) - viewing distance parameter for FLIP
@@ -866,17 +865,19 @@ void ImageCompare::collectMetricsResult()
 
   // Read the results from mapped memory
   uint32_t* resultData = (uint32_t*)m_metricsResultHost.mapping;
-  uint32_t  mseFixed   = resultData[0];  // MSE value (fixed-point, already normalized in shader)
-  // resultData[1] is reserved (pixel counting removed for optimization)
+  uint32_t  mseFixed   = resultData[0];  // MSE sum (fixed-point * 10000, NOT normalized)
+  // resultData[1] is reserved
   uint32_t flipFixed = resultData[2];  // FLIP value (fixed-point, already normalized in shader)
 
   //==========================================================================
   // MSE and PSNR Computation
   //==========================================================================
 
-  // Convert back from fixed-point (shader uses 1e9 multiplier)
-  // Values are already normalized by dividing by (width * height * 3) in shader
-  m_mseValue = (float)mseFixed / 1000000000.0f;
+  // Convert back from fixed-point: shader uses workgroup reduction (float precision)
+  // then accumulates per-workgroup sums * 10000 without per-pixel normalization.
+  // We divide by the multiplier (10000) and by (W * H * 3) to get the true MSE.
+  float sampleDivider = float(m_captureSize.width) * float(m_captureSize.height) * 3.0f;
+  m_mseValue          = (float)mseFixed / 10000.0f / sampleDivider;
 
   // Calculate PSNR: 10 * log10(MAX^2 / MSE)
   // For normalized color values, MAX = 1.0

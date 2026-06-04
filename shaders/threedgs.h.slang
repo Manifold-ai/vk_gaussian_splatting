@@ -20,6 +20,10 @@
 #ifndef _3DGS_CORE_H_
 #define _3DGS_CORE_H_
 
+#include "quaternions.h.slang"
+#include "shaderio.h"
+#include "threedgs_particle_storage.h.slang"
+
 // cov3Dm: 3D covariance matrix
 // splatCenterView: splat center in view coordinates
 // returns: the upper-left 2x2 portion of the projected 3D covariance matrix (see comments in function body). 
@@ -61,17 +65,14 @@ bool threedgsProjectedExtentBasis(float3 cov2Dv, float stdDev, float splatScale,
 {
 
 #if MS_ANTIALIASING == 1
-  // This mode is used when model is reconstructed using MipSplatting
+  // MipSplatting antialiasing: 2D covariance low-pass filter + opacity compensation.
   // https://niujinshuchong.github.io/mip-splatting/
   const float detOrig = cov2Dv[0] * cov2Dv[2] - cov2Dv[1] * cov2Dv[1];
 #endif
-
-  cov2Dv[0] += 0.3;
-  cov2Dv[2] += 0.3;
-
+  cov2Dv[0] += COVARIANCE_DILATION;
+  cov2Dv[2] += COVARIANCE_DILATION;
 #if MS_ANTIALIASING == 1
   const float detBlur = cov2Dv[0] * cov2Dv[2] - cov2Dv[1] * cov2Dv[1];
-  // apply the alpha compensation (required for correct stochastic rendering)
   opacity *= sqrt(max(detOrig / detBlur, 0.0));
 #endif
 
@@ -94,7 +95,7 @@ bool threedgsProjectedExtentBasis(float3 cov2Dv, float stdDev, float splatScale,
   const float D           = a * d - b * b;
   const float trace       = a + d;
   const float traceOver2  = 0.5 * trace;
-  const float term2       = sqrt(max(0.1f, traceOver2 * traceOver2 - D));
+  const float term2       = sqrt(max(0.0, traceOver2 * traceOver2 - D));
   float       eigenValue1 = traceOver2 + term2;
   float       eigenValue2 = traceOver2 - term2;
 
@@ -118,6 +119,108 @@ bool threedgsProjectedExtentBasis(float3 cov2Dv, float stdDev, float splatScale,
   basisVector2 = eigenVector2 * splatScale * min(stdDev * sqrt(eigenValue2), 2048.0);
 
   return true;
+}
+
+// ============================================================================
+// Particle descriptor and surface-normal helpers shared between the raster and
+// ray-tracing pipelines.
+// ============================================================================
+
+struct ThreedgsParticle
+{
+  int      id;           // particle Index
+  float3   position;     // particle position (mean)
+  float3   scale;        // particle scale
+  quat     quaternion;   // particle rotation as a quaternion
+  float3x3 invRotation;  // inverse of particle rotation matrix
+  float4   color;        // particle color (Non view dependent RGB + density/opacity in alpha channel)
+
+  // Indexed constructor
+  // Fetch non view dependent data from storage via SplatSetDesc
+  // If psrOnly is true, color is skipped, and only
+  // Position Scale Rotations are loaded
+  __init(SplatSetDesc splatSetDesc, int index, bool psrOnly = false)
+  {
+    id          = index;
+    position    = fetchCenter(splatSetDesc, id);
+    scale       = exp(fetchScale(splatSetDesc, id));
+    quaternion  = vec4toQuat(normalize(fetchRotation(splatSetDesc, id)));
+    invRotation = quatToMat3Transpose(quaternion);
+
+    if(!psrOnly)
+    {
+      color = fetchColor(splatSetDesc, id);
+    }
+  }
+}
+
+// Compute the ellipsoid normal using the maximum density plane approximation.
+// Based on the StochasticSplats approach: approximates the iso-density surface
+// with a tangent plane at the Gaussian center, then derives the normal from
+// the plane equation. Returns the normal in model space.
+float3 computeEllipsoidNormalMaxDensityPlane(in FrameInfo         frameInfo,
+                                             in float3            modelRayOrigin,
+                                             in float3            modelRayDirection,
+                                             in ThreedgsParticle particle)
+{
+  float3 normalModel;
+
+  // Check for degenerate scale components (very flat or line particles)
+  bool3 isSmall    = particle.scale < float3(frameInfo.thinParticleThreshold);
+  int   smallCount = (isSmall.x ? 1 : 0) + (isSmall.y ? 1 : 0) + (isSmall.z ? 1 : 0);
+
+  float3x3 rotMat      = transpose(particle.invRotation);
+  float3   localVector = modelRayOrigin - particle.position;
+
+  if(smallCount == 0)
+  {
+    // Maximum density plane approximation
+    // Theory: At the Gaussian center, the iso-density surface can be approximated by a tangent plane.
+    // See StochasticSplats https://github.com/ubc-vision/stochasticsplats
+
+    // Normal case: compute gradient-based normal
+    float3 invScaleSq = float3(1.0) / (particle.scale * particle.scale);
+
+    // Transform to canonical space, apply inverse scale squared, transform back
+    float3 canonicalVector = mul(localVector, particle.invRotation);
+    float3 scaledVector    = canonicalVector * invScaleSq;
+    // Transform back to model space using R
+    float3 gradient = mul(scaledVector, rotMat);
+
+    // The gradient points in the direction of maximum density increase
+    // For the normal, we want it pointing towards the ray origin (outward facing)
+    float gradientLengthSq = dot(gradient, gradient);
+
+    normalModel = gradient * rsqrt(gradientLengthSq);
+
+    // Ensure normal points towards ray origin (same side as view direction)
+    if(dot(normalModel, localVector) < 0.0)
+    {
+      normalModel = -normalModel;
+    }
+  }
+  else if(smallCount == 1)
+  {
+    // Exactly one scale is small: flat particle (disk/ellipse)
+    // Normal is perpendicular to the plane, along the small scale axis
+    float3 axisLocal = (isSmall.x) ? float3(1.0, 0.0, 0.0) : ((isSmall.y) ? float3(0.0, 1.0, 0.0) : float3(0.0, 0.0, 1.0));
+
+    // Transform from canonical space to model space using rotation matrix
+    normalModel = mul(axisLocal, rotMat);
+
+    // Ensure normal points towards ray origin (outward facing)
+    if(dot(normalModel, localVector) < 0.0)
+    {
+      normalModel = -normalModel;
+    }
+  }
+  else
+  {
+    // Two or more scales are degenerate (line or point): fall back to view direction
+    normalModel = -modelRayDirection;
+  }
+
+  return normalModel;
 }
 
 #endif

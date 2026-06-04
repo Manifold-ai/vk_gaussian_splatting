@@ -178,6 +178,9 @@ public:
   TransformMode  getTransformMode() const { return m_mode; }
   TransformSpace getTransformSpace() const { return m_space; }
   bool           isSnapEnabled() const { return m_enableSnapping; }
+  float          getSnapTranslate() const { return m_snapTranslate; }
+  float          getSnapRotate() const { return m_snapRotate; }
+  float          getSnapScale() const { return m_snapScale; }
 
   //-----------------------------------------------------------------------------
   // Interaction

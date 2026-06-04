@@ -23,6 +23,8 @@
 #include <nvvk/graphics_pipeline.hpp>
 #include <nvutils/logger.hpp>
 
+#include "hardware_support.h"
+
 namespace vk_gaussian_splatting {
 
 //-----------------------------------------------------------------------------
@@ -206,8 +208,13 @@ void GridHelperVk::createPipeline()
   pipelineState.rasterizationState.lineWidth = 3.0f;  // Line width (requires wideLines feature)
 
   // Enable smooth line rasterization (anti-aliased lines - Vulkan 1.4 core feature)
-  // nvvk::GraphicsPipelineState has rasterizationLineState which gets auto-chained to pNext
-  pipelineState.rasterizationLineState.lineRasterizationMode = VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH;
+  // nvvk::GraphicsPipelineState has rasterizationLineState which gets auto-chained to pNext.
+  // smoothLines is optional in Vulkan 1.4: requesting RECTANGULAR_SMOOTH on a
+  // device that does not enable VkPhysicalDeviceVulkan14Features::smoothLines
+  // (e.g. Intel Arc) is a validation error. Fall back to the default mode
+  // (implementation-defined, always allowed) when unsupported.
+  pipelineState.rasterizationLineState.lineRasterizationMode =
+      isSupported.smoothLines ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_SMOOTH : VK_LINE_RASTERIZATION_MODE_DEFAULT;
 
   // Depth: test enabled, write disabled (for proper alpha blending)
   pipelineState.depthStencilState.depthTestEnable  = VK_TRUE;

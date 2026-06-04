@@ -27,31 +27,6 @@ if (NOT DISABLE_DEFAULT_SCENE)
   download_files(FILENAMES flowers_1.zip EXTRACT)
 endif()
 
-# set with -DDISABLE_MESH_ASSETS_DOWNLOAD=ON on command line or use cmake-gui to set the parameter
-option(DISABLE_MESH_ASSETS_DOWNLOAD "If set to true the test mesh assets are not downloaded by CMake" OFF)
-
-if (NOT DISABLE_MESH_ASSETS_DOWNLOAD)
-  download_files(
-    FILENAMES 
-     armadillo.obj    
-     xyzrgb_dragon.obj
-     beast.obj        
-     happy.obj        
-     horse.obj        
-     lucy.obj         
-     nefertiti.obj    
-     teapot.obj       
-   URLS 
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/armadillo.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/xyzrgb_dragon.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/beast.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/happy.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/horse.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/lucy.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/nefertiti.obj
-     https://raw.githubusercontent.com/alecjacobson/common-3d-test-models/master/data/teapot.obj)
-endif()
-
 #####################################################################################
 # additions of 3rdparty
 
@@ -123,6 +98,7 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
   nvpro2::nvgpu_monitor
   vk_radix_sort
   spz::spz
+  tinygltf
 )
 
 add_project_definitions(${PROJECT_NAME})

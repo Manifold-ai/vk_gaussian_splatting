@@ -78,7 +78,7 @@ bool loadSplatFile(const std::filesystem::path&                          filenam
     return false;
   }
 
-  LOGI("Loading .splat file with %zu Gaussians...\n", numSplats);
+  LOGI("Loading .splat file with %u Gaussians...\n", numSplats);
 
   // Read entire file into memory
   file.seekg(0, std::ios::beg);
@@ -177,7 +177,7 @@ bool loadSplatFile(const std::filesystem::path&                          filenam
   // Print timing info
   auto      endTime  = std::chrono::high_resolution_clock::now();
   long long loadTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
-  LOGI("Loaded %zu splats from .splat file in %lldms\n", numSplats, loadTime);
+  LOGI("Loaded %u splats from .splat file in %lldms\n", numSplats, loadTime);
 
   return true;
 }

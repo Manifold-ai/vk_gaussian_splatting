@@ -24,6 +24,7 @@
 #include <set>
 #include <memory>
 #include <algorithm>
+#include <unordered_map>
 
 #include <glm/glm.hpp>
 
@@ -36,7 +37,7 @@
 
 #include "shaderio.h"
 
-#include "obj_loader.h"
+#include "mesh.h"
 #include "light_manager_vk.h"
 
 namespace vk_gaussian_splatting {
@@ -58,8 +59,16 @@ struct SharedPtrCompare
   }
 };
 
-// The OBJ model (Vk suffix for consistency with Vulkan class naming convention)
-struct MeshVk
+// GPU texture loaded from a mesh material (shared across meshes via shared_ptr)
+struct MeshTexture
+{
+  nvvk::Image image;        // VkImage + view + descriptor (includes sampler)
+  std::string path;         // Absolute file path or synthetic key (dedup key)
+  uint32_t    globalIndex;  // Index in the BINDING_MESH_TEXTURES descriptor array
+};
+
+// Mesh GPU resource (inherits RAM data from Mesh)
+struct MeshVk : public Mesh
 {
   enum class Flags : uint32_t
   {
@@ -75,22 +84,18 @@ struct MeshVk
   bool shouldRender() const { return !isMarkedForDeletion(); }
 
   size_t       index{0};  // Position in MeshManagerVk::meshes vector
-  std::string  path;      // Full file path (e.g., "C:/models/teapot.obj")
-  uint32_t     nbIndices{0};
-  uint32_t     nbVertices{0};
-  nvvk::Buffer vertexBuffer;     // Device buffer of all 'Vertex' (allocated in processVramUpdates)
-  nvvk::Buffer indexBuffer;      // Device buffer of the indices forming triangles
-  nvvk::Buffer materialsBuffer;  // Device buffer of 'Wavefront' materials
-  nvvk::Buffer matIndexBuffer;   // Device buffer of per face material IDs
-
-  // RAM storage (for upload to GPU in processVramUpdates)
-  std::vector<ObjVertex>   vertexData;    // RAM copy for upload
-  std::vector<uint32_t>    indexData;     // RAM copy for upload
-  std::vector<ObjMaterial> materials;     // RAM copy for upload
-  std::vector<uint32_t>    matIndexData;  // RAM copy for upload
-  std::vector<std::string> matNames;      // name of each material stored in materials
+  uint32_t     gpuVertexCount{0};  // Cached count (survives RAM clear after GPU upload)
+  uint32_t     gpuIndexCount{0};   // Cached count (survives RAM clear after GPU upload)
+  nvvk::Buffer vertexBuffer;       // Device buffer of all 'Vertex'
+  nvvk::Buffer indexBuffer;        // Device buffer of the indices forming triangles
+  nvvk::Buffer materialsBuffer;    // Device buffer of materials
+  nvvk::Buffer matIndexBuffer;     // Device buffer of per face material IDs
 
   Flags flags = Flags::eNone;  // Set by manager methods only
+
+  // Shared ownership of textures used by this mesh's materials.
+  // Prevents texture GPU resources from being freed while this mesh is alive.
+  std::vector<std::shared_ptr<MeshTexture>> loadedTextures;
 
   // Buffer management methods (called by MeshManagerVk)
   void initBuffers(nvvk::ResourceAllocator* alloc, nvvk::StagingUploader* uploader);
@@ -141,13 +146,17 @@ struct MeshInstanceVk
   glm::mat4 transform;                   // Matrix of the instance
   glm::mat4 transformInverse{};          // Inverse Matrix of the instance
   glm::mat3 transformRotScaleInverse{};  // Inverse of rotation-scale part (for normals)
+  glm::mat4 prevTransform{1.0f};         // Previous frame's transform (for DLSS object motion vectors)
+  int       transformDirtyCount{0};      // Countdown for descriptor uploads after transform change (2 → 0)
+
+  bool show = true;  // User visibility toggle (eye icon in asset tree)
 
   Flags flags = Flags::eNone;  // Set by manager methods only
 
   // Query methods for state
   bool isMarkedForDeletion() const { return static_cast<uint32_t>(flags) & static_cast<uint32_t>(Flags::eDelete); }
   bool shouldShowInUI() const { return !isMarkedForDeletion(); }
-  bool shouldRender() const { return !isMarkedForDeletion(); }
+  bool shouldRender() const { return show && !isMarkedForDeletion(); }
 
   // Note: mesh shared_ptr ensures mesh stays alive as long as instance exists
   // This provides automatic lifetime management via reference counting
@@ -201,6 +210,7 @@ public:
 
   // RTX specifics
   AccelerationStructureHelperLB rtAccelerationStructures;
+  uint32_t meshSbtRecordOffset = 1;  // SBT hit group index for mesh instances (shifts when billboard hit group is present)
 
   // Deferred update requests
   Request pendingRequests = Request::eNone;
@@ -209,21 +219,34 @@ public:
   inline void init(nvapp::Application*                                 app,
                    nvvk::ResourceAllocator*                            alloc,
                    nvvk::StagingUploader*                              uploader,
+                   VkSampler*                                          sampler,
                    VkPhysicalDeviceAccelerationStructurePropertiesKHR* accelStructProps)
   {
     m_app      = app;
     m_alloc    = alloc;
     m_uploader = uploader;
+    m_sampler  = sampler;
     rtAccelerationStructures.init(m_alloc, m_uploader, m_app->getQueue(0), 2000, 2000);
   };
 
   inline void deinit(void)
   {
     reset();
+
+    // Free all remaining mesh textures
+    for(auto& tex : m_meshTextures)
+    {
+      if(tex)
+        m_alloc->destroyImage(tex->image);
+    }
+    m_meshTextures.clear();
+    m_textureCache.clear();
+
     rtAccelerationStructures.deinit();
     m_app      = {};
     m_alloc    = {};
     m_uploader = {};
+    m_sampler  = {};
   }
 
   // Reset all meshes and instances (for scene reset, not app exit)
@@ -264,14 +287,8 @@ public:
   // Creates both the mesh and a default instance at origin
   std::shared_ptr<MeshVk> loadModel(const std::filesystem::path& filename);
 
-  // Low-level API: Create mesh from raw data and upload to VRAM
-  // Returns shared_ptr to the created mesh (can be used to create instances)
-  // This is the reusable core that loadModel() calls internally
-  std::shared_ptr<MeshVk> createMesh(const std::string&              name,
-                                     const std::vector<ObjVertex>&   vertices,
-                                     const std::vector<uint32_t>&    indices,
-                                     const std::vector<ObjMaterial>& materials,
-                                     const std::vector<uint32_t>&    matIndices);
+  // Register a pre-populated MeshVk with the manager (defers GPU upload)
+  std::shared_ptr<MeshVk> registerMesh(std::shared_ptr<MeshVk> meshVk);
 
   // ===== INSTANCE MANAGEMENT =====
 
@@ -321,6 +338,9 @@ public:
   // Update mesh materials (materials already modified in RAM, sets MaterialsChanged flag)
   void updateMeshMaterials(std::shared_ptr<MeshVk> mesh);
 
+  // Notify that instance visibility changed (triggers descriptor rebuild)
+  void setVisibilityDirty();
+
   // Process all deferred VRAM updates
   // Order: Delete → Update (RAM→GPU sync) → Upload (rebuild GPU structures)
   // @param processRtx If true, process RTX acceleration structure updates. If false, defer RTX updates.
@@ -344,7 +364,30 @@ public:
 
   // update the buffer that stores the list of object IDs
   // and some per object information
-  void updateObjDescriptionBuffer();
+  void updateMeshDescriptionBuffer();
+
+  // --- Texture management ---
+
+  // Load a texture from file (or reuse from cache). basePath is the mesh file's directory.
+  // sRGB selects VK_FORMAT_R8G8B8A8_SRGB (color maps) vs UNORM (data maps like normal/occlusion).
+  std::shared_ptr<MeshTexture> loadTexture(const std::filesystem::path& texturePath,
+                                           const std::filesystem::path& basePath,
+                                           bool                         sRGB,
+                                           const std::vector<uint8_t>&  embeddedData = {});
+
+  // Remove expired entries from the cache and compact the texture table.
+  // Called after mesh deletion to free GPU textures no longer referenced.
+  void pruneExpiredTextures();
+
+  // Dirty flag: set when textures are loaded or freed, consumed by GaussianSplatting
+  bool consumeMeshTexturesDirty()
+  {
+    bool d              = m_meshTexturesDirty;
+    m_meshTexturesDirty = false;
+    return d;
+  }
+
+  const std::vector<std::shared_ptr<MeshTexture>>& getMeshTextures() const { return m_meshTextures; }
 
   // init BLAS and TLAS for all the loaded models
   void rtxInitAccelerationStructures();
@@ -369,6 +412,12 @@ private:
   nvapp::Application*      m_app{};
   nvvk::ResourceAllocator* m_alloc{};
   nvvk::StagingUploader*   m_uploader{};
+  VkSampler*               m_sampler{};  // Shared sampler for mesh textures
+
+  // Texture management
+  std::vector<std::shared_ptr<MeshTexture>> m_meshTextures;  // All live textures (dense, for descriptor writes)
+  std::unordered_map<std::string, std::weak_ptr<MeshTexture>> m_textureCache;  // path → weak_ptr for deduplication
+  bool                                                        m_meshTexturesDirty = false;
 
 public:
   // Last created instance pointer (for UI convenience after loadModel)

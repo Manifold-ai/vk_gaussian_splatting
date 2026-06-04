@@ -33,7 +33,7 @@
 #include <nvvk/staging.hpp>
 
 #include "shaderio.h"
-#include "obj_loader.h"
+#include "mesh.h"
 
 namespace vk_gaussian_splatting {
 class MeshManagerVk;    // Forward declaration
@@ -55,11 +55,12 @@ struct LightSourceVk
   float               innerConeAngle  = 30.0f;  // Spot light: inner cone (degrees)
   float               outerConeAngle  = 45.0f;  // Spot light: outer cone (degrees)
   int                 attenuationMode = 2;      // 0=None, 1=Linear, 2=Quadratic, 3=Physical
-  float               proxyScale      = 1.0f;   // Visualization scale (independent of range)
+  float               radius          = 1.0f;   // Light source radius (soft shadows + proxy visualization)
+  int                 enabled         = 1;      // 0=disabled, 1=enabled
 
   // C++ management data (NOT uploaded to GPU)
   std::shared_ptr<MeshVk> proxyMesh;      // Visualization mesh (sphere/cone/quad)
-  ObjMaterial             proxyMaterial;  // Emissive material (color = light color)
+  Material                proxyMaterial;  // Emissive material (color = light color)
 };
 
 // LightSourceInstanceVk: Light instance (light in the scene)

@@ -79,6 +79,11 @@ public:
   // Return if the DLSS is enabled
   bool isEnabled() const;
 
+  // Return whether DLSS Ray Reconstruction is actually usable at runtime
+  // (NGX initialized and DLSS-RR available on this device/driver). This is
+  // independent of the user-facing enable toggle returned by isEnabled().
+  bool isRuntimeSupported() const { return m_dlssSupported; }
+
   // Set DLSS enabled state
   void setEnabled(bool enabled)
   {
@@ -107,11 +112,11 @@ public:
   // This is the actual denoising call
   void denoise(VkCommandBuffer cmd, glm::vec2 jitter, const glm::mat4& modelView, const glm::mat4& projection, bool reset = false);
 
-  // This is for the UI
-  bool onUi();
-
   // Return the render size
   VkExtent2D getRenderSize() const { return m_dlssGBuffers.getSize(); }
+
+  // Return whether DLSS was initialized
+  bool isInitialized() const { return m_initialized; }
 
   // Check if the rendering size needs to be updated based on current settings
   bool needsSizeUpdate() const { return m_sizeModeChanged; }
@@ -132,13 +137,13 @@ private:
 
   // dereferenced by enum DlssImages, must be aligned
   std::vector<VkFormat> m_bufferInfos = {
-      {VK_FORMAT_R32G32B32A32_SFLOAT},  // DLSS - Rendered image       : eDlssInputImage
-      {VK_FORMAT_R8G8B8A8_UNORM},       // DLSS - BaseColor            : eDlssAlbedo
-      {VK_FORMAT_R16G16B16A16_SFLOAT},  // DLSS - SpecAlbedo           : eDlssSpecAlbedo
-      {VK_FORMAT_R16G16B16A16_SFLOAT},  // DLSS - Normal / Roughness   : eDlssNormalRoughness
-      {VK_FORMAT_R16G16_SFLOAT},        // DLSS - Motion vectors       : eDlssMotion
-      {VK_FORMAT_R16_SFLOAT},           // DLSS - ViewZ                : eDlssDepth
-      {VK_FORMAT_R8_UNORM},             // DLSS - Object ID            : eSelectImage (optional)
+      {VK_FORMAT_R32G32B32A32_SFLOAT},       // DLSS - Rendered image       : eDlssInputImage
+      {VK_FORMAT_A2B10G10R10_UNORM_PACK32},  // DLSS - BaseColor          : eDlssAlbedo
+      {VK_FORMAT_R16G16B16A16_SFLOAT},       // DLSS - SpecAlbedo           : eDlssSpecAlbedo
+      {VK_FORMAT_R16G16B16A16_SFLOAT},       // DLSS - Normal / Roughness   : eDlssNormalRoughness
+      {VK_FORMAT_R16G16_SFLOAT},             // DLSS - Motion vectors       : eDlssMotion
+      {VK_FORMAT_R16_SFLOAT},                // DLSS - ViewZ                : eDlssDepth
+      {VK_FORMAT_R8_UNORM},                  // DLSS - Object ID            : eSelectImage (optional)
   };
 
   nvvk::GBuffer m_dlssGBuffers{};  // G-Buffers: for denoising

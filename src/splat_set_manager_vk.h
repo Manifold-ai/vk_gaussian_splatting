@@ -22,6 +22,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #include <glm/glm.hpp>
@@ -82,6 +83,7 @@ struct SplatSetInstanceVk
   // Query methods for state
   bool isMarkedForDeletion() const { return static_cast<uint32_t>(flags) & static_cast<uint32_t>(Flags::eDelete); }
   bool shouldShowInUI() const { return !isMarkedForDeletion(); }
+  bool shouldRender() const { return show && !isMarkedForDeletion(); }
 
   size_t                      index{0};            // Position in SplatSetManagerVk::m_instances vector
   std::shared_ptr<SplatSetVk> splatSet = nullptr;  // Direct reference to base asset (replaces splatSetHandle)
@@ -95,15 +97,19 @@ struct SplatSetInstanceVk
   glm::mat4 transform                = glm::mat4(1.0f);
   glm::mat4 transformInverse         = glm::mat4(1.0f);
   glm::mat3 transformRotScaleInverse = glm::mat3(1.0f);  // Inverse of rotation-scale part
+  glm::mat4 prevTransform            = glm::mat4(1.0f);  // Previous frame's transform (for DLSS object motion vectors)
+  int       transformDirtyCount{0};  // Countdown for descriptor uploads after transform change (2 → 0)
 
   // Material (per-instance)
-  shaderio::ObjMaterial splatMaterial;
+  shaderio::Material splatMaterial;
 
   // GPU descriptor index (index into gpuDescriptorArray)
   uint32_t gpuDescriptorIndex = 0;
 
   // Display name (e.g., "Splat set 0 - garden.ply")
   std::string displayName;
+
+  bool show = true;  // User visibility toggle (eye icon in asset tree)
 
   Flags flags = Flags::eNone;  // Set by manager methods only
 
@@ -252,6 +258,9 @@ public:
   // This method just sets flags to trigger deferred GPU update
   void updateInstanceMaterial(std::shared_ptr<SplatSetInstanceVk> instance);
 
+  // Notify that instance visibility changed (triggers global index table + descriptor rebuild)
+  void setVisibilityDirty();
+
   // ===== DEFERRED UPDATE API =====
   // These methods set flags and requests - actual VRAM updates happen in processVramUpdates()
 
@@ -270,8 +279,15 @@ public:
   // @return true if tables were updated, false if no update was needed
   bool updateGlobalIndexTablesIfNeeded();
 
-  // Get total splat count across all instances
+  // Get total splat count across all instances (cached; updated by rebuildGlobalIndexTables)
   uint32_t getTotalGlobalSplatCount() const { return m_totalGlobalSplatCount; }
+
+  // Sum splat counts from live instances before the global index table is rebuilt
+  // (e.g. same frame as createInstance, when m_totalGlobalSplatCount is still 0).
+  uint32_t getPendingGlobalSplatCount() const;
+
+  // Cached table count when available, otherwise pending instance sum.
+  uint32_t getEffectiveGlobalSplatCount() const;
 
   // Get maximum SH degree across all splat sets
   uint32_t getMaxShDegree() const { return m_maxShDegree; }
@@ -279,11 +295,33 @@ public:
   VkDeviceAddress getGlobalIndexTableAddress() const;
   VkDeviceAddress getSplatSetGlobalIndexTableAddress() const;
 
+  // Pure RTX mode does not need the global index table (saves 8 bytes per splat).
+  // Set to false when only the RTX pipeline is active; set back to true for hybrid/raster.
+  void setNeedsGlobalIndexTable(bool needs);
+  bool hasGlobalIndexTableBuffers() const { return m_globalIndexTableBuffer.buffer != VK_NULL_HANDLE; }
+  void releaseGlobalIndexTableBuffers();
+
+  // Pure RTX mode does not need covariance buffers (raster-only, 24 bytes per splat).
+  // Release when entering pure RTX; reallocate (recomputed from scale/rotation) when leaving.
+  void setNeedsCovarianceData(bool needs);
+  bool isCovarianceDataReleased() const { return m_covarianceDataReleased; }
+  void releaseCovarianceData();
+  void allocateCovarianceData();
+
   // ===== SORTING BUFFERS =====
 
   VkDeviceAddress getSplatSortingDistancesAddress() const { return m_splatSortingDistancesDevice.address; }
   VkDeviceAddress getSplatSortingIndicesAddress() const { return m_splatSortingIndicesDevice.address; }
   VrdxSorter      getSplatSortingVrdxSorter() const { return m_splatSortingVrdxSorter; }
+  bool            hasSortingBuffers() const { return m_sortingBuffersAllocatedCount > 0; }
+  bool            hasCpuSortingBuffer() const { return m_splatSortingIndicesHost.buffer != VK_NULL_HANDLE; }
+  bool            hasCpuSortIndicesOnGpu() const { return m_cpuSortIndicesOnGpu; }
+  void            releaseSortingBuffers();
+  void            setCreateVrdxSorter(bool create) { m_createVrdxSorter = create; }
+  // Creates/destroys VRDX when sort mode changes without reallocating index/distance buffers.
+  // backendChanged is set when VRDX resources were created or destroyed.
+  bool ensureSortingBackend(bool createVrdxSorter, bool* backendChanged = nullptr);
+  bool updateSortingBuffers(bool createVrdxSorter = true);
 
   const nvvk::LargeBuffer& getSplatSortingIndicesDevice() const { return m_splatSortingIndicesDevice; }
   const nvvk::LargeBuffer& getSplatSortingDistancesDevice() const { return m_splatSortingDistancesDevice; }
@@ -327,6 +365,12 @@ public:
     return dirty;
   }
 
+  // Write BINDING_SPLAT_TEXTURES to a descriptor set with current texture image views.
+  // Writes 5 descriptors per STORAGE_TEXTURES splat set (centers, scales, rotations, colors, SH),
+  // plus covariance as 6th only when the covariance texture is allocated (raster-only resource,
+  // released in pure RTX mode). Safe to call at any time; no-op if no splat sets use textures.
+  void updateBindingSplatTextures(VkDescriptorSet descriptorSet);
+
   // ===== RAY TRACING =====
 
   // Mark one splat sets for data regeneration
@@ -339,10 +383,12 @@ public:
   void markAllSplatSetsForRegeneration();
 
   void rtxDeinitAccelerationStructures();
+  void setRtxState(RtxState state) { m_rtxState = state; }
 
   VkDeviceAddress          getTlasAddress() const;
   const SplatSetTlasArray& getTlasArray() const { return m_rtAccelerationStructures; }
   VkDeviceAddress          getRtxDescriptorArrayAddress() const;
+  uint32_t getRtxDescriptorCount() const { return static_cast<uint32_t>(m_gpuRtxDescriptorArray.size()); }
 
   // Provide particle AS compute pipeline handles and descriptor set (set by renderer).
   // The descriptor set is required so the AS build compute shader can access splat
@@ -450,7 +496,9 @@ private:
 
   // Phase 3a sub-methods:
 
-  // Per-splat mode (useTlasInstances): builds unit BLAS + per-splat TLAS array.
+  // Per-particle instanced mode (useTlasInstances): builds unit BLAS + one shared TLAS per unique
+  // splat set asset. Per-particle transforms are local-only (no global bake); the global transform
+  // is applied to the ray at trace time.
   bool rtxRebuildBlasAndTlasPerSplat();
 
   // Per-instance mode, single-BLAS: one BLAS per splat set + per-instance TLAS.
@@ -460,12 +508,12 @@ private:
   bool rtxRebuildBlasAndTlasPerInstanceMultiBlas(VkBuildAccelerationStructureFlagsKHR blasFlags);
 
   // Phase 3b: TLAS-only rebuild (BLAS already exists, instance count changed).
-  // Dispatches to one of the 3 sub-methods below based on mode.
+  // Dispatches to sub-methods below based on mode.
   bool rtxRebuildTlas();
 
   // Phase 3b sub-methods:
 
-  // Per-splat TLAS rebuild (useTlasInstances): shared BLAS, each splat is a TLAS instance.
+  // Per-particle instanced TLAS rebuild: one TLAS per unique asset, local-only transforms.
   bool rtxRebuildTlasPerSplat();
 
   // Per-instance TLAS rebuild: handles both multi-BLAS and single-BLAS modes.
@@ -475,12 +523,12 @@ private:
   bool rtxRebuildTlasFallbackCleanup();
 
   // Phase 3c: Fast TLAS update path for transform changes only.
-  // Dispatches to one of the 3 sub-methods below based on mode.
+  // Dispatches to sub-methods below based on mode.
   bool rtxUpdateTlasTransforms(bool& descriptorsNeedRebuild);
 
   // Phase 3c sub-methods:
 
-  // Per-splat TLAS mode (useTlasInstances): shared BLAS, each splat is a TLAS instance.
+  // Per-particle instanced mode: no TLAS work needed for transform changes (only descriptors).
   bool rtxUpdateTlasPerSplat();
 
   // Per-instance TLAS, multi-BLAS: multiple BLAS chunks per splat set, uses RTX descriptor array.
@@ -504,14 +552,31 @@ private:
   std::vector<std::shared_ptr<SplatSetVk>>         m_splatSets;
   std::vector<std::shared_ptr<SplatSetInstanceVk>> m_instances;
 
-  // GPU-side storage (contiguous for rendering)
+  // Canonical per-instance descriptor array (one entry per SplatSetInstance).
+  // Shared by raster, hybrid, and RTX pipelines. Contains all instance data: data buffer
+  // addresses, transforms, materials, storage format, etc. Uploaded to GPU as
+  // SceneAssets::splatSetDescriptors. Also serves as the authoritative source for
+  // m_gpuRtxDescriptorArray (RTX entries are derived from these via copy + override).
   std::vector<shaderio::SplatSetDesc> m_gpuDescriptorArray;
   nvvk::Buffer                        m_descriptorBuffer;
-  // RTX-only descriptor array (per-TLAS-instance, used for split BLAS)
+
+  // RTX-specific descriptor array (one entry per TLAS instance, i.e. per instance x BLAS chunk).
+  // Only populated when BLAS splitting is active (m_useSplitBlasRtxDescriptors == true).
+  // Each entry is a full copy of the corresponding m_gpuDescriptorArray entry, with RTX-specific
+  // fields overridden: blasAddress (per-chunk BLAS), splatBase (chunk offset), globalSplatBase,
+  // and splatCount. Uploaded to GPU as SceneAssets::splatSetDescriptorsRtx.
+  // Use refreshRtxDescriptorsFromBase() to propagate material/transform changes from the
+  // canonical array without a full BLAS rebuild.
   std::vector<shaderio::SplatSetDesc> m_gpuRtxDescriptorArray;
+  std::vector<uint32_t>               m_rtxToBaseDescriptorMap;  // RTX entry index -> m_gpuDescriptorArray index
   nvvk::Buffer                        m_rtxDescriptorBuffer;
   bool                                m_useSplitBlasRtxDescriptors = false;
-  // GPU-side storage for per-splat-set descriptors (BLAS generation)
+
+  // Per-splat-set (per-asset) descriptor array (one entry per unique SplatSet, not per instance).
+  // Used by the BLAS generation compute shader (particle_as_build.comp.slang) to access splat
+  // data (positions, scales, rotations) during geometry construction. Unlike m_gpuDescriptorArray
+  // which is per-instance, this array is indexed by splat set asset, so multiple instances
+  // sharing the same asset reference the same entry.
   std::vector<shaderio::SplatSetDesc> m_gpuSplatSetDescriptorArray;
   nvvk::Buffer                        m_splatSetDescriptorBuffer;
 
@@ -530,8 +595,8 @@ private:
   std::vector<InstanceInfo>          m_instanceInfos;                   // RAM: cached per-instance offsets
   std::vector<GlobalSplatIndexEntry> m_globalIndexTable;                // RAM: authoritative
   std::vector<uint32_t>              m_splatSetGlobalIndexTable;        // RAM: authoritative
-  nvvk::Buffer                       m_globalIndexTableBuffer;          // GPU: synchronized
-  nvvk::Buffer                       m_splatSetGlobalIndexTableBuffer;  // GPU: synchronized
+  nvvk::LargeBuffer                  m_globalIndexTableBuffer;          // GPU: synchronized (LargeBuffer for >4GB)
+  nvvk::LargeBuffer                  m_splatSetGlobalIndexTableBuffer;  // GPU: synchronized (LargeBuffer for >4GB)
   uint32_t                           m_totalGlobalSplatCount = 0;
   uint32_t                           m_maxShDegree           = 0;  // Maximum SH degree across all splat sets
 
@@ -542,6 +607,9 @@ private:
   nvvk::LargeBuffer m_splatSortingVrdxStorageBuffer;                  // VRDX internal storage (GPU)
   VrdxSorter   m_splatSortingVrdxSorter       = VK_NULL_HANDLE;  // GPU radix sorter
   uint32_t     m_sortingBuffersAllocatedCount = 0;               // Track buffer size for resize detection
+  bool              m_sortingBuffersReleased       = false;  // True after explicit releaseSortingBuffers() call
+  bool              m_createVrdxSorter             = true;  // Mirrored from prmRaster.sortingMethod before buffer alloc
+  bool              m_cpuSortIndicesOnGpu          = false;  // True after valid indices uploaded to device buffer
 
   // CPU Async Sorting (application lifetime)
   SplatSorterAsync           m_cpuSorter;                   // Async CPU sorter thread
@@ -556,6 +624,7 @@ private:
   ParticleAccelerationStructureHelperGpu              m_particleAsHelper{};
   std::vector<ParticleAccelerationStructureHelperGpu> m_particleAsBlasHelpers{};
   std::vector<ParticleAccelerationStructureHelperGpu> m_particleAsTlasHelpers{};
+  std::unordered_map<SplatSetVk*, size_t> m_sharedTlasAssetMap;  // Asset → TLAS helper index (shared TLAS mode)
   VkPipeline                                          m_particleAsComputePipeline = VK_NULL_HANDLE;
   VkPipelineLayout                                    m_particleAsPipelineLayout  = VK_NULL_HANDLE;
   VkDescriptorSet                                     m_particleAsDescriptorSet   = VK_NULL_HANDLE;
@@ -580,6 +649,9 @@ private:
   bool m_globalIndexTableDirty   = true;   // Set when topology changes
   bool m_gpuDescriptorsDirty     = true;   // Set when instances change
   bool m_textureDescriptorsDirty = false;  // Set when texture data storage is (re)created
+  bool     m_needsGlobalIndexTable   = true;   // False for pure RTX (table not needed; saves memory)
+  bool     m_needsCovarianceData     = true;   // False for pure RTX (covariance is raster-only; saves 24 bytes/splat)
+  bool     m_covarianceDataReleased  = false;
   uint32_t m_tlasNeedsFullRebuild = 0;  // Counter: forces rebuilds before allowing update path (set to 10 on copy/import)
 
   // Vulkan resources
@@ -597,6 +669,8 @@ private:
 
   void            updateGpuDescriptorArray();
   void            uploadGpuDescriptorArray();
+  void            uploadRtxDescriptorArray();
+  void            refreshRtxDescriptorsFromBase();
   void            rebuildRtxDescriptorArrayFromChunks();
   void            updateGpuSplatSetDescriptorArray();
   void            uploadGpuSplatSetDescriptorArray();
@@ -605,15 +679,17 @@ private:
   // Release scene-scoped GPU buffers (descriptor/index/sorting) when empty.
   void clearSceneGpuBuffers();
 
+  void refreshModelBufferStats();
   void markGlobalIndexTableDirty();
   void markGpuDescriptorsDirty();
 
   void updateMaxShDegree();  // Recompute max SH degree from all splat sets
-  uint32_t computeMaxSplatsPerGpuBlas(bool useAabbs, VkBuildAccelerationStructureFlagsKHR blasBuildFlags, uint32_t splatCount) const;
+  uint32_t computeMaxSplatsPerGpuBlas(bool useAabbs, bool useSpheres, VkBuildAccelerationStructureFlagsKHR blasBuildFlags, uint32_t splatCount) const;
 
   // Estimate BLAS build sizes (AS size + scratch) for a given splat count using vkGetAccelerationStructureBuildSizesKHR.
   // Used by both computeMaxSplatsPerGpuBlas (chunk sizing) and VRAM budget pre-check.
   VkAccelerationStructureBuildSizesInfoKHR estimateBlasBuildSizes(bool                                 useAabbs,
+                                                                  bool                                 useSpheres,
                                                                   VkBuildAccelerationStructureFlagsKHR blasBuildFlags,
                                                                   uint32_t splatCount) const;
 

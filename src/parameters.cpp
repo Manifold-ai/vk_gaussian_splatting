@@ -127,6 +127,8 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
   parameterRegistry->add({"rgbaformat", "0=fp32 1=fp16 2=uint8"}, &prmData.rgbaFormat);
   parameterRegistry->add({"useAABBs", "0=use icosahedron 3D mesh and built-in triangle/ray intersection (Default), 1=use AABBs and parametric intersection shader. DO NOT COMBINE with useTlasInstances=0."},
                          &prmRtxData.useAABBs);
+  parameterRegistry->add({"useSpheres", "1=use sphere primitives (VK_NV_ray_tracing_linear_swept_spheres). Mutually exclusive with useAABBs."},
+                         &prmRtxData.useSpheres);
   parameterRegistry->add({"useTlasInstances", "1=use one TLAS instance per particle and a small unit particle BLAS (default). 0=use one TLAS entry and a large BLAS."},
                          &prmRtxData.useTlasInstances);
   parameterRegistry->add({"compressBlas", "1=compress BLAS (default). 0=diabled."}, &prmRtxData.compressBlas);
@@ -134,11 +136,34 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
   // Pipelines
   parameterRegistry->add({"pipeline", "0=3dgs-vert 1=3dgs-mesh(default) 2=3dgrt 3=hybrid-3dgs 4=3dgut 5=hybrid-3dgut"},
                          &prmSelectedPipeline);
-  parameterRegistry->add({"maxShDegree", "max sh degree used for rendering in [0,1,2,3]"}, &prmFrame.shDegree);
+  parameterRegistry->add({"maxShDegree", "max sh degree used for rendering in [0,1,2,3]"}, &prmFrame.shDegree,
+                         int32_t(0), int32_t(3));
+
+  // Rendering
+  parameterRegistry->add({"lightingEnabled", "0=off(default) 1=enable lighting"}, &prmRender.lightingEnabled,
+                         (int32_t)LIGHTING_DISABLED, (int32_t)LIGHTING_ENABLED);
+  parameterRegistry->add({"shadowMode", "0=off(default) 1=hard shadows 2=soft shadows"},
+                         (uint32_t*)&prmRender.shadowsMode, (uint32_t)SHADOWS_DISABLED, (uint32_t)SHADOWS_SOFT);
+
+  // Rasterization
+  parameterRegistry->add({"sortStrategy", "particles rasterization strategy 0=GPU radix sort(default) 1=CPU async mono 2=CPU async multi 3=stochastic splat"},
+                         &prmRaster.sortingMethod, SORTING_GPU_SYNC_RADIX, SORTING_STOCHASTIC_SPLAT);
   parameterRegistry->add({"extentProjection", "particle extent projection method [0=Eigen (default),1=Conic]"},
                          &prmRaster.extentProjection);
+
+  // Ray Tracing
+  parameterRegistry->add({"rtxSortStrategy", "particles raytracing strategy 0=full anyhit(default) 1=pass stochastic 2=stochastic anyhit"},
+                         &prmRtx.rtxTraceStrategy, RTX_TRACE_STRATEGY_FULL_ANYHIT, RTX_TRACE_STRATEGY_STOCHASTIC_ANYHIT);
+  parameterRegistry->add({"rtxMaxBounces", "max light bounces for path tracing [0-16, default=3]"},
+                         &prmFrame.rtxMaxBounces, int32_t(0), int32_t(16));
   parameterRegistry->add({"kernelDegree", "kernel degree used by 3DGRT, 3DGUT and Hybrid 3DGUT pipelines in [0,1,2(default),3,4,5]"},
-                         &prmRtx.kernelDegree);
+                         &prmRtx.kernelDegree, int32_t(0), int32_t(5));
+  parameterRegistry->add({"rtxParticleDepth", "particle depth mode 0=billboard 1=ellipsoid(default)"},
+                         &prmRtx.particleDepth, PARTICLE_DEPTH_BILLBOARD, PARTICLE_DEPTH_ELLIPSOID);
+  parameterRegistry->add({"rtxShortenRay", "shorten ray in stochastic any-hit billboard mode 0=off 1=on(default)"},
+                         &prmRtx.shortenRay);
+  parameterRegistry->add({"rtxBillboardBounding", "billboard bounding mode 0=fitted 1=uniform 2=uniform3/4 3=uniform2/3 4=uniform1/2 5=uniform1/3 6=uniform1/4 7=optimal"},
+                         (int32_t*)&prmRtxData.billboardBoundingMode, int32_t(0), int32_t(7));
 }
 
 }  // namespace vk_gaussian_splatting

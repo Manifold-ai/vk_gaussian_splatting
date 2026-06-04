@@ -19,6 +19,7 @@
 
 #include <gaussian_splatting_ui.h>
 #include "elem_camera_custom.hpp"
+#include "hardware_support.h"
 
 #if USE_DLSS
 #include "dlss_wrapper.hpp"
@@ -54,6 +55,9 @@ int main(int argc, char** argv)
   // see GaussianSplatting constructor for other options
   parameterRegistry.addVector({"size", "Size of the window to be created"}, &appInfo.windowSize);
   parameterRegistry.add({"vsync"}, &appInfo.vSync);
+  parameterRegistry.add({"headless", "Run without a window (no swapchain, no display)"}, &appInfo.headless);
+  parameterRegistry.add({"headlessFrameCount", "Number of frames to render in headless mode (ignored when --benchmark is enabled)"},
+                        &appInfo.headlessFrameCount);
   parameterRegistry.add({"verbose", "Verbose output of the Vulkan context"}, &vkSetup.verbose);
   parameterRegistry.add({"validation", "Enable validation layers"}, &vkSetup.enableValidationLayers);
   parameterRegistry.add({"benchmark", "Enable benchmarking, prevents async loadings and turns off vsync"}, &benchmarkMode);
@@ -106,19 +110,27 @@ int main(int argc, char** argv)
   };
   vkSetup.deviceExtensions.emplace_back(VK_KHR_PUSH_DESCRIPTOR_EXTENSION_NAME);  // for vk_radix_sort (vrdx)
   vkSetup.deviceExtensions.emplace_back(VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-  vkSetup.deviceExtensions.emplace_back(VK_EXT_MESH_SHADER_EXTENSION_NAME, &meshFeaturesEXT, true);
+  vkSetup.deviceExtensions.emplace_back(VK_EXT_MESH_SHADER_EXTENSION_NAME, &meshFeaturesEXT, false);
   vkSetup.deviceExtensions.emplace_back(VK_KHR_FRAGMENT_SHADING_RATE_EXTENSION_NAME, &fragFeaturesKHR, true);
-  vkSetup.deviceExtensions.emplace_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, &baryFeaturesKHR, true);
+  vkSetup.deviceExtensions.emplace_back(VK_KHR_FRAGMENT_SHADER_BARYCENTRIC_EXTENSION_NAME, &baryFeaturesKHR, false);
   vkSetup.deviceExtensions.emplace_back(VK_KHR_DYNAMIC_RENDERING_EXTENSION_NAME);  // for ImGui
 
-  // Activate the ray tracing extension
+  // Dynamic depth/stencil state (vkCmdSetDepthTestEnable, vkCmdSetDepthCompareOp, etc.) is core and
+  // mandatory since Vulkan 1.3 (promoted from VK_EXT_extended_dynamic_state / _2), so no extension is
+  // requested here; the 1.4 baseline guarantees it.
+
+  // Ray tracing extensions: all three are requested as optional. The
+  // composite isSupported.raytracing flag (hardware_support.cpp) is true only
+  // when the trio is actually enabled on the device, and every RTX code path
+  // (shader compilation, pipeline creation, AS builds, UI entries) is gated
+  // by it.
   VkPhysicalDeviceAccelerationStructureFeaturesKHR accelFeature = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR};
-  vkSetup.deviceExtensions.emplace_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, &accelFeature, true);  // To build acceleration structures
+  vkSetup.deviceExtensions.emplace_back(VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME, &accelFeature, false);  // To build acceleration structures
   VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtPipelineFeature = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
   vkSetup.deviceExtensions.emplace_back(VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME, &rtPipelineFeature, false);  // To use vkCmdTraceRaysKHR
-  vkSetup.deviceExtensions.emplace_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME);  // Required by ray tracing pipeline
+  vkSetup.deviceExtensions.emplace_back(VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME, nullptr, false);  // Required by ray tracing pipeline
   VkPhysicalDeviceRayTracingPositionFetchFeaturesKHR rtPositionFetchFeature = {
       .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_POSITION_FETCH_FEATURES_KHR, .rayTracingPositionFetch = VK_TRUE};
   vkSetup.deviceExtensions.emplace_back(VK_KHR_RAY_TRACING_POSITION_FETCH_EXTENSION_NAME, &rtPositionFetchFeature, false);
@@ -132,6 +144,13 @@ int main(int argc, char** argv)
   };
   vkSetup.deviceExtensions.emplace_back(VK_NV_RAY_TRACING_INVOCATION_REORDER_EXTENSION_NAME, &serFeatures, false);
 
+  // Sphere primitives for ray tracing acceleration structures (optional NV extension)
+  static VkPhysicalDeviceRayTracingLinearSweptSpheresFeaturesNV lssFeaturesNV = {
+      .sType   = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_LINEAR_SWEPT_SPHERES_FEATURES_NV,
+      .spheres = VK_TRUE,
+  };
+  vkSetup.deviceExtensions.emplace_back(VK_NV_RAY_TRACING_LINEAR_SWEPT_SPHERES_EXTENSION_NAME, &lssFeaturesNV, false);
+
   // Memory budget extension for querying VRAM usage
   vkSetup.deviceExtensions.emplace_back(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME);
 
@@ -142,8 +161,7 @@ int main(int argc, char** argv)
   };
   vkSetup.deviceExtensions.emplace_back(VK_EXT_FRAGMENT_SHADER_INTERLOCK_EXTENSION_NAME, &interlockFeatures, true);
 
-  // Note: Line rasterization features (smoothLines, rectangularLines) are part of Vulkan 1.4 core
-  // and are enabled automatically via enableAllFeatures = true
+  // Note: smooth line rasterization is a Vulkan 1.4 core feature (enabled via enableAllFeatures).
 
   if(!appInfo.headless)
   {
@@ -183,12 +201,21 @@ int main(int argc, char** argv)
   // Adding the validation layer settings
   vkSetup.instanceCreateInfoExt = vvlInfo.buildPNextChain();
 
-  // Create Vulkan context
+  // Create Vulkan context. Vulkan 1.4 is required: maintenance5 (buffer usage flags2, inline SPIR-V
+  // pipeline modules), vertex attribute divisor and smooth line rasterization are used as core 1.4
+  // features.
+  vkSetup.apiVersion = VK_API_VERSION_1_4;
   if(vkContext.init(vkSetup) != VK_SUCCESS)
   {
-    LOGE("Error in Vulkan context creation\n");
+    LOGE("Error in Vulkan context creation (Vulkan 1.4 is required).\n");
     return 1;
   }
+
+  // Populate the global hardware capability registry from the freshly created
+  // context. After this point, code can branch on isSupported.* (see
+  // src/hardware_support.h). DLSS runtime availability is filled in later
+  // from GaussianSplatting once NGX has probed the device.
+  isSupported.initFromVulkanContext(vkContext);
 
   /////////////////////////////////
   // Application setup
@@ -199,22 +226,27 @@ int main(int argc, char** argv)
   appInfo.queues                = vkContext.getQueueInfos();
   appInfo.hasUndockableViewport = true;
   appInfo.useMenu               = !benchmarkMode;  // we hide the menu in benchmark mode
+  if(appInfo.headless && benchmarkMode)
+  {
+    appInfo.headlessFrameCount = UINT32_MAX;  // Let the sequencer's close() terminate the loop
+  }
 
   // Setting up the layout of the application
   appInfo.dockSetup = [](ImGuiID viewportID) {
     // right side panel container
     ImGuiID assetsID = ImGui::DockBuilderSplitNode(viewportID, ImGuiDir_Right, 0.20F, nullptr, &viewportID);
     ImGui::DockBuilderDockWindow("Assets", assetsID);
-    ImGuiID propertiesID = ImGui::DockBuilderSplitNode(assetsID, ImGuiDir_Down, 0.75F, nullptr, &assetsID);
+    ImGuiID propertiesID = ImGui::DockBuilderSplitNode(assetsID, ImGuiDir_Down, 0.70F, nullptr, &assetsID);
     ImGui::DockBuilderDockWindow("Properties", propertiesID);
 
-    // bottom panel container
-    ImGuiID memoryID = ImGui::DockBuilderSplitNode(viewportID, ImGuiDir_Down, 0.45F, nullptr, &viewportID);
-    ImGui::DockBuilderDockWindow("Memory Statistics", memoryID);
-    ImGuiID profilerID = ImGui::DockBuilderSplitNode(memoryID, ImGuiDir_Right, 0.33F, nullptr, &memoryID);
+    // left side panel container
+    ImGuiID profilerID = ImGui::DockBuilderSplitNode(viewportID, ImGuiDir_Left, 0.20F, nullptr, &viewportID);
     ImGui::DockBuilderDockWindow("Profiler", profilerID);
-    ImGuiID renderingID = ImGui::DockBuilderSplitNode(profilerID, ImGuiDir_Down, 0.30F, nullptr, &profilerID);
+    ImGuiID renderingID = ImGui::DockBuilderSplitNode(profilerID, ImGuiDir_Down, 0.65F, nullptr, &profilerID);
     ImGui::DockBuilderDockWindow("Rendering Statistics", renderingID);
+    ImGui::DockBuilderDockWindow("Shader Feedback", renderingID);
+    ImGuiID memoryID = ImGui::DockBuilderSplitNode(renderingID, ImGuiDir_Down, 0.30F, nullptr, &renderingID);
+    ImGui::DockBuilderDockWindow("Memory Statistics", memoryID);
   };
 
   //
@@ -242,19 +274,10 @@ int main(int argc, char** argv)
     // In this mode we do not display the GUI elements
     application.setVsync(false);
   }
-  else
+
+  if(appInfo.headless)
   {
-    application.addElement(std::make_shared<nvgpu_monitor::ElementGpuMonitor>());
-
-    // setup the profiler element and view
-    auto profilerViewSettings = std::make_shared<nvapp::ElementProfiler::ViewSettings>(
-        nvapp::ElementProfiler::ViewSettings{.name       = "Profiler",
-                                             .defaultTab = nvapp::ElementProfiler::TABLE,
-                                             .pieChart   = {.cpuTotal = false, .levels = true},
-                                             .lineChart  = {.cpuLine = false}});
-
-    // setting are optional, but can be used to expose to sample code (like hiding views for benchmark)
-    application.addElement(std::make_shared<nvapp::ElementProfiler>(&profilerManager, profilerViewSettings));
+    ImGui::GetIO().IniFilename = nullptr;
   }
 
   //

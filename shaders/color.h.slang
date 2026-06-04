@@ -40,6 +40,13 @@ float3 hsbToRgb(float3 hsbColor)
   return (hsbColor.z * lerp(float3(1.0), rgb, hsbColor.y));
 }
 
+// ITU-R BT.709 luminance: perceptual brightness of a linear RGB color.
+// Weights reflect human eye sensitivity (green > red > blue).
+float luminance_bt709(float3 rgb)
+{
+  return dot(rgb, float3(0.2126, 0.7152, 0.0722));
+}
+
 // Convert sRGB to linear RGB (accurate version following sRGB spec)
 float3 srgbToLinear(float3 srgb)
 {

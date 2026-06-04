@@ -21,6 +21,8 @@
 #include "utilities.h"
 #include "splat_set_vk.h"
 
+#include <algorithm>
+#include <cmath>
 #include <filesystem>
 #include <tinygltf/json.hpp>
 
@@ -34,16 +36,88 @@ namespace vk_gaussian_splatting {
 //
 
 #define LOAD1(val, item, name)                                                                                         \
-  if((item).contains(name))                                                                                            \
-  (val) = (item)[name]
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if((item).contains(name))                                                                                          \
+      (val) = (item)[name];                                                                                            \
+  } while(0)
 
 #define LOAD2(val, item, name)                                                                                         \
-  if((item).contains(name))                                                                                            \
-  (val) = {(item)[name][0], (item)[name][1]}
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if((item).contains(name))                                                                                          \
+      (val) = {(item)[name][0], (item)[name][1]};                                                                      \
+  } while(0)
 
 #define LOAD3(val, item, name)                                                                                         \
-  if((item).contains(name))                                                                                            \
-  (val) = {(item)[name][0], (item)[name][1], (item)[name][2]}
+  do                                                                                                                   \
+  {                                                                                                                    \
+    if((item).contains(name))                                                                                          \
+      (val) = {(item)[name][0], (item)[name][1], (item)[name][2]};                                                     \
+  } while(0)
+
+// Load material from JSON — version 7+ uses maxBounces, version 6 uses illum, older converts from Phong
+static void loadMaterialFromJson(Material& mat, const json& matItem, int fileVersion)
+{
+  if(fileVersion >= 7)
+  {
+    LOAD3(mat.baseColor, matItem, "baseColor");
+    LOAD1(mat.metallic, matItem, "metallic");
+    LOAD1(mat.roughness, matItem, "roughness");
+    LOAD3(mat.emissive, matItem, "emissive");
+    LOAD1(mat.emissiveStrength, matItem, "emissiveStrength");
+    LOAD1(mat.maxBounces, matItem, "maxBounces");
+    LOAD1(mat.ior, matItem, "ior");
+    LOAD1(mat.transmission, matItem, "transmission");
+    LOAD1(mat.opacity, matItem, "opacity");
+    LOAD1(mat.specularFactor, matItem, "specularFactor");
+    LOAD3(mat.specularColorFactor, matItem, "specularColorFactor");
+    LOAD1(mat.clearcoatFactor, matItem, "clearcoatFactor");
+    LOAD1(mat.clearcoatRoughness, matItem, "clearcoatRoughness");
+  }
+  else if(fileVersion >= 6)
+  {
+    LOAD3(mat.baseColor, matItem, "baseColor");
+    LOAD1(mat.metallic, matItem, "metallic");
+    LOAD1(mat.roughness, matItem, "roughness");
+    LOAD3(mat.emissive, matItem, "emissive");
+    LOAD1(mat.emissiveStrength, matItem, "emissiveStrength");
+    LOAD1(mat.ior, matItem, "ior");
+    LOAD1(mat.transmission, matItem, "transmission");
+    LOAD1(mat.opacity, matItem, "opacity");
+
+    // Convert legacy illum to maxBounces
+    int illum = 0;
+    LOAD1(illum, matItem, "illum");
+    mat.maxBounces = (illum == 3) ? 3 : (illum >= 1) ? 1 : 0;
+  }
+  else
+  {
+    // Legacy Phong material — convert to PBR
+    glm::vec3 diffuse(0.7f), specular(0.0f), transmittance(0.0f);
+    float     shininess = 32.0f;
+
+    LOAD3(diffuse, matItem, "diffuse");
+    LOAD3(specular, matItem, "specular");
+    LOAD3(mat.emissive, matItem, "emission");
+    LOAD3(transmittance, matItem, "transmittance");
+    LOAD1(shininess, matItem, "shininess");
+    LOAD1(mat.ior, matItem, "ior");
+
+    mat.baseColor    = diffuse;
+    mat.roughness    = std::sqrt(2.0f / (std::max(shininess, 1.0f) + 2.0f));
+    float specLum    = glm::length(specular);
+    float diffLum    = glm::length(diffuse);
+    mat.metallic     = (specLum > 0.5f && diffLum < 0.1f) ? 1.0f : 0.0f;
+    mat.transmission = (glm::length(transmittance) > 0.001f) ? 1.0f : 0.0f;
+    mat.opacity      = 1.0f;
+
+    // Convert legacy illum to maxBounces
+    int illum = 0;
+    LOAD1(illum, matItem, "illum");
+    mat.maxBounces = (illum == 3) ? 3 : (illum >= 1) ? 1 : 0;
+  }
+}
 
 //--------------------------------------------------------------------------------------------------
 // Helper function to convert relative path to absolute
@@ -75,6 +149,9 @@ bool VkgsProjectReader::loadProject(const json& data, const std::string& path, G
     loadMeshes(data, fileVersion, path, ui);
     loadCameras(data, ui);
     loadLights(data, fileVersion, ui);
+    loadEnvironment(data, path, ui);
+    loadSettings(data, ui);
+    loadTonemapping(data, ui);
 
     prmScene.projectToLoadFilename = "";
     return true;
@@ -139,18 +216,66 @@ void VkgsProjectReader::loadRendererSettings(const json& data, GaussianSplatting
   if(item.contains("normalMethod"))
     prmRender.normalMethod = (NormalMethod)item["normalMethod"].get<int>();
   LOAD1(prmRender.thinParticleThreshold, item, "thinParticleThreshold");
+  LOAD1(prmRtx.fireflyClampThreshold, item, "fireflyClampThreshold");
+#if defined(USE_DLSS)
+  LOAD1(prmRtx.dlssMinRadianceThreshold, item, "dlssMinRadianceThreshold");
+  if(item.contains("dlssEnabled"))
+    ui->m_dlss.setEnabled(item["dlssEnabled"].get<bool>());
+  if(item.contains("dlssSizeMode"))
+    ui->m_dlss.setSizeMode(static_cast<DlssDenoiser::SizeMode>(item["dlssSizeMode"].get<int>()));
+#endif
 
-  // Lighting and shadows mode (enum class, need explicit cast from int)
-  if(item.contains("lightingMode"))
-    prmRender.lightingMode = (LightingMode)item["lightingMode"].get<int>();
+  // Lighting: current format is bool "lightingEnabled"
+  if(item.contains("lightingEnabled"))
+    prmRender.lightingEnabled = item["lightingEnabled"].get<bool>() ? LIGHTING_ENABLED : LIGHTING_DISABLED;
+  // Backward compat: old projects used int "lightingMode" (0=off, 1+=on)
+  if(!item.contains("lightingEnabled") && item.contains("lightingMode"))
+    prmRender.lightingEnabled = (item["lightingMode"].get<int>() > 0) ? LIGHTING_ENABLED : LIGHTING_DISABLED;
+
   if(item.contains("shadowsMode"))
     prmRender.shadowsMode = (ShadowsMode)item["shadowsMode"].get<int>();
-
-  // Backward compat: migrate old boolean fields to new enum modes
-  if(!item.contains("lightingMode") && item.contains("lightingEnabled"))
-    prmRender.lightingMode = item["lightingEnabled"].get<bool>() ? LightingMode::eLightingIndirect : LightingMode::eLightingDisabled;
+  // Backward compat: old projects used bool "shadowsEnabled"
   if(!item.contains("shadowsMode") && item.contains("shadowsEnabled"))
     prmRender.shadowsMode = item["shadowsEnabled"].get<bool>() ? ShadowsMode::eShadowsHard : ShadowsMode::eShadowsDisabled;
+
+  LOAD1(prmFrame.rtxMaxBounces, item, "rtxMaxBounces");
+  LOAD1(prmFrame.rtxSecondaryRayOffset, item, "rtxSecondaryRayOffset");
+  LOAD1(prmFrame.minSplatSetCompositeTransmittance, item, "splatSetCompositeTransmittance");
+  LOAD1(prmRtx.temporalSamplingMode, item, "temporalSamplingMode");
+  LOAD1(prmFrame.alphaCullThreshold, item, "alphaCullThreshold");
+  LOAD1(prmFrame.splatScale, item, "splatScale");
+  LOAD1(prmFrame.alphaClamp, item, "alphaClamp");
+  LOAD1(prmFrame.minTransmittance, item, "minTransmittance");
+  LOAD1(prmFrame.maxPasses, item, "maxPasses");
+  LOAD1(prmRtx.particleDepth, item, "particleDepth");
+  LOAD1(prmRtx.billboardFrustumCulling, item, "billboardFrustumCulling");
+  LOAD1(prmRtx.shortenRay, item, "shortenRay");
+  LOAD1(prmRtx.quantizeMeshPayload, item, "quantizeMeshPayload");
+  LOAD1(prmRtx.particleShadowOffset, item, "particleShadowOffset");
+  LOAD1(prmRtx.particleShadowTransmittanceThreshold, item, "particleShadowTransmittanceThreshold");
+  LOAD1(prmRtx.particleShadowColorStrength, item, "particleShadowColorStrength");
+  LOAD1(prmRtx.particleEmissiveAoEnabled, item, "particleEmissiveAoEnabled");
+  LOAD1(prmRtx.particleEmissiveAoRadius, item, "particleEmissiveAoRadius");
+  LOAD1(prmRtx.particleEmissiveAoStrength, item, "particleEmissiveAoStrength");
+  LOAD1(prmRtx.depthIsoThresholdRTX, item, "depthIsoThresholdRTX");
+  LOAD1(prmRaster.depthIsoThreshold, item, "depthIsoThreshold");
+  LOAD1(prmRaster.covarianceDilation, item, "covarianceDilation");
+  LOAD1(prmRaster.msAntialiasing, item, "msAntialiasing");
+  LOAD1(prmRaster.quantizeNormals, item, "quantizeNormals");
+  LOAD1(prmRaster.ftbSyncMode, item, "ftbSyncMode");
+  LOAD1(prmRaster.extentProjection, item, "extentProjection");
+
+  // Color format (VkFormat enum, need explicit cast)
+  // Must trigger GBuffer reinit when the format differs from the current one
+  if(item.contains("colorFormat"))
+  {
+    VkFormat newFormat = static_cast<VkFormat>(item["colorFormat"].get<int>());
+    if(newFormat != prmRender.colorFormat)
+    {
+      prmRender.colorFormat      = newFormat;
+      ui->m_requestGBufferReinit = true;
+    }
+  }
 }
 
 //--------------------------------------------------------------------------------------------------
@@ -167,7 +292,10 @@ void VkgsProjectReader::loadSplatGlobalOptions(const json& data)
   LOAD1(prmData.rgbaFormat, item, "rgbaFormat");
   LOAD1(prmRtxData.compressBlas, item, "compressBlas");
   LOAD1(prmRtxData.useAABBs, item, "useAABBs");
+  LOAD1(prmRtxData.useSpheres, item, "useSpheres");
   LOAD1(prmRtxData.useTlasInstances, item, "useTlasInstances");
+  if(item.contains("billboardBoundingMode"))
+    prmRtxData.billboardBoundingMode = (BillboardBoundingMode)item["billboardBoundingMode"].get<int>();
   // Note: No manager requests needed here.
   // The scene will be loaded with these settings during initAll(),
   // which reads prmData/prmRtxData. Requesting an update would trigger
@@ -237,6 +365,9 @@ void VkgsProjectReader::loadSplatInstances(const json& data, int fileVersion, st
     }
     // else: Name will be generated by registerInstance() if empty
 
+    if(item.contains("show"))
+      instance->show = item["show"].get<bool>();
+
     // Parse and set transform
     if(item.contains("position") && item.contains("rotation") && item.contains("scale"))
     {
@@ -249,14 +380,17 @@ void VkgsProjectReader::loadSplatInstances(const json& data, int fileVersion, st
                        instance->transformInverse, instance->transformRotScaleInverse);
     }
 
-    // Parse and set material
+    // Set splat-specific defaults before loading (struct defaults are for glTF meshes)
+    instance->splatMaterial.baseColor           = glm::vec3(0.0f);
+    instance->splatMaterial.specularFactor      = 0.0f;
+    instance->splatMaterial.specularColorFactor = glm::vec3(0.0f);
+    instance->splatMaterial.emissive            = glm::vec3(1.0f);
+    instance->splatMaterial.maxBounces          = 0;
+
+    // Parse and set material (overrides defaults with saved values if present)
     if(item.contains("material"))
     {
-      LOAD3(instance->splatMaterial.ambient, item["material"], "ambient");
-      LOAD3(instance->splatMaterial.diffuse, item["material"], "diffuse");
-      LOAD3(instance->splatMaterial.specular, item["material"], "specular");
-      LOAD3(instance->splatMaterial.emission, item["material"], "emission");
-      LOAD1(instance->splatMaterial.shininess, item["material"], "shininess");
+      loadMaterialFromJson(instance->splatMaterial, item["material"], fileVersion);
     }
 
     instancesBySplatSetId[splatSetId].push_back(instance);
@@ -316,6 +450,9 @@ void VkgsProjectReader::loadSplatSetsAndInstances(const json& data, int fileVers
       }
       // else: Name will be generated by registerInstance() if empty
 
+      if(item.contains("show"))
+        instance->show = item["show"].get<bool>();
+
       // Parse and set transform
       if(item.contains("position") && item.contains("rotation") && item.contains("scale"))
       {
@@ -328,14 +465,17 @@ void VkgsProjectReader::loadSplatSetsAndInstances(const json& data, int fileVers
                          instance->transformInverse, instance->transformRotScaleInverse);
       }
 
-      // Parse and set material
+      // Set splat-specific defaults before loading (struct defaults are for glTF meshes)
+      instance->splatMaterial.baseColor           = glm::vec3(0.0f);
+      instance->splatMaterial.specularFactor      = 0.0f;
+      instance->splatMaterial.specularColorFactor = glm::vec3(0.0f);
+      instance->splatMaterial.emissive            = glm::vec3(1.0f);
+      instance->splatMaterial.maxBounces          = 0;
+
+      // Parse and set material (overrides defaults with saved values if present)
       if(item.contains("material"))
       {
-        LOAD3(instance->splatMaterial.ambient, item["material"], "ambient");
-        LOAD3(instance->splatMaterial.diffuse, item["material"], "diffuse");
-        LOAD3(instance->splatMaterial.specular, item["material"], "specular");
-        LOAD3(instance->splatMaterial.emission, item["material"], "emission");
-        LOAD1(instance->splatMaterial.shininess, item["material"], "shininess");
+        loadMaterialFromJson(instance->splatMaterial, item["material"], fileVersion);
       }
 
       // Create request with pre-configured instance
@@ -383,7 +523,10 @@ void VkgsProjectReader::loadMeshAssets(const json&                             d
 //--------------------------------------------------------------------------------------------------
 // Load mesh instances and apply transforms/materials
 //
-void VkgsProjectReader::loadMeshInstances(const json& data, const std::map<int, std::shared_ptr<MeshVk>>& assetIdToMesh, GaussianSplattingUI* ui)
+void VkgsProjectReader::loadMeshInstances(const json&                                   data,
+                                          int                                           fileVersion,
+                                          const std::map<int, std::shared_ptr<MeshVk>>& assetIdToMesh,
+                                          GaussianSplattingUI*                          ui)
 {
   // Get instances array (supports both object and array formats)
   const json* instancesArray = nullptr;
@@ -418,6 +561,9 @@ void VkgsProjectReader::loadMeshInstances(const json& data, const std::map<int, 
       instance->name = instItem["name"].get<std::string>();
     }
 
+    if(instItem.contains("show"))
+      instance->show = instItem["show"].get<bool>();
+
     // Load transform
     LOAD3(instance->translation, instItem, "position");
     LOAD3(instance->rotation, instItem, "rotation");
@@ -435,15 +581,7 @@ void VkgsProjectReader::loadMeshInstances(const json& data, const std::map<int, 
           break;
 
         auto& mat = mesh->materials[matId];
-        LOAD3(mat.ambient, matItem, "ambient");
-        LOAD3(mat.diffuse, matItem, "diffuse");
-        LOAD3(mat.emission, matItem, "emission");
-        LOAD1(mat.illum, matItem, "illum");
-        LOAD1(mat.ior, matItem, "ior");
-        LOAD1(mat.shininess, matItem, "shininess");
-        LOAD3(mat.specular, matItem, "specular");
-        LOAD3(mat.transmittance, matItem, "transmittance");
-
+        loadMaterialFromJson(mat, matItem, fileVersion);
         matId++;
       }
 
@@ -469,7 +607,7 @@ void VkgsProjectReader::loadMeshes(const json& data, int fileVersion, const std:
     // Load assets and instances using helper functions
     std::map<int, std::shared_ptr<MeshVk>> assetIdToMesh;
     loadMeshAssets(data, projectPath, assetIdToMesh, ui);
-    loadMeshInstances(data, assetIdToMesh, ui);
+    loadMeshInstances(data, fileVersion, assetIdToMesh, ui);
 
     ui->m_requestUpdateShaders = true;
   }
@@ -533,15 +671,7 @@ void VkgsProjectReader::loadMeshes(const json& data, int fileVersion, const std:
             break;
 
           auto& mat = mesh.materials[matId];
-          LOAD3(mat.ambient, matItem, "ambient");
-          LOAD3(mat.diffuse, matItem, "diffuse");
-          LOAD3(mat.emission, matItem, "emission");
-          LOAD1(mat.illum, matItem, "illum");
-          LOAD1(mat.ior, matItem, "ior");
-          LOAD1(mat.shininess, matItem, "shininess");
-          LOAD3(mat.specular, matItem, "specular");
-          LOAD3(mat.transmittance, matItem, "transmittance");
-
+          loadMaterialFromJson(mat, matItem, fileVersion);
           matId++;
         }
 
@@ -662,7 +792,12 @@ void VkgsProjectReader::loadLights(const json& data, int fileVersion, GaussianSp
           LOAD1(instance->lightSource->innerConeAngle, assetItem, "innerConeAngle");
           LOAD1(instance->lightSource->outerConeAngle, assetItem, "outerConeAngle");
           LOAD1(instance->lightSource->attenuationMode, assetItem, "attenuationMode");
-          LOAD1(instance->lightSource->proxyScale, assetItem, "proxyScale");
+          if(assetItem.contains("radius"))
+            LOAD1(instance->lightSource->radius, assetItem, "radius");
+          else if(assetItem.contains("proxyScale"))
+            LOAD1(instance->lightSource->radius, assetItem, "proxyScale");
+          if(assetItem.contains("enabled"))
+            LOAD1(instance->lightSource->enabled, assetItem, "enabled");
         }
         else  // Version 3: backward compatibility
         {
@@ -672,11 +807,11 @@ void VkgsProjectReader::loadLights(const json& data, int fileVersion, GaussianSp
           else
             instance->lightSource->range = 10.0f;
 
-          // Map old "scale" to new "proxyScale"
+          // Map old "scale" to radius
           if(assetItem.contains("scale"))
-            LOAD1(instance->lightSource->proxyScale, assetItem, "scale");
+            LOAD1(instance->lightSource->radius, assetItem, "scale");
           else
-            instance->lightSource->proxyScale = 1.0f;
+            instance->lightSource->radius = 1.0f;
 
           // Set defaults for new fields
           instance->lightSource->innerConeAngle  = 30.0f;
@@ -757,7 +892,7 @@ void VkgsProjectReader::loadLights(const json& data, int fileVersion, GaussianSp
       asset->innerConeAngle  = 30.0f;
       asset->outerConeAngle  = 45.0f;
       asset->attenuationMode = 2;  // Quadratic
-      asset->proxyScale      = 1.0f;
+      asset->radius          = 1.0f;
 
       if(!item.contains("color"))
       {
@@ -771,5 +906,190 @@ void VkgsProjectReader::loadLights(const json& data, int fileVersion, GaussianSp
   }
 }
 
+
+void VkgsProjectReader::loadEnvironment(const json& data, const std::string& projectPath, GaussianSplattingUI* ui)
+{
+  if(!data.contains("environment"))
+    return;
+
+  const json& env = data["environment"];
+  auto&       sky = ui->m_sky;
+
+  if(env.contains("mode"))
+    sky.setMode(static_cast<shaderio::EnvironmentMode>(env["mode"].get<int>()));
+  if(env.contains("enabled"))
+    sky.setEnabled(env["enabled"].get<bool>());
+  if(env.contains("resolution") && env["resolution"].is_array() && env["resolution"].size() == 2)
+    sky.setResolution(glm::ivec2(env["resolution"][0].get<int>(), env["resolution"][1].get<int>()));
+
+  // Sky & Sun parameters
+  if(env.contains("skyAndSun"))
+  {
+    const json&                      sun = env["skyAndSun"];
+    shaderio::SkyPhysicalParameters& sp  = sky.skyParams();
+
+    if(sun.contains("sunDirection") && sun["sunDirection"].is_array())
+      sp.sunDirection = {sun["sunDirection"][0].get<float>(), sun["sunDirection"][1].get<float>(),
+                         sun["sunDirection"][2].get<float>()};
+    if(sun.contains("sunDiskScale"))
+      sp.sunDiskScale = sun["sunDiskScale"].get<float>();
+    if(sun.contains("sunDiskIntensity"))
+      sp.sunDiskIntensity = sun["sunDiskIntensity"].get<float>();
+    if(sun.contains("sunGlowIntensity"))
+      sp.sunGlowIntensity = sun["sunGlowIntensity"].get<float>();
+    if(sun.contains("haze"))
+      sp.haze = sun["haze"].get<float>();
+    if(sun.contains("redblueshift"))
+      sp.redblueshift = sun["redblueshift"].get<float>();
+    if(sun.contains("saturation"))
+      sp.saturation = sun["saturation"].get<float>();
+    if(sun.contains("horizonHeight"))
+      sp.horizonHeight = sun["horizonHeight"].get<float>();
+    if(sun.contains("groundColor") && sun["groundColor"].is_array())
+      sp.groundColor = {sun["groundColor"][0].get<float>(), sun["groundColor"][1].get<float>(),
+                        sun["groundColor"][2].get<float>()};
+    if(sun.contains("horizonBlur"))
+      sp.horizonBlur = sun["horizonBlur"].get<float>();
+    if(sun.contains("nightColor") && sun["nightColor"].is_array())
+      sp.nightColor = {sun["nightColor"][0].get<float>(), sun["nightColor"][1].get<float>(), sun["nightColor"][2].get<float>()};
+  }
+
+  // IBL parameters
+  if(env.contains("ibl"))
+  {
+    const json& ibl = env["ibl"];
+
+    if(ibl.contains("intensity"))
+      sky.setIblIntensity(ibl["intensity"].get<float>());
+    if(ibl.contains("rotation") && ibl["rotation"].is_array())
+      sky.setIblRotation(
+          glm::vec3(ibl["rotation"][0].get<float>(), ibl["rotation"][1].get<float>(), ibl["rotation"][2].get<float>()));
+
+    if(ibl.contains("file") && !ibl["file"].get<std::string>().empty())
+    {
+      std::filesystem::path projDir = std::filesystem::path(projectPath).parent_path();
+      std::filesystem::path hdrPath = makeAbsolutePath(projDir, ibl["file"].get<std::string>());
+
+      if(std::filesystem::exists(hdrPath) && sky.mode() == shaderio::EnvironmentMode::eHDR)
+      {
+        VkCommandBuffer cmd = ui->m_app->createTempCmdBuffer();
+        sky.loadHdrEnvironment(cmd, hdrPath);
+        ui->m_app->submitAndWaitTempCmdBuffer(cmd);
+      }
+    }
+  }
+
+  sky.setDirty();
+}
+
+//--------------------------------------------------------------------------------------------------
+// Load settings (navigation, visual helpers)
+//
+void VkgsProjectReader::loadSettings(const json& data, GaussianSplattingUI* ui)
+{
+  if(!data.contains("settings"))
+    return;
+
+  const auto& settings = data["settings"];
+
+  // Navigation
+  if(settings.contains("navigation"))
+  {
+    const auto& nav   = settings["navigation"];
+    auto*       manip = ui->cameraManip.get();
+    if(nav.contains("mode"))
+      manip->setMode(static_cast<nvutils::CameraManipulator::Modes>(nav["mode"].get<int>()));
+    if(nav.contains("speed"))
+      manip->setSpeed(nav["speed"].get<float>());
+    if(nav.contains("transition"))
+      manip->setAnimationDuration(nav["transition"].get<float>());
+    if(nav.contains("autoPlay"))
+    {
+      ui->m_autoPlayPresets = nav["autoPlay"].get<bool>();
+      if(ui->m_autoPlayPresets)
+        ui->m_playPresets = true;
+    }
+  }
+
+  // Transform helpers
+  if(settings.contains("transformHelpers"))
+  {
+    const auto& transform = settings["transformHelpers"];
+    if(transform.contains("show"))
+      ui->m_helpers.setEditingMode(transform["show"].get<bool>());
+    if(transform.contains("snapEnabled"))
+      ui->m_helpers.transform.setSnapEnabled(transform["snapEnabled"].get<bool>());
+    if(transform.contains("snapTranslate") && transform.contains("snapRotate") && transform.contains("snapScale"))
+    {
+      ui->m_helpers.transform.setSnapValues(transform["snapTranslate"].get<float>(),
+                                            transform["snapRotate"].get<float>(), transform["snapScale"].get<float>());
+    }
+  }
+
+  // Grid
+  if(settings.contains("grid"))
+  {
+    const auto& grid = settings["grid"];
+    if(grid.contains("show"))
+      ui->m_helpers.grid.setVisible(grid["show"].get<bool>());
+  }
+
+  // Light proxies
+  if(settings.contains("lightProxies"))
+  {
+    const auto& lp = settings["lightProxies"];
+    if(lp.contains("show"))
+      ui->m_showLightProxies = lp["show"].get<bool>();
+  }
+
+  // Summary info overlay
+  if(settings.contains("summaryOverlay"))
+  {
+    const auto& overlay = settings["summaryOverlay"];
+    if(overlay.contains("show"))
+      ui->m_showSummaryOverlay = overlay["show"].get<bool>();
+  }
+}
+
+//--------------------------------------------------------------------------------------------------
+// Load tonemapping parameters
+//
+void VkgsProjectReader::loadTonemapping(const json& data, GaussianSplattingUI* ui)
+{
+  if(!data.contains("tonemapping"))
+    return;
+
+  const auto& item = data["tonemapping"];
+  auto&       tm   = ui->m_tonemapperData;
+
+  LOAD1(tm.isActive, item, "isActive");
+  LOAD1(tm.method, item, "method");
+  LOAD1(tm.exposure, item, "exposure");
+  LOAD1(tm.temperature, item, "temperature");
+  LOAD1(tm.tint, item, "tint");
+
+  LOAD1(tm.contrast, item, "contrast");
+  LOAD1(tm.brightness, item, "brightness");
+  LOAD1(tm.saturation, item, "saturation");
+  LOAD1(tm.vignette, item, "vignette");
+
+  LOAD1(tm.vibrance, item, "vibrance");
+  LOAD1(tm.shadowBias, item, "shadowBias");
+  LOAD1(tm.midtoneBias, item, "midtoneBias");
+  LOAD1(tm.highlightBias, item, "highlightBias");
+  LOAD3(tm.coolColor, item, "coolColor");
+  LOAD3(tm.warmColor, item, "warmColor");
+  LOAD1(tm.splitBalance, item, "splitBalance");
+
+  LOAD1(tm.autoExposure, item, "autoExposure");
+  LOAD1(tm.autoExposureSpeed, item, "autoExposureSpeed");
+  LOAD1(tm.evMinValue, item, "evMinValue");
+  LOAD1(tm.evMaxValue, item, "evMaxValue");
+  LOAD1(tm.enableCenterMetering, item, "enableCenterMetering");
+  LOAD1(tm.centerMeteringSize, item, "centerMeteringSize");
+  LOAD1(tm.averageMode, item, "averageMode");
+
+  LOAD1(tm.dither, item, "dither");
+}
 
 }  // namespace vk_gaussian_splatting

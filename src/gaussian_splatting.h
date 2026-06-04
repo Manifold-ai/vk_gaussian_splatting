@@ -51,6 +51,7 @@
 #include <nvvk/context.hpp>
 #include <nvvk/debug_util.hpp>
 #include <nvvk/pipeline.hpp>
+#include <nvvk/graphics_pipeline.hpp>
 #include <nvvk/physical_device.hpp>
 #include <nvvk/helpers.hpp>
 #include <nvvk/gbuffers.hpp>
@@ -94,6 +95,7 @@
 #include "ply_loader_async.h"
 #include "splat_sorter_async.h"
 #include "visual_helpers_vk.h"  // 3D gizmo and grid visualization
+#include "sky_sun_and_ibl.h"
 
 // #DLSS
 #if defined(USE_DLSS)
@@ -102,7 +104,17 @@
 
 #include "image_compare.h"
 
+#include <nvshaders_host/tonemapper.hpp>
+
 namespace vk_gaussian_splatting {
+
+struct BufferDumpInfo
+{
+  VkImage     image;
+  VkFormat    format;
+  VkExtent2D  size;
+  std::string postfix;
+};
 
 class GaussianSplatting
 {
@@ -131,7 +143,16 @@ protected:
 
   // reset frame counter for temporal accumulated multi-sampling
   // will cause a restart of the frame construction
-  inline void resetFrameCounter() { prmFrame.frameSampleId = -1; }
+  // When DLSS is enabled, frameSampleId must never reset — DLSS handles temporal
+  // history via motion vectors and needs a continuously incrementing frame index.
+  inline void resetFrameCounter()
+  {
+#if defined(USE_DLSS)
+    if(m_dlss.isEnabled())
+      return;
+#endif
+    prmFrame.frameSampleId = -1;
+  }
 
   void onRender(VkCommandBuffer cmd);
 
@@ -151,6 +172,35 @@ protected:
     return (prmSelectedPipeline == PIPELINE_RTX || prmSelectedPipeline == PIPELINE_HYBRID || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
   }
 
+  // Check if current pipeline is pure ray tracing (no rasterization)
+  inline bool isRtxPipelineOnly() const { return prmSelectedPipeline == PIPELINE_RTX; }
+
+  // Check if current pipeline uses rasterization (Vert, Mesh, Mesh 3DGUT, or Hybrid variants)
+  inline bool isRasterPipelineActive() const
+  {
+    return (prmSelectedPipeline == PIPELINE_VERT || prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_MESH_3DGUT
+            || prmSelectedPipeline == PIPELINE_HYBRID || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
+  }
+
+  // Check if current pipeline is pure rasterization (no ray tracing)
+  inline bool isRasterPipelineOnly() const
+  {
+    return (prmSelectedPipeline == PIPELINE_VERT || prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_MESH_3DGUT);
+  }
+
+  // Check if a pipeline relies on VK_EXT_mesh_shader (raster MESH, MESH_3DGUT
+  // and the hybrid raster paths all dispatch via vkCmdDrawMeshTasksEXT).
+  static inline bool isMeshShaderPipeline(uint32_t pipeline)
+  {
+    return pipeline == PIPELINE_MESH || pipeline == PIPELINE_HYBRID || pipeline == PIPELINE_MESH_3DGUT || pipeline == PIPELINE_HYBRID_3DGUT;
+  }
+
+  // True when the distance compute (+ optional VRDX radix) GPU path is active this frame.
+  inline bool usesGpuDistSort() const
+  {
+    return (prmRaster.sortingMethod == SORTING_GPU_SYNC_RADIX) || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
+  }
+
   // Check if DLSS is supported in current pipeline (RTX and hybrid pipelines)
   inline bool isDlssSupportedPipeline() const
   {
@@ -168,7 +218,7 @@ protected:
   // Must match the NEED_SURFACE_INFO shader macro computation in updateSlangMacros()
   inline bool needSurfaceInfo()
   {
-    bool need = (prmRender.lightingMode != LightingMode::eLightingDisabled) || (m_assets.cameras.getCamera().dofMode != DOF_DISABLED);
+    bool need = prmRender.lightingEnabled || (m_assets.cameras.getCamera().dofMode != DOF_DISABLED);
 #if defined(USE_DLSS)
     need = need || m_dlss.isEnabled();
 #endif
@@ -186,12 +236,24 @@ protected:
   void deinitScene();
 
 private:
+  // Utility: create a graphics pipeline and log/null-out the handle on failure.
+  // Returns true on success.
+  static bool createGraphicsPipelineChecked(VkDevice                           device,
+                                            VkPipelineCache                    cache,
+                                            nvvk::GraphicsPipelineCreator&     creator,
+                                            const nvvk::GraphicsPipelineState& state,
+                                            VkPipeline*                        pipeline,
+                                            const char*                        debugName);
+
   // init the raster pipelines
   void initPipelines();
 
   // Update BINDING_SPLAT_TEXTURES in the descriptor set after textures are (re)created.
   // Called after processVramUpdates() to ensure descriptor set matches current GPU textures.
   void updateSplatTextureDescriptors();
+
+  // Update BINDING_MESH_TEXTURES in the descriptor set after mesh textures are loaded or freed.
+  void updateMeshTextureDescriptors();
 
   // deinit raster and rtx pipelines TODO move rtx in separate method
   void deinitPipelines();
@@ -231,6 +293,13 @@ private:
   // forceAll: if true, process all requests including RTX even if not in RTX pipeline (for cleanup on reset/exit)
   void processUpdateRequests(bool forceAll = false);
 
+  // Release GPU buffers not needed by the current pipeline to reclaim VRAM:
+  //   Pure RTX:    release sorting buffers (no raster pass)
+  //   Pure raster: release RTX acceleration structures (no ray tracing)
+  //   Hybrid:      keep both
+  // Buffers are reallocated on demand when switching to a pipeline that needs them.
+  void releaseUnusedBuffers();
+
 
   // Process GBuffer reinitialization requests (format changes)
   // Called from onPreRender before the frame command buffer is recorded
@@ -240,6 +309,8 @@ private:
   void updateAndUploadFrameInfoUBO(VkCommandBuffer cmd, const uint32_t splatCount);
 
   void processSortingOnGPU(VkCommandBuffer cmd, const uint32_t splatCount);
+
+  void coerceRasterParamsForSortingMethod();
 
   void drawSplatPrimitives(VkCommandBuffer cmd, const uint32_t splatCount);
 
@@ -255,7 +326,7 @@ private:
   // read back updated indirect parameters from m_indirect into m_indirectReadbackHost
   void readBackIndirectParametersIfNeeded(VkCommandBuffer cmd);
 
-  void updateRenderingMemoryStatistics(const uint32_t splatCount);
+  void updateRasterizationMemoryStatistics(const uint32_t splatCount);
 
   //////////////
   // RTX specific
@@ -277,8 +348,29 @@ private:
   void postProcess(VkCommandBuffer cmd);
 
 protected:
-  // name of the loaded scene if load is successfull
-  std::filesystem::path m_loadedSceneFilename;
+  int getPayloadArraySize() const;
+
+  // Number of mesh-task workgroups needed to rasterize splatCount splats (one workgroup per
+  // RASTER_MESH_WORKGROUP_SIZE = prmRaster.meshShaderWorkgroupSize splats).
+  uint32_t getMeshTaskWorkgroupCount(uint32_t splatCount) const;
+
+  // 2D mesh-task dispatch grid {groupCountX, groupCountY} covering splatCount splats. The grid
+  // width is the device maxMeshWorkGroupCount[0] (HardwareSupport::maxMeshWorkGroupCountX); the
+  // raster mesh shaders linearize the grid id (groupID.y * width + groupID.x), so a single-row
+  // grid (y == 1) is identical to a plain 1D dispatch.
+  glm::uvec2 getMeshTaskDispatchGrid(uint32_t splatCount) const;
+
+  // True when splatCount needs more mesh-task workgroups than the device can dispatch, i.e. the 2D
+  // grid would exceed the Y per-dimension limit or the X*Y total-count limit. Beyond this point the
+  // scene cannot be fully rasterized via the mesh pipeline (a hardware ceiling, not a grid-shape
+  // issue); the UI flags it so the user knows splats are being dropped.
+  bool isMeshTaskDispatchOverflow(uint32_t splatCount) const;
+
+  // path of the splat set file currently being loaded (transient, used across async load frames)
+  std::filesystem::path m_currentLoadingSplatSetFilename;
+
+  // path of the currently loaded/saved .vkgs project (empty = untitled)
+  std::filesystem::path m_projectPath;
 
   // Current load request being processed (for queue-based loading)
   SceneLoadRequest m_currentLoadRequest;
@@ -310,6 +402,9 @@ protected:
   bool m_requestUpdateShaders = false;
   // Defer shader rebuild until camera animation completes
   bool m_requestUpdateShadersAfterCameraAnim = false;
+  // Track scene composition for RTX_HAS_MESHES / RTX_HAS_PARTICLES macro changes
+  bool m_lastHadMeshes    = false;
+  bool m_lastHadParticles = false;
   // Pipeline-specific optimization: defer RTX AS rebuild when in raster mode
   // When transforms are modified in raster mode, we don't rebuild RTX structures immediately.
   // This flag tracks that RTX needs rebuilding, and will trigger rebuild when switching to RTX pipeline.
@@ -334,11 +429,11 @@ protected:
   nvutils::ProfilerTimeline* m_profilerTimeline{};
   nvvk::ProfilerGpuTimer     m_profilerGpuTimer;
 
-  glm::vec2 m_viewSize = {0, 0};
-  VkFormat m_colorFormat = VK_FORMAT_R16G16B16A16_SFLOAT;  // Color format of the image (minimum 16-bit float for temporal accumulation precision)
+  glm::vec2         m_viewSize      = {0, 0};
   VkFormat          m_depthFormat = VK_FORMAT_UNDEFINED;       // Depth format of the depth buffer
   VkClearColorValue m_clearColor  = {0.0F, 0.0F, 0.0F, 0.0F};  // Clear color
-  VkDevice          m_device      = VK_NULL_HANDLE;            // Convenient sortcut to device
+  VkDevice          m_device        = VK_NULL_HANDLE;            // Convenient shortcut to device
+  VkPipelineCache   m_pipelineCache = VK_NULL_HANDLE;            // In-memory cache for pipeline compilation
 
   // Convenient enum to dereference color buffers in GBuffers
   enum
@@ -349,6 +444,7 @@ protected:
     COLOR_RASTER_NORMAL     = 3,  // Rasterization: integrated normals (RGB16F)
     COLOR_RASTER_DEPTH      = 4,  // Rasterization: picked depth (R) + transmittance (G) for FTB
     COLOR_RASTER_SPLATID    = 5,  // Rasterization: global splat ID (R32_UINT)
+    COLOR_LDR               = 6,  // Tone-mapped LDR output (R8G8B8A8_UNORM)
   };
   // G-Buffers: 9 color buffers + 1 depth buffer
   nvvk::GBuffer m_gBuffers;
@@ -394,7 +490,8 @@ protected:
     VkShaderModule rtxRmiss2Shader{};  // For shadows (no support yet)
     VkShaderModule rtxRchitShader{};   // Closest Hit (for meshes)
     VkShaderModule rtxRahitShader{};   // Any Hit
-    VkShaderModule rtxRintShader{};    // Interrsection
+    VkShaderModule rtxRintShader{};    // Intersection
+    VkShaderModule rtxRintBillboardShader{};  // Intersection (billboard variant)
     // Post processings
     VkShaderModule postComputeShader{};
     // Deferred shading
@@ -485,6 +582,20 @@ protected:
   VkDescriptorSet getPresentationImageDescriptorSet(void);
 
   ///////////////////////////////
+  // Tone Mapping
+  nvshaders::Tonemapper    m_tonemapper;
+  shaderio::TonemapperData m_tonemapperData{.isActive = 0, .method = shaderio::ToneMapMethod::eClip};
+
+  void initTonemapper();
+  void deinitTonemapper();
+  void tonemap(VkCommandBuffer cmd);
+
+  ///////////////////////////////
+  // Sky, Sun & IBL environment
+  SkySunAndIBL m_sky;
+  nvvk::Buffer m_envAccelDummyBuffer{};  // Dummy buffer for RTX_BINDING_ENV_ACCEL when no HDR loaded
+
+  ///////////////////////////////
   // Visual Helpers (3D Gizmo and Grid)
   VisualHelpers m_helpers;
   bool          m_showLightProxies = true;  // Show/hide light proxy meshes
@@ -494,6 +605,9 @@ protected:
 
   // Returns the source image info for the current visualization mode (used by ImageCompare)
   ImageCompare::ImageInfo getCurrentVisualizationImageInfo() const;
+
+  // Returns all dumpable image buffers for multi-buffer frame capture
+  std::vector<BufferDumpInfo> getAllDumpableBuffers() const;
 
 #if defined(USE_DLSS)
   // Helper to map visualization mode to DLSS buffer

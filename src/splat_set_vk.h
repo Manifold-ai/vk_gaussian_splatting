@@ -36,7 +36,7 @@
 #include "acceleration_structures_lb.hpp"
 #include "splat_set.h"
 #include "utilities.h"
-#include "obj_loader.h"
+#include "mesh.h"
 
 #include "splat_set.h"  // Base class with RAM data
 #include "memory_statistics.h"
@@ -109,7 +109,7 @@ public:
   // uploads the splatSet into VRAM
   // format/rgbaFormat in  [FORMAT_FLOAT32, FORMAT_FLOAT16, FORMAT_UINT8]
   // Note: Uses inherited SplatSet data (this->positions, etc.)
-  void initDataStorage(uint32_t shFormat, uint32_t rgbaFormat);
+  void initDataStorage(uint32_t shFormat, uint32_t rgbaFormat, bool skipCovariance = false);
 
   // destroy all buffers from VRAM
   // a new initDataStorage can be invoked afterward
@@ -182,7 +182,7 @@ public:
   nvvk::LargeBuffer sphericalHarmonicsBuffer;
 
   // Material properties for splat set (default material for new instances)
-  shaderio::ObjMaterial splatMaterial;
+  shaderio::Material splatMaterial;
 
   // Splat set metadata (needed by instances to build descriptors)
   uint32_t splatCount  = 0;  // Number of splats in this set
@@ -194,12 +194,14 @@ public:
 
   // Texture indices (for STORAGE_TEXTURES mode, bindless texture array)
   // These are set during initDataTextures() and used by instances to build descriptors
+  // Covariance is last (index 5) so it can be omitted from the descriptor write
+  // when released in pure RTX mode (raster-only resource).
   uint32_t textureIndexCenters     = 0;
   uint32_t textureIndexScales      = 0;
   uint32_t textureIndexRotations   = 0;
   uint32_t textureIndexColors      = 0;
-  uint32_t textureIndexCovariances = 0;
   uint32_t textureIndexSH          = 0;
+  uint32_t textureIndexCovariances = 0;
 
   // Note: descriptor and descriptorBuffer moved to SplatSetInstanceVk (per-instance data)
 
@@ -242,11 +244,19 @@ public:
   uint64_t tlasSizeBytes = 0;  // Size of the TLAS in VRAM in bytes
   uint64_t blasSizeBytes = 0;  // Size of the BLAS in VRAM in bytes
 
+  // Covariance buffer lifecycle (raster-only resource, can be released in pure RTX)
+  void initCovarianceBuffer();
+  void deinitCovarianceBuffer();
+  void initCovarianceTexture();
+  void deinitCovarianceTexture();
+  bool hasCovarianceBuffer() const { return covariancesBuffer.buffer != VK_NULL_HANDLE; }
+  bool hasCovarianceTexture() const { return covariancesMap.image != VK_NULL_HANDLE; }
+
 private:
   // create the buffers on the device and upload
   // the splat set data from host to device
   // Note: Uses inherited SplatSet data
-  void initDataBuffers();
+  void initDataBuffers(bool skipCovariance);
 
   // release buffers
   void deinitDataBuffers(void);
@@ -254,7 +264,7 @@ private:
   // create the texture maps on the device and upload
   // the splat set data from host to device
   // Note: Uses inherited SplatSet data
-  void initDataTextures();
+  void initDataTextures(bool skipCovariance);
 
   // release textures
   void deinitDataTextures(void);

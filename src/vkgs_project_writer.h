@@ -47,6 +47,9 @@ private:
   static void saveSplatSets(json& data, const GaussianSplattingUI* ui, const std::string& projectPath);
   static void saveSplatInstances(json& data, const GaussianSplattingUI* ui);
   static void saveMeshes(json& data, const GaussianSplattingUI* ui, const std::string& projectPath);
+  static void saveEnvironment(json& data, const GaussianSplattingUI* ui, const std::string& projectPath);
+  static void saveSettings(json& data, const GaussianSplattingUI* ui);
+  static void saveTonemapping(json& data, const GaussianSplattingUI* ui);
 };
 
 }  // namespace vk_gaussian_splatting

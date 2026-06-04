@@ -28,16 +28,19 @@ struct VertexInput
 {
   [[vk::location(0)]] float3 position : POSITION;
   [[vk::location(1)]] float3 normal : NORMAL;
-  //[[vk::location(2)]] float3 color : COLOR;
-  //[[vk::location(3)]] float2 texCoord : TEXCOORD0;
+  [[vk::location(2)]] float2 texCoord : TEXCOORD0;
+  [[vk::location(3)]] float2 texCoord1 : TEXCOORD1;
+  [[vk::location(4)]] float4 tangent : TANGENT;
 };
 
 struct VertexOutput
 {
-  [[vk::location(1)]] float3 worldPos : TEXCOORD1;
-  [[vk::location(2)]] float3 worldNrm : TEXCOORD2;
-  [[vk::location(3)]] float3 viewDir : TEXCOORD3;
-  //[[vk::location(4)]] float2 texCoord : TEXCOORD4;
+  [[vk::location(1)]] float3 worldPos : POSITION_WS;
+  [[vk::location(2)]] float3 worldNrm : NORMAL_WS;
+  [[vk::location(3)]] float3 viewDir : VIEW_DIR;
+  [[vk::location(4)]] float2 texCoord : TEXCOORD0;
+  [[vk::location(5)]] float2 texCoord1 : TEXCOORD1;
+  [[vk::location(6)]] float4 worldTangent : TANGENT_WS;
   float4 position : SV_Position;
 };
 // clang-format on
@@ -52,12 +55,18 @@ VertexOutput main(VertexInput input)
 
   float3 origin = mul(float4(0, 0, 0, 1), frameInfo.viewInverse).xyz;
 
-  output.worldPos = mul(float4(input.position, 1.0), meshDesc.transform).xyz;
-  output.viewDir  = output.worldPos - origin;
-  // output.texCoord = input.texCoord;
+  output.worldPos  = mul(float4(input.position, 1.0), meshDesc.transform).xyz;
+  output.viewDir   = output.worldPos - origin;
+  output.texCoord  = input.texCoord;
+  output.texCoord1 = input.texCoord1;
+
   // For normals, we need transpose(inverse(RS))
   // We store inverse(RS), then transpose() it here (fast operation)
   output.worldNrm = normalize(mul(input.normal, transpose(meshDesc.transformRotScaleInverse)));
+
+  // Transform tangent direction to world space (same transform as normals for direction vectors)
+  float3 worldT = normalize(mul(input.tangent.xyz, transpose(meshDesc.transformRotScaleInverse)));
+  output.worldTangent = float4(worldT, input.tangent.w);
 
   output.position = mul(mul(float4(output.worldPos, 1.0), frameInfo.viewMatrix), frameInfo.projectionMatrixJittered);
 

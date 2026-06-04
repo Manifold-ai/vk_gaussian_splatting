@@ -23,6 +23,7 @@ theme:
         name: Switch to light mode
   features:
     - navigation.instant
+    - navigation.indexes
     - navigation.top
     - search.suggest
     - search.highlight
@@ -63,18 +64,29 @@ markdown_extensions:
 
 extra_css:
   - stylesheets/extra.css
+  - https://unpkg.com/img-comparison-slider@8/dist/styles.css
+  - https://cdn.jsdelivr.net/gh/abelcabezaroman/definitive-image-comparison-slider@master/src/dics.css
 
 extra_javascript:
   - javascripts/mathjax.js
   - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+  - https://unpkg.com/img-comparison-slider@8/dist/index.js
+  - https://cdn.jsdelivr.net/gh/abelcabezaroman/definitive-image-comparison-slider@master/src/dics.js
+  - javascripts/multi-img-comp-init.js
 
 nav:
   - Home: index.md
   - Getting Started: getting-started.md
   - Release Notes: release-notes.md
   - Feature Videos: feature-videos.md
+  - Sample Projects:
+    - sample-projects/index.md
+    - Winter House - Splats as Env: sample-projects/sample-project-winter-house-chess-splats-as-env.md
+    - Winter House - Point Lights: sample-projects/sample-project-winter-house-stove-point-lights.md
+    - Large City — Sky Environment: sample-projects/sample-project-city-sky-env.md
+  - Download Datasets: datasets.md
   - User Guides:
-    - Overview: user-guides/overview.md
+    - user-guides/index.md
     - Workflow: user-guides/workflow.md
     - File Menu: user-guides/file-menu.md
     - Assets and Properties:
@@ -95,6 +107,6 @@ nav:
     - VK3DGHR - Hybrid Rendering: deep-dives/hybrid_rendering_3d_gaussians.md
     - Stochastic Transparency: deep-dives/stochastic_transparency.md
     - Lighting and Shadows: deep-dives/lighting_and_shadows.md
-  - Datasets: datasets.md
+    - Billboard Ray Tracing: deep-dives/billboard_ray_tracing.md
   - Benchmarking: benchmarking.md
   - References: references.md

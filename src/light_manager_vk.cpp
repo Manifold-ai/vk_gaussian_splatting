@@ -101,7 +101,7 @@ std::shared_ptr<LightSourceInstanceVk> LightManagerVk::createLight()
   lightAsset->innerConeAngle  = 30.0f;
   lightAsset->outerConeAngle  = 45.0f;
   lightAsset->attenuationMode = 2;  // Quadratic
-  lightAsset->proxyScale      = 1.0f;
+  lightAsset->radius          = 1.0f;
 
   // Create proxy mesh for THIS asset based on light type (NOT shared!)
   // Each asset gets its own mesh so it can have its own material/color
@@ -127,11 +127,9 @@ std::shared_ptr<LightSourceInstanceVk> LightManagerVk::createLight()
     // Set material as purely emissive (no lighting)
     if(lightAsset->proxyMesh && !lightAsset->proxyMesh->materials.empty())
     {
-      lightAsset->proxyMesh->materials[0].emission = lightAsset->color;
-      lightAsset->proxyMesh->materials[0].diffuse  = glm::vec3(0.0f);  // No lighting
-      lightAsset->proxyMesh->materials[0].ambient  = glm::vec3(0.0f);  // No lighting
-      lightAsset->proxyMesh->materials[0].specular = glm::vec3(0.0f);  // No lighting
-      lightAsset->proxyMaterial                    = lightAsset->proxyMesh->materials[0];
+      lightAsset->proxyMesh->materials[0].emissive  = lightAsset->color;
+      lightAsset->proxyMesh->materials[0].baseColor = glm::vec3(0.0f);
+      lightAsset->proxyMaterial                     = lightAsset->proxyMesh->materials[0];
     }
   }
 
@@ -300,16 +298,14 @@ void LightManagerVk::updateLightAsset(std::shared_ptr<LightSourceVk> asset)
   }
 
   // Update proxy material color (affects all instances sharing this asset)
-  asset->proxyMaterial.emission = asset->color;
+  asset->proxyMaterial.emissive = asset->color;
 
   // Update the mesh's material (stored in MeshVk) - keep it purely emissive!
   if(asset->proxyMesh && !asset->proxyMesh->materials.empty())
   {
-    asset->proxyMesh->materials[0].emission = asset->color;
-    asset->proxyMesh->materials[0].diffuse  = glm::vec3(0.0f);  // Ensure no lighting
-    asset->proxyMesh->materials[0].ambient  = glm::vec3(0.0f);  // Ensure no lighting
-    asset->proxyMesh->materials[0].specular = glm::vec3(0.0f);  // Ensure no lighting
-    m_meshSetVk->updateMeshMaterials(asset->proxyMesh);         // ✅ Mark for GPU upload!
+    asset->proxyMesh->materials[0].emissive  = asset->color;
+    asset->proxyMesh->materials[0].baseColor = glm::vec3(0.0f);
+    m_meshSetVk->updateMeshMaterials(asset->proxyMesh);
   }
 
   // Update ALL instances that share this asset (transforms/scale)
@@ -371,11 +367,9 @@ void LightManagerVk::recreateProxyForAsset(std::shared_ptr<LightSourceVk> asset)
   // Set material as purely emissive
   if(asset->proxyMesh && !asset->proxyMesh->materials.empty())
   {
-    asset->proxyMesh->materials[0].emission = asset->color;
-    asset->proxyMesh->materials[0].diffuse  = glm::vec3(0.0f);
-    asset->proxyMesh->materials[0].ambient  = glm::vec3(0.0f);
-    asset->proxyMesh->materials[0].specular = glm::vec3(0.0f);
-    asset->proxyMaterial                    = asset->proxyMesh->materials[0];
+    asset->proxyMesh->materials[0].emissive  = asset->color;
+    asset->proxyMesh->materials[0].baseColor = glm::vec3(0.0f);
+    asset->proxyMaterial                     = asset->proxyMesh->materials[0];
   }
 
   // Recreate proxy instances for all instances using this asset
@@ -477,7 +471,8 @@ void LightManagerVk::rebuildBuffer()
       shaderLight.innerConeAngle  = instance->lightSource->innerConeAngle;
       shaderLight.outerConeAngle  = instance->lightSource->outerConeAngle;
       shaderLight.attenuationMode = instance->lightSource->attenuationMode;
-      shaderLight.radius          = instance->lightSource->proxyScale;  // For soft shadows disk sampling
+      shaderLight.radius          = instance->lightSource->radius;
+      shaderLight.enabled         = instance->lightSource->enabled;
       shaderLights.push_back(shaderLight);
     }
   }
@@ -530,7 +525,8 @@ void LightManagerVk::updateBuffer()
       shaderLight.innerConeAngle  = instance->lightSource->innerConeAngle;
       shaderLight.outerConeAngle  = instance->lightSource->outerConeAngle;
       shaderLight.attenuationMode = instance->lightSource->attenuationMode;
-      shaderLight.radius          = instance->lightSource->proxyScale;  // For soft shadows disk sampling
+      shaderLight.radius          = instance->lightSource->radius;
+      shaderLight.enabled         = instance->lightSource->enabled;
       shaderLights.push_back(shaderLight);
     }
   }
@@ -557,13 +553,13 @@ std::shared_ptr<MeshVk> LightManagerVk::createProxySphere()
     return nullptr;
   }
 
-  // Create sphere geometry (simplified - icosahedron-based)
+  // Create sphere geometry
   const int   segments = 16;
   const int   rings    = 8;
   const float radius   = 0.1f;
 
-  std::vector<ObjVertex> vertices;
-  std::vector<uint32_t>  indices;
+  auto meshVk  = std::make_shared<MeshVk>();
+  meshVk->path = "light_proxy_sphere";
 
   // Generate sphere vertices
   for(int ring = 0; ring <= rings; ++ring)
@@ -573,10 +569,10 @@ std::shared_ptr<MeshVk> LightManagerVk::createProxySphere()
     {
       float theta = 2.0f * glm::pi<float>() * float(seg) / float(segments);
 
-      ObjVertex vert{};
+      Vertex vert{};
       vert.pos = glm::vec3(radius * sin(phi) * cos(theta), radius * cos(phi), radius * sin(phi) * sin(theta));
       vert.nrm = glm::normalize(vert.pos);
-      vertices.push_back(vert);
+      meshVk->vertices.push_back(vert);
     }
   }
 
@@ -590,30 +586,25 @@ std::shared_ptr<MeshVk> LightManagerVk::createProxySphere()
       int i2 = (ring + 1) * (segments + 1) + seg;
       int i3 = i2 + 1;
 
-      indices.push_back(i0);
-      indices.push_back(i2);
-      indices.push_back(i1);
+      meshVk->indices.push_back(i0);
+      meshVk->indices.push_back(i2);
+      meshVk->indices.push_back(i1);
 
-      indices.push_back(i1);
-      indices.push_back(i2);
-      indices.push_back(i3);
+      meshVk->indices.push_back(i1);
+      meshVk->indices.push_back(i2);
+      meshVk->indices.push_back(i3);
     }
   }
 
-  // Create purely emissive material (no lighting interaction)
-  ObjMaterial material{};
-  material.emission                  = glm::vec3(1.0f);  // White by default (will be updated)
-  material.diffuse                   = glm::vec3(0.0f);  // ✅ No diffuse = no lighting
-  material.ambient                   = glm::vec3(0.0f);  // ✅ No ambient = no lighting
-  material.specular                  = glm::vec3(0.0f);  // ✅ No specular = no lighting
-  std::vector<ObjMaterial> materials = {material};
-  std::vector<uint32_t>    matIndices(indices.size() / 3, 0);  // All faces use material 0
+  // Purely emissive material (no lighting interaction)
+  Material material{};
+  material.emissive  = glm::vec3(1.0f);
+  material.baseColor = glm::vec3(0.0f);
+  meshVk->materials  = {material};
+  meshVk->matIndices.resize(meshVk->indices.size() / 3, 0);
 
-  // Create mesh (each light gets its own mesh for independent materials)
-  auto mesh = m_meshSetVk->createMesh("light_proxy_sphere", vertices, indices, materials, matIndices);
-
-  LOGD("Created proxy sphere: %zu vertices, %zu indices\n", vertices.size(), indices.size());
-  return mesh;
+  LOGD("Created proxy sphere: %zu vertices, %zu indices\n", meshVk->vertices.size(), meshVk->indices.size());
+  return m_meshSetVk->registerMesh(meshVk);
 }
 
 std::shared_ptr<MeshVk> LightManagerVk::createProxyCone(int segments)
@@ -624,24 +615,24 @@ std::shared_ptr<MeshVk> LightManagerVk::createProxyCone(int segments)
     return nullptr;
   }
 
-  // Create cone geometry: apex at origin, pointing along -Z axis (matching light direction), base at z=-height
-  const float height     = 0.2f;  // Small cone (5x smaller than original)
+  // Cone geometry: apex at origin, pointing along -Z axis, base at z=-height
+  const float height     = 0.2f;
   const float baseRadius = 0.1f;
 
-  std::vector<ObjVertex> vertices;
-  std::vector<uint32_t>  indices;
+  auto meshVk  = std::make_shared<MeshVk>();
+  meshVk->path = "light_proxy_cone";
 
   // Apex vertex (at origin)
-  ObjVertex apex{};
+  Vertex apex{};
   apex.pos = glm::vec3(0.0f, 0.0f, 0.0f);
-  apex.nrm = glm::vec3(0.0f, 0.0f, 1.0f);  // Point forward
-  vertices.push_back(apex);
+  apex.nrm = glm::vec3(0.0f, 0.0f, 1.0f);
+  meshVk->vertices.push_back(apex);
 
   // Base center vertex
-  ObjVertex baseCenter{};
+  Vertex baseCenter{};
   baseCenter.pos = glm::vec3(0.0f, 0.0f, -height);
   baseCenter.nrm = glm::vec3(0.0f, 0.0f, -1.0f);
-  vertices.push_back(baseCenter);
+  meshVk->vertices.push_back(baseCenter);
 
   // Base circle vertices
   for(int i = 0; i <= segments; ++i)
@@ -650,55 +641,47 @@ std::shared_ptr<MeshVk> LightManagerVk::createProxyCone(int segments)
     float x     = baseRadius * cos(theta);
     float y     = baseRadius * sin(theta);
 
-    // Base vertex
-    ObjVertex baseVert{};
+    Vertex baseVert{};
     baseVert.pos = glm::vec3(x, y, -height);
 
-    // Cone side normal (pointing outward from cone surface)
     glm::vec3 toApex  = glm::normalize(apex.pos - baseVert.pos);
     glm::vec3 tangent = glm::vec3(-sin(theta), cos(theta), 0.0f);
     baseVert.nrm      = glm::normalize(glm::cross(tangent, toApex));
 
-    vertices.push_back(baseVert);
+    meshVk->vertices.push_back(baseVert);
   }
 
-  // Generate indices for cone sides
+  // Cone side indices
   int apexIdx = 0;
   for(int i = 0; i < segments; ++i)
   {
     int baseIdx1 = 2 + i;
     int baseIdx2 = 2 + i + 1;
-
-    indices.push_back(apexIdx);
-    indices.push_back(baseIdx1);
-    indices.push_back(baseIdx2);
+    meshVk->indices.push_back(apexIdx);
+    meshVk->indices.push_back(baseIdx1);
+    meshVk->indices.push_back(baseIdx2);
   }
 
-  // Generate indices for base circle (reversed winding since normal flipped)
+  // Base circle indices
   int baseCenterIdx = 1;
   for(int i = 0; i < segments; ++i)
   {
     int baseIdx1 = 2 + i;
     int baseIdx2 = 2 + i + 1;
-
-    indices.push_back(baseCenterIdx);
-    indices.push_back(baseIdx1);
-    indices.push_back(baseIdx2);
+    meshVk->indices.push_back(baseCenterIdx);
+    meshVk->indices.push_back(baseIdx1);
+    meshVk->indices.push_back(baseIdx2);
   }
 
-  // Create purely emissive material
-  ObjMaterial material{};
-  material.emission                  = glm::vec3(1.0f);  // White by default (will be updated)
-  material.diffuse                   = glm::vec3(0.0f);
-  material.ambient                   = glm::vec3(0.0f);
-  material.specular                  = glm::vec3(0.0f);
-  std::vector<ObjMaterial> materials = {material};
-  std::vector<uint32_t>    matIndices(indices.size() / 3, 0);
+  // Purely emissive material
+  Material material{};
+  material.emissive  = glm::vec3(1.0f);
+  material.baseColor = glm::vec3(0.0f);
+  meshVk->materials  = {material};
+  meshVk->matIndices.resize(meshVk->indices.size() / 3, 0);
 
-  auto mesh = m_meshSetVk->createMesh("light_proxy_cone", vertices, indices, materials, matIndices);
-
-  LOGD("Created proxy cone: %zu vertices, %zu indices\n", vertices.size(), indices.size());
-  return mesh;
+  LOGD("Created proxy cone: %zu vertices, %zu indices\n", meshVk->vertices.size(), meshVk->indices.size());
+  return m_meshSetVk->registerMesh(meshVk);
 }
 
 std::shared_ptr<MeshVk> LightManagerVk::createProxyQuad()
@@ -709,85 +692,64 @@ std::shared_ptr<MeshVk> LightManagerVk::createProxyQuad()
     return nullptr;
   }
 
-  // Create quad geometry: facing +Z axis, with a cone indicator
-  const float size     = 0.1f;  // Small quad (0.2x0.2 total, 5x smaller than original)
+  // Quad geometry: facing +Z axis, with a cone indicator
+  const float size     = 0.1f;
   const float coneSize = 0.06f;
 
-  std::vector<ObjVertex> vertices;
-  std::vector<uint32_t>  indices;
+  auto meshVk  = std::make_shared<MeshVk>();
+  meshVk->path = "light_proxy_quad";
 
   // Quad vertices (square facing +Z)
-  ObjVertex v0, v1, v2, v3;
+  Vertex v0, v1, v2, v3;
   v0.pos = glm::vec3(-size, -size, 0.0f);
   v1.pos = glm::vec3(size, -size, 0.0f);
   v2.pos = glm::vec3(size, size, 0.0f);
   v3.pos = glm::vec3(-size, size, 0.0f);
   v0.nrm = v1.nrm = v2.nrm = v3.nrm = glm::vec3(0.0f, 0.0f, 1.0f);
 
-  vertices.push_back(v0);  // 0
-  vertices.push_back(v1);  // 1
-  vertices.push_back(v2);  // 2
-  vertices.push_back(v3);  // 3
+  meshVk->vertices.push_back(v0);  // 0
+  meshVk->vertices.push_back(v1);  // 1
+  meshVk->vertices.push_back(v2);  // 2
+  meshVk->vertices.push_back(v3);  // 3
 
   // Cone indicator vertices (pointing in +Z direction)
-  // Cone shaft
-  ObjVertex c0, c1, c2, c3;
+  Vertex c0, c1, c2, c3;
   c0.pos = glm::vec3(-coneSize * 0.1f, 0.0f, 0.0f);
   c1.pos = glm::vec3(coneSize * 0.1f, 0.0f, 0.0f);
   c2.pos = glm::vec3(coneSize * 0.1f, coneSize * 0.6f, 0.0f);
   c3.pos = glm::vec3(-coneSize * 0.1f, coneSize * 0.6f, 0.0f);
   c0.nrm = c1.nrm = c2.nrm = c3.nrm = glm::vec3(0.0f, 0.0f, 1.0f);
 
-  vertices.push_back(c0);  // 4
-  vertices.push_back(c1);  // 5
-  vertices.push_back(c2);  // 6
-  vertices.push_back(c3);  // 7
+  meshVk->vertices.push_back(c0);  // 4
+  meshVk->vertices.push_back(c1);  // 5
+  meshVk->vertices.push_back(c2);  // 6
+  meshVk->vertices.push_back(c3);  // 7
 
   // Cone tip
-  ObjVertex t0, t1, t2;
+  Vertex t0, t1, t2;
   t0.pos = glm::vec3(-coneSize * 0.3f, coneSize * 0.6f, 0.0f);
   t1.pos = glm::vec3(coneSize * 0.3f, coneSize * 0.6f, 0.0f);
   t2.pos = glm::vec3(0.0f, coneSize, 0.0f);
   t0.nrm = t1.nrm = t2.nrm = glm::vec3(0.0f, 0.0f, 1.0f);
 
-  vertices.push_back(t0);  // 8
-  vertices.push_back(t1);  // 9
-  vertices.push_back(t2);  // 10
+  meshVk->vertices.push_back(t0);  // 8
+  meshVk->vertices.push_back(t1);  // 9
+  meshVk->vertices.push_back(t2);  // 10
 
   // Quad indices
-  indices.push_back(0);
-  indices.push_back(1);
-  indices.push_back(2);
-  indices.push_back(0);
-  indices.push_back(2);
-  indices.push_back(3);
+  meshVk->indices = {0, 1, 2, 0, 2, 3,  // quad
+                     4, 5, 6, 4, 6, 7,  // cone shaft
+                     8, 9, 10};         // cone tip
 
-  // Cone shaft indices
-  indices.push_back(4);
-  indices.push_back(5);
-  indices.push_back(6);
-  indices.push_back(4);
-  indices.push_back(6);
-  indices.push_back(7);
+  // Purely emissive material
+  Material material{};
+  material.emissive  = glm::vec3(1.0f);
+  material.baseColor = glm::vec3(0.0f);
+  meshVk->materials  = {material};
+  meshVk->matIndices.resize(meshVk->indices.size() / 3, 0);
 
-  // Cone tip indices
-  indices.push_back(8);
-  indices.push_back(9);
-  indices.push_back(10);
-
-  // Create purely emissive material
-  ObjMaterial material{};
-  material.emission                  = glm::vec3(1.0f);  // White by default (will be updated)
-  material.diffuse                   = glm::vec3(0.0f);
-  material.ambient                   = glm::vec3(0.0f);
-  material.specular                  = glm::vec3(0.0f);
-  std::vector<ObjMaterial> materials = {material};
-  std::vector<uint32_t>    matIndices(indices.size() / 3, 0);
-
-  auto mesh = m_meshSetVk->createMesh("light_proxy_quad", vertices, indices, materials, matIndices);
-
-  LOGD("Created proxy quad: %zu vertices, %zu indices\n", vertices.size(), indices.size());
-  return mesh;
+  LOGD("Created proxy quad: %zu vertices, %zu indices\n", meshVk->vertices.size(), meshVk->indices.size());
+  return m_meshSetVk->registerMesh(meshVk);
 }
 
 void LightManagerVk::updateProxyTransform(std::shared_ptr<LightSourceInstanceVk> instance)
@@ -800,14 +762,14 @@ void LightManagerVk::updateProxyTransform(std::shared_ptr<LightSourceInstanceVk>
   // Update proxy instance transform to match light instance translation and rotation
   glm::vec3 lightPos   = instance->translation;                         // From instance
   glm::vec3 lightRot   = instance->rotation;                            // From instance
-  glm::vec3 proxyScale = glm::vec3(instance->lightSource->proxyScale);  // From asset
+  glm::vec3 lightRadius = glm::vec3(instance->lightSource->radius);      // From asset
 
   instance->proxyInstance->translation = lightPos;
   instance->proxyInstance->rotation    = lightRot;
-  instance->proxyInstance->scale       = proxyScale;
+  instance->proxyInstance->scale       = lightRadius;
 
   // Use utility function (now fixed to use quaternion-based rotation)
-  computeTransform(proxyScale, lightRot, lightPos, instance->proxyInstance->transform,
+  computeTransform(lightRadius, lightRot, lightPos, instance->proxyInstance->transform,
                    instance->proxyInstance->transformInverse, instance->proxyInstance->transformRotScaleInverse);
 
   // Note: Proxy material color is updated in updateLightAsset(), not here

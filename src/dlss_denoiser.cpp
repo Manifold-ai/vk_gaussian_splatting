@@ -20,8 +20,6 @@
 #include <nvutils/logger.hpp>
 #include <nvutils/timers.hpp>
 #include <nvvk/debug_util.hpp>
-#include <imgui/imgui.h>
-#include <nvgui/property_editor.hpp>
 
 #include "dlss_denoiser.hpp"
 
@@ -64,7 +62,7 @@ void DlssDenoiser::initDenoiser(const InitResources& resources)
 {
   if(m_initialized)
     return;
-  SCOPED_TIMER("Initializing DLSS Denoiser");
+  SCOPED_TIMER("Initializing DLSS Denoiser\n");
 
   m_device = resources.allocator->getDevice();
 
@@ -135,8 +133,9 @@ VkExtent2D DlssDenoiser::updateSize(VkCommandBuffer cmd, VkExtent2D size)
   m_sizeModeChanged = false;
 
   DlssRayReconstruction::InitInfo initInfo{
-      .inputSize  = m_renderingSize,
-      .outputSize = size,
+      .hardwareDepth = true,  // Depth guide is NDC depth (clip.z / clip.w), not linear view-space depth
+      .inputSize     = m_renderingSize,
+      .outputSize    = size,
   };
   m_dlss.deinit();
   vkDeviceWaitIdle(m_device);
@@ -204,43 +203,4 @@ void DlssDenoiser::denoise(VkCommandBuffer cmd, glm::vec2 jitter, const glm::mat
   }
 
   m_forceReset = false;
-}
-
-bool DlssDenoiser::onUi()
-{
-  namespace PE = nvgui::PropertyEditor;
-
-  bool changed = false;
-
-  if(!m_dlssSupported && m_initialized)
-  {
-    PE::Text("DLSS is not available", "");
-    return changed;
-  }
-
-  if(PE::Checkbox("Enable DLSS", &m_settings.enable))
-  {
-    m_forceReset = true;  // Force a reset when enabling/disabling DLSS
-    changed      = true;
-  }
-  if(!m_initialized)
-    return changed;
-
-  if(!m_settings.enable)
-    return changed;
-
-  // Size mode selection
-  const char* sizeModes[]     = {"Min", "Optimal", "Max"};
-  int         currentSizeMode = static_cast<int>(m_settings.sizeMode);
-
-  if(PE::Combo("DLSS Size Mode", &currentSizeMode, sizeModes, IM_ARRAYSIZE(sizeModes)))
-  {
-    m_settings.sizeMode = static_cast<SizeMode>(currentSizeMode);
-    m_sizeModeChanged   = true;  // Mark that size mode has changed
-    changed             = true;  // Mark that changes were made
-  }
-
-  PE::Text("Current Resolution", "%d x %d", m_renderingSize.width, m_renderingSize.height);
-
-  return changed;
 }

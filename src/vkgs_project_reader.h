@@ -61,7 +61,14 @@ private:
                              const std::string&                      projectPath,
                              std::map<int, std::shared_ptr<MeshVk>>& assetIdToMesh,
                              GaussianSplattingUI*                    ui);
-  static void loadMeshInstances(const json& data, const std::map<int, std::shared_ptr<MeshVk>>& assetIdToMesh, GaussianSplattingUI* ui);
+  static void loadMeshInstances(const json&                                   data,
+                                int                                           fileVersion,
+                                const std::map<int, std::shared_ptr<MeshVk>>& assetIdToMesh,
+                                GaussianSplattingUI*                          ui);
+
+  static void loadEnvironment(const json& data, const std::string& projectPath, GaussianSplattingUI* ui);
+  static void loadSettings(const json& data, GaussianSplattingUI* ui);
+  static void loadTonemapping(const json& data, GaussianSplattingUI* ui);
 };
 
 }  // namespace vk_gaussian_splatting

@@ -554,8 +554,9 @@ void ImageCompareUI::renderMetricsCharts(ImVec2 fixedSize)
         ImPlot::SetupAxis(ImAxis_Y1, nullptr, yAxisFlags);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0, s_maxMSE * 1.2f, ImPlotCond_Always);
 
-        ImPlot::SetNextFillStyle(ImVec4(1.0f, 0.4f, 0.4f, 0.8f));
-        ImPlot::PlotBars("MSE", mseData.data(), historySize, 1.0);  // Bar width = 1.0
+        ImPlotSpec mseBarSpec;
+        mseBarSpec.FillColor = ImVec4(1.0f, 0.4f, 0.4f, 0.8f);
+        ImPlot::PlotBars("MSE", mseData.data(), historySize, 1.0, 0.0, mseBarSpec);  // Bar width = 1.0
       }
       else
       {
@@ -565,8 +566,10 @@ void ImageCompareUI::renderMetricsCharts(ImVec2 fixedSize)
         ImPlot::SetupAxis(ImAxis_Y1, nullptr, yAxisFlags);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0, s_maxMSE * 1.2f, ImPlotCond_Always);
 
-        ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), 2.0f);
-        ImPlot::PlotLine("MSE", mseData.data(), historySize);
+        ImPlotSpec mseLineSpec;
+        mseLineSpec.LineColor  = ImVec4(1.0f, 0.4f, 0.4f, 1.0f);
+        mseLineSpec.LineWeight = 2.0f;
+        ImPlot::PlotLine("MSE", mseData.data(), historySize, 1.0, 0.0, mseLineSpec);
       }
 
       ImPlot::EndPlot();
@@ -589,8 +592,9 @@ void ImageCompareUI::renderMetricsCharts(ImVec2 fixedSize)
         float psnrPadding = psnrRange * 0.1f;
         ImPlot::SetupAxisLimits(ImAxis_Y1, s_minPSNR - psnrPadding, s_maxPSNR + psnrPadding, ImPlotCond_Always);
 
-        ImPlot::SetNextFillStyle(ImVec4(0.4f, 1.0f, 0.4f, 0.8f));
-        ImPlot::PlotBars("PSNR", psnrData.data(), historySize, 1.0);  // Bar width = 1.0
+        ImPlotSpec psnrBarSpec;
+        psnrBarSpec.FillColor = ImVec4(0.4f, 1.0f, 0.4f, 0.8f);
+        ImPlot::PlotBars("PSNR", psnrData.data(), historySize, 1.0, 0.0, psnrBarSpec);  // Bar width = 1.0
       }
       else
       {
@@ -604,8 +608,10 @@ void ImageCompareUI::renderMetricsCharts(ImVec2 fixedSize)
         float psnrPadding = psnrRange * 0.1f;
         ImPlot::SetupAxisLimits(ImAxis_Y1, s_minPSNR - psnrPadding, s_maxPSNR + psnrPadding, ImPlotCond_Always);
 
-        ImPlot::SetNextLineStyle(ImVec4(0.4f, 1.0f, 0.4f, 1.0f), 2.0f);
-        ImPlot::PlotLine("PSNR", psnrData.data(), historySize);
+        ImPlotSpec psnrLineSpec;
+        psnrLineSpec.LineColor  = ImVec4(0.4f, 1.0f, 0.4f, 1.0f);
+        psnrLineSpec.LineWeight = 2.0f;
+        ImPlot::PlotLine("PSNR", psnrData.data(), historySize, 1.0, 0.0, psnrLineSpec);
       }
 
       ImPlot::EndPlot();
@@ -624,8 +630,9 @@ void ImageCompareUI::renderMetricsCharts(ImVec2 fixedSize)
         ImPlot::SetupAxis(ImAxis_Y1, nullptr, yAxisFlags);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0, s_maxFLIP * 1.2f, ImPlotCond_Always);
 
-        ImPlot::SetNextFillStyle(ImVec4(1.0f, 0.8f, 0.4f, 0.8f));
-        ImPlot::PlotBars("FLIP", flipData.data(), historySize, 1.0);  // Bar width = 1.0
+        ImPlotSpec flipBarSpec;
+        flipBarSpec.FillColor = ImVec4(1.0f, 0.8f, 0.4f, 0.8f);
+        ImPlot::PlotBars("FLIP", flipData.data(), historySize, 1.0, 0.0, flipBarSpec);  // Bar width = 1.0
       }
       else
       {
@@ -635,8 +642,10 @@ void ImageCompareUI::renderMetricsCharts(ImVec2 fixedSize)
         ImPlot::SetupAxis(ImAxis_Y1, nullptr, yAxisFlags);
         ImPlot::SetupAxisLimits(ImAxis_Y1, 0, s_maxFLIP * 1.2f, ImPlotCond_Always);
 
-        ImPlot::SetNextLineStyle(ImVec4(1.0f, 0.8f, 0.4f, 1.0f), 2.0f);
-        ImPlot::PlotLine("FLIP", flipData.data(), historySize);
+        ImPlotSpec flipLineSpec;
+        flipLineSpec.LineColor  = ImVec4(1.0f, 0.8f, 0.4f, 1.0f);
+        flipLineSpec.LineWeight = 2.0f;
+        ImPlot::PlotLine("FLIP", flipData.data(), historySize, 1.0, 0.0, flipLineSpec);
       }
 
       ImPlot::EndPlot();

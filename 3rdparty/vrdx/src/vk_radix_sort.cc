@@ -16,13 +16,21 @@ constexpr int PARTITION_SIZE = PARTITION_DIVISION * WORKGROUP_SIZE;
 
 uint32_t RoundUp(uint32_t a, uint32_t b) { return (a + b - 1) / b; }
 uint32_t Align(uint32_t a, uint32_t b) { return (a + b - 1) / b * b; }
+VkDeviceSize AlignSize(VkDeviceSize a, VkDeviceSize b) { return (a + b - 1) / b * b; }
 
-VkDeviceSize HistogramSize(uint32_t elementCount) {
-  return Align((4 + 4 * RADIX + RoundUp(elementCount, PARTITION_SIZE) * RADIX) * sizeof(uint32_t),
-               16);
+// Each sub-region of the storage buffer is bound as VK_DESCRIPTOR_TYPE_STORAGE_BUFFER
+// via vkCmdPushDescriptorSetKHR, so its offset must be a multiple of
+// minStorageBufferOffsetAlignment (e.g. 16 on NVIDIA, 64 on Intel Arc, up to 256
+// on some other implementations). Sizes additionally must remain aligned so the
+// next sub-region also lands on an aligned offset.
+VkDeviceSize HistogramSize(uint32_t elementCount, VkDeviceSize storageAlignment) {
+  return AlignSize((4 + 4 * RADIX + RoundUp(elementCount, PARTITION_SIZE) * RADIX) * sizeof(uint32_t),
+                   storageAlignment);
 }
 
-VkDeviceSize InoutSize(uint32_t elementCount) { return Align(elementCount * sizeof(uint32_t), 16); }
+VkDeviceSize InoutSize(uint32_t elementCount, VkDeviceSize storageAlignment) {
+  return AlignSize(elementCount * sizeof(uint32_t), storageAlignment);
+}
 
 void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t elementCount,
              VkBuffer indirectBuffer, VkDeviceSize indirectOffset, VkBuffer buffer,
@@ -43,7 +51,51 @@ struct VrdxSorter_T {
   VkPipeline spinePipeline = VK_NULL_HANDLE;
   VkPipeline downsweepPipeline = VK_NULL_HANDLE;
   VkPipeline downsweepKeyValuePipeline = VK_NULL_HANDLE;
+
+  // Cached at create time from the physical device limits. Used to align all
+  // sub-buffer offsets passed to vkCmdPushDescriptorSetKHR (storage buffer
+  // descriptors require offset % minStorageBufferOffsetAlignment == 0).
+  VkDeviceSize storageBufferOffsetAlignment = 16;
 };
+
+namespace {
+
+// The upsweep/spine/downsweep shaders are written for a subgroup (wave) size of
+// at least 32. Specifically downsweep allocates groupshared localHistogram of
+// PARTITION_SIZE (4096) entries and indexes it up to RADIX * (WORKGROUP_SIZE /
+// subgroupSize). That stays in bounds only when subgroupSize >= 32:
+//   RADIX * WORKGROUP_SIZE / subgroupSize <= PARTITION_SIZE
+//   256  * 512           / subgroupSize  <= 4096   =>   subgroupSize >= 32
+// NVIDIA defaults to 32 and AMD to 64, so they work implicitly. Intel iGPUs
+// default to 8 or 16, which overflows the groupshared array and hangs the GPU.
+// We therefore pin the compute stages to a subgroup size of 32 via
+// VK_EXT_subgroup_size_control (core in Vulkan 1.3) when the device allows it.
+constexpr uint32_t REQUIRED_SUBGROUP_SIZE = 32;
+
+// Returns 0 when subgroup-size pinning is unavailable/unnecessary, otherwise the
+// subgroup size to force on the radix-sort compute pipelines (always 32 here).
+uint32_t selectRequiredSubgroupSize(VkPhysicalDevice physicalDevice) {
+  if (physicalDevice == VK_NULL_HANDLE) return 0;
+
+  VkPhysicalDeviceSubgroupSizeControlProperties subgroupProps = {
+      VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_PROPERTIES};
+  VkPhysicalDeviceProperties2 props2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+  props2.pNext = &subgroupProps;
+  vkGetPhysicalDeviceProperties2(physicalDevice, &props2);
+
+  const bool computeStageOk =
+      (subgroupProps.requiredSubgroupSizeStages & VK_SHADER_STAGE_COMPUTE_BIT) != 0;
+  const bool inRange = REQUIRED_SUBGROUP_SIZE >= subgroupProps.minSubgroupSize &&
+                       REQUIRED_SUBGROUP_SIZE <= subgroupProps.maxSubgroupSize;
+  const bool fitsBudget =
+      (WORKGROUP_SIZE / REQUIRED_SUBGROUP_SIZE) <= subgroupProps.maxComputeWorkgroupSubgroups;
+
+  const uint32_t selected = (computeStageOk && inRange && fitsBudget) ? REQUIRED_SUBGROUP_SIZE : 0;
+
+  return selected;
+}
+
+}  // namespace
 
 struct PushConstants {
   uint32_t pass;
@@ -51,7 +103,28 @@ struct PushConstants {
 
 void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSorter) {
   VkDevice device = pCreateInfo->device;
+  VkPhysicalDevice physicalDevice = pCreateInfo->physicalDevice;
   VkPipelineCache pipelineCache = pCreateInfo->pipelineCache;
+
+  // Query the device's storage buffer offset alignment. This must be honored by
+  // every offset we pass into VkDescriptorBufferInfo for STORAGE_BUFFER writes.
+  VkDeviceSize storageBufferOffsetAlignment = 16;
+  if (physicalDevice != VK_NULL_HANDLE) {
+    VkPhysicalDeviceProperties physicalDeviceProperties = {};
+    vkGetPhysicalDeviceProperties(physicalDevice, &physicalDeviceProperties);
+    storageBufferOffsetAlignment =
+        physicalDeviceProperties.limits.minStorageBufferOffsetAlignment;
+    if (storageBufferOffsetAlignment < 16) storageBufferOffsetAlignment = 16;
+  }
+
+  // The radix-sort shaders require a subgroup size >= 32 (see comment on
+  // selectRequiredSubgroupSize). Pin it explicitly so small-wave GPUs (Intel
+  // iGPU defaults to 8/16) don't overflow groupshared memory and hang.
+  const uint32_t requiredSubgroupSize = selectRequiredSubgroupSize(physicalDevice);
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfo subgroupSizeInfo = {
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO};
+  subgroupSizeInfo.requiredSubgroupSize = requiredSubgroupSize;
+  const void* stagePNext = (requiredSubgroupSize != 0) ? (const void*)&subgroupSizeInfo : nullptr;
 
   // device extensions
   PFN_vkCmdPushDescriptorSetKHR vkCmdPushDescriptorSetKHR =
@@ -100,6 +173,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
 
     VkComputePipelineCreateInfo pipelineInfo = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.pNext = stagePNext;
     pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
@@ -120,6 +194,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
 
     VkComputePipelineCreateInfo pipelineInfo = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfo.stage.pNext = stagePNext;
     pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
@@ -146,6 +221,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
     VkComputePipelineCreateInfo pipelineInfos[2];
     pipelineInfos[0] = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfos[0].stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfos[0].stage.pNext = stagePNext;
     pipelineInfos[0].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfos[0].stage.module = shaderModules[0];
     pipelineInfos[0].stage.pName = "main";
@@ -153,6 +229,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
 
     pipelineInfos[1] = {VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO};
     pipelineInfos[1].stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
+    pipelineInfos[1].stage.pNext = stagePNext;
     pipelineInfos[1].stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfos[1].stage.module = shaderModules[1];
     pipelineInfos[1].stage.pName = "main";
@@ -177,6 +254,7 @@ void vrdxCreateSorter(const VrdxSorterCreateInfo* pCreateInfo, VrdxSorter* pSort
   (*pSorter)->spinePipeline = spinePipeline;
   (*pSorter)->downsweepPipeline = downsweepPipeline;
   (*pSorter)->downsweepKeyValuePipeline = downsweepKeyValuePipeline;
+  (*pSorter)->storageBufferOffsetAlignment = storageBufferOffsetAlignment;
 }
 
 void vrdxDestroySorter(VrdxSorter sorter) {
@@ -193,10 +271,11 @@ void vrdxDestroySorter(VrdxSorter sorter) {
 void vrdxGetSorterStorageRequirements(VrdxSorter sorter, uint32_t maxElementCount,
                                       VrdxSorterStorageRequirements* requirements) {
   VkDevice device = sorter->device;
+  const VkDeviceSize storageAlignment = sorter->storageBufferOffsetAlignment;
 
-  VkDeviceSize elementCountSize = Align(sizeof(uint32_t), 16);
-  VkDeviceSize histogramSize = HistogramSize(maxElementCount);
-  VkDeviceSize inoutSize = InoutSize(maxElementCount);
+  VkDeviceSize elementCountSize = AlignSize(sizeof(uint32_t), storageAlignment);
+  VkDeviceSize histogramSize = HistogramSize(maxElementCount, storageAlignment);
+  VkDeviceSize inoutSize = InoutSize(maxElementCount, storageAlignment);
 
   VkDeviceSize histogramOffset = elementCountSize;
   VkDeviceSize inoutOffset = histogramOffset + histogramSize;
@@ -209,10 +288,11 @@ void vrdxGetSorterStorageRequirements(VrdxSorter sorter, uint32_t maxElementCoun
 void vrdxGetSorterKeyValueStorageRequirements(VrdxSorter sorter, uint32_t maxElementCount,
                                               VrdxSorterStorageRequirements* requirements) {
   VkDevice device = sorter->device;
+  const VkDeviceSize storageAlignment = sorter->storageBufferOffsetAlignment;
 
-  VkDeviceSize elementCountSize = Align(sizeof(uint32_t), 16);
-  VkDeviceSize histogramSize = HistogramSize(maxElementCount);
-  VkDeviceSize inoutSize = InoutSize(maxElementCount);
+  VkDeviceSize elementCountSize = AlignSize(sizeof(uint32_t), storageAlignment);
+  VkDeviceSize histogramSize = HistogramSize(maxElementCount, storageAlignment);
+  VkDeviceSize inoutSize = InoutSize(maxElementCount, storageAlignment);
 
   VkDeviceSize histogramOffset = elementCountSize;
   VkDeviceSize inoutOffset = histogramOffset + histogramSize;
@@ -270,9 +350,10 @@ void gpuSort(VkCommandBuffer commandBuffer, VrdxSorter sorter, uint32_t elementC
 
   uint32_t partitionCount = RoundUp(elementCount, PARTITION_SIZE);
 
-  VkDeviceSize elementCountSize = Align(sizeof(uint32_t), 16);
-  VkDeviceSize histogramSize = HistogramSize(elementCount);
-  VkDeviceSize inoutSize = InoutSize(elementCount);
+  const VkDeviceSize storageAlignment = sorter->storageBufferOffsetAlignment;
+  VkDeviceSize elementCountSize = AlignSize(sizeof(uint32_t), storageAlignment);
+  VkDeviceSize histogramSize = HistogramSize(elementCount, storageAlignment);
+  VkDeviceSize inoutSize = InoutSize(elementCount, storageAlignment);
 
   VkDeviceSize elementCountOffset = storageOffset;
   VkDeviceSize histogramOffset = elementCountOffset + elementCountSize;

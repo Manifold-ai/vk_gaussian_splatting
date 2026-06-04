@@ -1,0 +1,872 @@
+{
+    "camera": {
+        "aperture": 0.0010000000474974513,
+        "clip": [
+            0.009999999776482582,
+            2000.0
+        ],
+        "ctr": [
+            3.37982439994812,
+            0.6705904603004456,
+            6.5387282371521
+        ],
+        "dofMode": 0,
+        "eye": [
+            3.270653486251831,
+            0.7668790817260742,
+            6.959341049194336
+        ],
+        "focusDist": 1.2999999523162842,
+        "fov": 60.0,
+        "model": 0,
+        "up": [
+            0.0,
+            1.0,
+            0.0
+        ]
+    },
+    "cameras": [
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.009999999776482582,
+                2000.0
+            ],
+            "ctr": [
+                3.37982439994812,
+                0.6705904603004456,
+                6.5387282371521
+            ],
+            "dofMode": 0,
+            "eye": [
+                3.270653486251831,
+                0.7668790817260742,
+                6.959341049194336
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.009999999776482582,
+                2000.0
+            ],
+            "ctr": [
+                0.9070472717285156,
+                1.08086359500885,
+                3.8014774322509766
+            ],
+            "dofMode": 0,
+            "eye": [
+                0.9052770137786865,
+                1.1098464727401733,
+                3.8843834400177
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.009999999776482582,
+                2000.0
+            ],
+            "ctr": [
+                0.8772869110107422,
+                1.121142029762268,
+                3.142831563949585
+            ],
+            "dofMode": 0,
+            "eye": [
+                0.8670796751976013,
+                1.1511367559432983,
+                3.291714668273926
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        },
+        {
+            "aperture": 0.0010000000474974513,
+            "clip": [
+                0.009999999776482582,
+                2000.0
+            ],
+            "ctr": [
+                0.8110762238502502,
+                0.8480685353279114,
+                2.8404715061187744
+            ],
+            "dofMode": 0,
+            "eye": [
+                0.10173552483320236,
+                1.004824161529541,
+                2.98714280128479
+            ],
+            "focusDist": 1.2999999523162842,
+            "fov": 60.0,
+            "model": 0,
+            "up": [
+                0.0,
+                1.0,
+                0.0
+            ]
+        }
+    ],
+    "environment": {
+        "enabled": false,
+        "ibl": {
+            "file": "",
+            "intensity": 1.0,
+            "rotation": [
+                0.0,
+                0.0,
+                0.0
+            ]
+        },
+        "mode": 0,
+        "resolution": [
+            2048,
+            1024
+        ],
+        "skyAndSun": {
+            "groundColor": [
+                0.4000000059604645,
+                0.4000000059604645,
+                0.4000000059604645
+            ],
+            "haze": 0.10000000149011612,
+            "horizonBlur": 0.30000001192092896,
+            "horizonHeight": 0.0,
+            "nightColor": [
+                0.0,
+                0.0,
+                0.009999999776482582
+            ],
+            "redblueshift": 0.10000000149011612,
+            "saturation": 1.0,
+            "sunDirection": [
+                -1.2341340394073086e-08,
+                0.7071068286895752,
+                0.7071067094802856
+            ],
+            "sunDiskIntensity": 1.0,
+            "sunDiskScale": 1.0,
+            "sunGlowIntensity": 2.5
+        }
+    },
+    "lights": {
+        "assets": [],
+        "instances": [],
+        "nextNamingNumber": 3
+    },
+    "meshAssets": [
+        {
+            "id": 0,
+            "path": "data\\glTF-Sample-Assets\\Models\\Corset\\glTF\\Corset.gltf"
+        },
+        {
+            "id": 1,
+            "path": "data\\glTF-Sample-Assets\\Models\\DiffuseTransmissionTeacup\\glTF\\DiffuseTransmissionTeacup.gltf"
+        },
+        {
+            "id": 2,
+            "path": "data\\glTF-Sample-Assets\\Models\\ABeautifulGame\\glTF\\ABeautifulGame.gltf"
+        }
+    ],
+    "meshInstances": {
+        "items": [
+            {
+                "materials": [
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Corset_O",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    }
+                ],
+                "meshAssetId": 0,
+                "name": "Model 1 - Corset.gltf",
+                "position": [
+                    0.8289541602134705,
+                    0.541475772857666,
+                    3.145087242126465
+                ],
+                "rotation": [
+                    0.0,
+                    -309.7931823730469,
+                    0.0
+                ],
+                "scale": [
+                    11.073199272155762,
+                    11.073199272155762,
+                    11.073199272155762
+                ],
+                "show": true
+            },
+            {
+                "materials": [
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "tea_saucer",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "tea_cup",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    }
+                ],
+                "meshAssetId": 1,
+                "name": "Model 2 - seTransmissionTeacup.gltf",
+                "position": [
+                    3.0878331661224365,
+                    0.732291579246521,
+                    7.194802284240723
+                ],
+                "rotation": [
+                    0.0,
+                    -222.31900024414063,
+                    1.5
+                ],
+                "scale": [
+                    0.8677603006362915,
+                    0.8677603006362915,
+                    0.8677603006362915
+                ],
+                "show": true
+            },
+            {
+                "materials": [
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "King_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "King_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Queen_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Queen_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Chessboard",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            0.6601866483688354
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Pawn_Top_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 1.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Pawn_Body_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            0.07048114389181137,
+                            0.21763762831687927,
+                            0.17261061072349548
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Pawn_Top_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 1.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Pawn_Body_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Castle_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Castle_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Knight_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Knight_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Bishop_Black",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "Bishop_White",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    }
+                ],
+                "meshAssetId": 2,
+                "name": "Model 7 - ABeautifulGame.gltf",
+                "position": [
+                    3.2683804035186768,
+                    0.7404243350028992,
+                    6.875703811645508
+                ],
+                "rotation": [
+                    1.158888578414917,
+                    28.762447357177734,
+                    -1.1300392150878906
+                ],
+                "scale": [
+                    0.367861807346344,
+                    0.367861807346344,
+                    0.367861807346344
+                ],
+                "show": true
+            },
+            {
+                "materials": [
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "tea_saucer",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    },
+                    {
+                        "baseColor": [
+                            1.0,
+                            1.0,
+                            1.0
+                        ],
+                        "emissive": [
+                            0.0,
+                            0.0,
+                            0.0
+                        ],
+                        "emissiveStrength": 1.0,
+                        "ior": 1.5,
+                        "maxBounces": 3,
+                        "metallic": 1.0,
+                        "name": "tea_cup",
+                        "opacity": 1.0,
+                        "roughness": 1.0,
+                        "transmission": 0.0
+                    }
+                ],
+                "meshAssetId": 1,
+                "name": "Model 8 - seTransmissionTeacup.gltf",
+                "position": [
+                    3.426388740539551,
+                    0.7337978482246399,
+                    6.6215081214904785
+                ],
+                "rotation": [
+                    1.1131229400634766,
+                    0.0,
+                    -0.06748545169830322
+                ],
+                "scale": [
+                    0.972000002861023,
+                    0.9720374345779419,
+                    0.9720374345779419
+                ],
+                "show": true
+            }
+        ],
+        "nextNamingNumber": 65
+    },
+    "renderer": {
+        "alphaClamp": 0.9900000095367432,
+        "alphaCullThreshold": 0.003921568859368563,
+        "billboardFrustumCulling": true,
+        "colorFormat": 109,
+        "covarianceDilation": 0.30000001192092896,
+        "cpuLazySort": true,
+        "depthIsoThreshold": 0.699999988079071,
+        "depthIsoThresholdRTX": 0.699999988079071,
+        "distShaderWorkgroupSize": 256,
+        "dlssEnabled": false,
+        "dlssMinRadianceThreshold": 0.0,
+        "dlssSizeMode": 1,
+        "extentProjection": 1,
+        "fireflyClampThreshold": 0.0,
+        "fragmentBarycentric": false,
+        "frustumCulling": 1,
+        "ftbSyncMode": 0,
+        "kernelAdaptiveClamping": true,
+        "kernelDegree": 2,
+        "kernelMinResponse": 0.011300000362098217,
+        "lightingEnabled": true,
+        "maxPasses": 200,
+        "maxShDegree": 3,
+        "meshShaderWorkgroupSize": 32,
+        "minTransmittance": 0.009999999776482582,
+        "msAntialiasing": false,
+        "normalMethod": 0,
+        "opacityGaussianDisabled": false,
+        "particleDepth": 0,
+        "particleEmissiveAoEnabled": true,
+        "particleEmissiveAoRadius": 0.05000000074505806,
+        "particleEmissiveAoStrength": 1.0,
+        "particleSamplesPerPass": 18,
+        "particleShadowColorStrength": 0.0,
+        "particleShadowOffset": 0.20000000298023224,
+        "particleShadowTransmittanceThreshold": 0.800000011920929,
+        "pipeline": 2,
+        "pointCloudModeEnabled": false,
+        "quantizeMeshPayload": true,
+        "quantizeNormals": true,
+        "rtxMaxBounces": 3,
+        "rtxSecondaryRayOffset": 0.0010000000474974513,
+        "rtxTraceStrategy": 2,
+        "shadowsMode": 2,
+        "showShOnly": false,
+        "sizeCulling": 0,
+        "sizeCullingMinPixels": 1.0,
+        "sortingMethod": 3,
+        "splatScale": 1.0,
+        "splatSetCompositeTransmittance": 0.10000000149011612,
+        "temporalSamplesCount": 2000,
+        "temporalSampling": true,
+        "temporalSamplingMode": 0,
+        "thinParticleThreshold": 9.999999974752427e-07,
+        "visualize": 0,
+        "vsync": false,
+        "wireframe": false
+    },
+    "settings": {
+        "grid": {
+            "show": false
+        },
+        "lightProxies": {
+            "show": false
+        },
+        "navigation": {
+            "autoPlay": false,
+            "mode": 0,
+            "speed": 3.0,
+            "transition": 5.0
+        },
+        "summaryOverlay": {
+            "show": false
+        },
+        "transformHelpers": {
+            "show": false,
+            "snapEnabled": false,
+            "snapRotate": 15.0,
+            "snapScale": 0.10000000149011612,
+            "snapTranslate": 0.25
+        }
+    },
+    "splatSets": [
+        {
+            "id": 0,
+            "path": "data\\teleportour\\Winter-Garden-view2.ply",
+            "rgbaFormat": 2,
+            "shFormat": 2,
+            "storage": 0
+        }
+    ],
+    "splats": [
+        {
+            "material": {
+                "baseColor": [
+                    9.999999747378752e-05,
+                    9.998999303206801e-05,
+                    9.998999303206801e-05
+                ],
+                "clearcoatFactor": 0.0,
+                "clearcoatRoughness": 0.0,
+                "emissive": [
+                    1.0,
+                    0.9998999834060669,
+                    0.9998999834060669
+                ],
+                "emissiveStrength": 9.199999809265137,
+                "ior": 1.0,
+                "maxBounces": 0,
+                "metallic": 0.0,
+                "opacity": 1.0,
+                "roughness": 1.0,
+                "specularColorFactor": [
+                    0.0,
+                    0.0,
+                    0.0
+                ],
+                "specularFactor": 0.0,
+                "transmission": 0.0
+            },
+            "name": "Splat set 1 - Winter-Garden-view2.ply",
+            "position": [
+                0.0,
+                0.0,
+                0.0
+            ],
+            "rotation": [
+                0.0,
+                1.1267436742782593,
+                -3.08840012550354
+            ],
+            "scale": [
+                1.0,
+                1.0,
+                1.0
+            ],
+            "show": true,
+            "splatSetId": 0
+        }
+    ],
+    "splatsGlobals": {
+        "compressBlas": true,
+        "rgbaFormat": 2,
+        "shFormat": 2,
+        "useAABBs": false,
+        "useSpheres": false,
+        "useTlasInstances": true
+    },
+    "tonemapping": {
+        "autoExposure": 0,
+        "autoExposureSpeed": 5.0,
+        "averageMode": 1,
+        "brightness": 1.0,
+        "centerMeteringSize": 0.5,
+        "contrast": 1.0,
+        "coolColor": [
+            1.0,
+            1.0,
+            1.0
+        ],
+        "dither": 1,
+        "enableCenterMetering": 0,
+        "evMaxValue": 10.0,
+        "evMinValue": -5.0,
+        "exposure": 1.0,
+        "highlightBias": 0.0,
+        "isActive": 1,
+        "method": 2,
+        "midtoneBias": 0.0,
+        "saturation": 1.0,
+        "shadowBias": 0.0,
+        "splitBalance": 0.0,
+        "temperature": 6506.111328125,
+        "tint": 0.0032589531037956476,
+        "vibrance": 0.0,
+        "vignette": 0.0,
+        "warmColor": [
+            1.0,
+            1.0,
+            1.0
+        ]
+    },
+    "version": 7
+}

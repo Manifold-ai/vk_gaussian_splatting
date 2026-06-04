@@ -24,7 +24,10 @@ set(spz_headers
 add_library(spz STATIC ${spz_sources} ${spz_headers} )
 add_library(spz::spz ALIAS spz)
 
-target_link_libraries(spz PRIVATE zlib)
+# The upgraded spz (SPZ header version 4+) also needs zstd for compression.
+# Reuse the zstd target provided by nvpro_core2 (its INTERFACE include dir brings in zstd.h)
+# instead of letting spz FetchContent its own copy, which collides with nvpro_core2's targets.
+target_link_libraries(spz PRIVATE zlib libzstd_static)
 
 target_include_directories(spz
   PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/cc>

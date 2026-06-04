@@ -114,6 +114,12 @@ public:  // Methods specializing IAppElement
 
   ~GaussianSplattingUI() override;
 
+  // Access profiler view settings (e.g. for benchmark)
+  std::shared_ptr<nvapp::ElementProfiler::ViewSettings> getProfilerViewSettings() const
+  {
+    return m_profilerViewSettings;
+  }
+
   void onAttach(nvapp::Application* app) override;
 
   void onDetach() override;
@@ -147,21 +153,35 @@ private:
   void selectSplatSetInstance(std::shared_ptr<SplatSetInstanceVk> instance);
   void selectLightInstance(std::shared_ptr<LightSourceInstanceVk> instance);
 
+  // Register callback-based CLI/benchmark parameters (called from constructor)
+  void registerParameters(nvutils::ParameterRegistry* parameterRegistry);
+
   // Camera preset helper
   bool cameraPresetNeedsShaderRebuild(uint64_t presetIndex);
 
   void guiLoadSceneAndDrawProgressIfNeeded(void);
+  void guiImportMeshIfNeeded(void);
   void guiDrawViewport(void);
   void guiDrawAssetsWindow(void);
   void resetSelection();  // Clear any selection and detach transform gizmo
   void guiDrawRendererTree();
+  void guiDrawRasterizationTree();
+  void guiDrawRaytracingTree();
+  void guiDrawDenoisingTree();
+  void guiDrawTonemappingTree();
   void guiDrawCameraTree();
   void guiDrawLightTree();
   void guiDrawRadianceFieldsTree();
   void guiDrawObjectTree();
+  void guiDrawSkyTree();
 
   void guiDrawPropertiesWindow(void);
+  void guiDrawSettingsProperties(void);
   void guiDrawRendererProperties();
+  void guiDrawRasterizationProperties();
+  void guiDrawRaytracingProperties();
+  void guiDrawDenoisingProperties();
+  void guiDrawTonemappingProperties();
   void guiDrawCommonSplatSetProperties();
   void guiDrawSplatSetProperties();
   void guiDrawMeshTransformProperties();
@@ -169,6 +189,7 @@ private:
   void guiDrawCameraProperties();
   void guiDrawNavigationProperties();
   void guiDrawLightProperties();
+  void guiDrawSkyProperties();
 
   void guiDrawRendererStatisticsWindow();
 
@@ -196,6 +217,7 @@ private:
                        glm::mat3& transformRotScaleInv,
                        bool       disabled /*=false*/);
 
+
   // Helper method to toggle comparison mode
   void toggleComparisonMode(bool enable);
 
@@ -205,11 +227,16 @@ private:
   // Helper method to save current visualization to image file
   void saveVisualizationImageToFile(const std::filesystem::path& filename);
 
+  // Save a specific buffer by index to file, or all buffers if bufferIndex == -1.
+  // The filename provides the base path and extension (.png/.jpg/.hdr).
+  void saveBufferToFile(const std::filesystem::path& filename, int32_t bufferIndex);
+
   // Helper method to get settings string for comparison display
   std::string getSettingsString(int pipeline, int visualize);
 
   // methods to handle recent files in file menu
   void guiAddToRecentFiles(std::filesystem::path filePath, int historySize = 20);
+  void guiAddToRecentMeshes(std::filesystem::path filePath, int historySize = 20);
   void guiAddToRecentProjects(std::filesystem::path filePath, int historySize = 20);
 
   bool loadProjectIfNeeded();
@@ -217,24 +244,48 @@ private:
 
 private:
   // hide/show ui elements
+  bool m_showAssetsWindow       = true;
+  bool m_showPropertiesWindow   = true;
   bool m_showRendererStatistics = true;
   bool m_showMemoryStatistics   = true;
-  bool m_showShaderFeedback     = false;
+  bool m_showShaderFeedback     = true;
+  bool m_showFooterBar          = true;
+
+  // Fullscreen toggle state (borderless fullscreen via GLFW)
+  bool m_fullScreen      = false;
+  int  m_windowedPos[2]  = {0, 0};
+  int  m_windowedSize[2] = {0, 0};
 
   // Persistent cursor target overlay (locks shader feedback cursor)
   bool   m_showCursorTargetOverlay = false;
   bool   m_cursorTargetDragging    = false;
   ImVec2 m_cursorTargetPos         = ImVec2(-1.0f, -1.0f);  // in viewport image pixels (top-left origin)
 
+  // Owned sub-elements (created in onAttach when not in benchmark mode)
   std::shared_ptr<nvapp::ElementProfiler::ViewSettings> m_profilerViewSettings;
+  nvgpu_monitor::ElementGpuMonitor*                     m_gpuMonitor = nullptr;
 
   // benchmark mode (enabled by command line), loadings will be synchronous and vsync off
   bool* m_pBenchmarkEnabled = {};
   // screenshot file name (used by benchmark)
   std::filesystem::path m_screenshotFilename;
+  // saveImage file name and buffer index (used by benchmark)
+  std::filesystem::path m_saveImageFilename;
+  int32_t               m_saveImageBufferIndex = -1;
+  // camera presets file path (used by benchmark)
+  std::filesystem::path m_cameraPresetsFilename;
+  // camera preset index to activate (used by benchmark)
+  int32_t m_activateCameraPresetIndex = -1;
+  // color buffer format index: 0=R8_UNORM, 1=R16_SFLOAT(default), 2=R32_SFLOAT (used by benchmark)
+  int32_t m_colorBufferFormatIndex = 1;
+  // trigger destination for --updateData (must be a member so the pointer stays valid for the sequencer)
+  bool m_updateDataTrigger = false;
 
   // Recent files list
   std::vector<std::filesystem::path> m_recentFiles;
+
+  // Recent meshes list
+  std::vector<std::filesystem::path> m_recentMeshes;
 
   // Recent projects list
   std::vector<std::filesystem::path> m_recentProjects;
@@ -242,35 +293,37 @@ private:
   // for multiple choice selectors in the UI
   enum GuiEnums
   {
-    GUI_STORAGE,              // model storage in VRAM (in texture or buffer)
-    GUI_SORTING,              // the sorting method to use
-    GUI_PIPELINE,             // the rendering pipeline to use
-    GUI_CAMERA_TYPE,          // type of camera
-    GUI_FRUSTUM_CULLING,      // where to perform frustum culling (or disabled)
-    GUI_SH_FORMAT,            // data format for storage of SH in VRAM
-    GUI_RGBA_FORMAT,          // data format for storage of RGBA colors in VRAM
-    GUI_PARTICLE_FORMAT,      // Particle tracing mode for RTX
-    GUI_KERNEL_DEGREE,        // Kernel degree for RTX
-    GUI_VISUALIZE,            // visualization mode
-    GUI_VISUALIZE_DLSS_ON,    // visualization mode with DLSS enabled
-    GUI_ILLUM_MODEL,          // TODO rename, "illumination" model is not the proper name
-    GUI_DIST_SHADER_WG_SIZE,  // Distance shader workgroup size
-    GUI_MESH_SHADER_WG_SIZE,  // Mesh shader workgroup size
-    GUI_RAY_HIT_PER_PASS,     // Particle samples per pass (controls PARTICLES_SPP)
-    GUI_RTX_TRACE_STRATEGY,   // Ray tracing trace strategy (full any hit vs monte carlo)
-    GUI_TEMPORAL_SAMPLING,    // Temporal sampling mode
-    GUI_LIGHT_TYPE,           // Type of light
-    GUI_ATTENUATION_MODE,     // Light attenuation mode
-    GUI_EXTENT_METHOD,        // extent projection method
-    GUI_COMPARISON_DISPLAY,   // comparison display mode (reference, current, difference)
-    GUI_DLSS_MODE,            // DLSS quality mode (Disabled, Optimal, Minimal, Maximal)
-    GUI_FTB_SYNC_MODE,        // FTB depth buffer synchronization mode (interlock vs disabled)
-    GUI_COLOR_FORMAT,         // Color buffer format (precision/memory tradeoff)
-    GUI_NORMAL_METHOD,        // Normal vector computation method (max density plane, iso surface)
-    GUI_LIGHTING_MODE,        // Lighting mode (disabled, direct, indirect)
-    GUI_SHADOWS_MODE,         // Shadows mode (disabled, hard, soft)
-    GUI_DOF_MODE,             // Depth of Field mode (disabled, fixed focus, auto focus)
-    GUI_DOF_MODE_NO_AUTO      // Depth of Field mode (disabled, fixed focus)
+    GUI_STORAGE,                  // model storage in VRAM (in texture or buffer)
+    GUI_SORTING,                  // the sorting method to use
+    GUI_PIPELINE,                 // the rendering pipeline to use
+    GUI_CAMERA_TYPE,              // type of camera
+    GUI_FRUSTUM_CULLING,          // where to perform frustum culling (or disabled)
+    GUI_SH_FORMAT,                // data format for storage of SH in VRAM
+    GUI_RGBA_FORMAT,              // data format for storage of RGBA colors in VRAM
+    GUI_PARTICLE_FORMAT,          // Particle tracing mode for RTX (icosahedron, AABB, sphere)
+    GUI_KERNEL_DEGREE,            // Kernel degree for RTX
+    GUI_VISUALIZE,                // visualization mode
+    GUI_VISUALIZE_DLSS_ON,        // visualization mode with DLSS enabled
+    GUI_DIST_SHADER_WG_SIZE,      // Distance shader workgroup size
+    GUI_MESH_SHADER_WG_SIZE,      // Mesh shader workgroup size
+    GUI_RAY_HIT_PER_PASS,         // Particle samples per pass (controls PARTICLES_SPP)
+    GUI_RTX_TRACE_STRATEGY,       // Ray tracing trace strategy (full any hit vs monte carlo)
+    GUI_TEMPORAL_SAMPLING,        // Temporal sampling mode
+    GUI_LIGHT_TYPE,               // Type of light
+    GUI_ATTENUATION_MODE,         // Light attenuation mode
+    GUI_EXTENT_METHOD,            // extent projection method
+    GUI_COMPARISON_DISPLAY,       // comparison display mode (reference, current, difference)
+    GUI_DLSS_MODE,                // DLSS quality mode (Disabled, Optimal, Minimal, Maximal)
+    GUI_FTB_SYNC_MODE,            // FTB depth buffer synchronization mode (interlock vs disabled)
+    GUI_COLOR_FORMAT,             // Color buffer format (precision/memory tradeoff)
+    GUI_NORMAL_METHOD,            // Normal vector computation method (max density plane, iso surface)
+    GUI_LIGHTING_MODE,            // Lighting on/off selector
+    GUI_SHADOWS_MODE,             // Shadows mode (disabled, hard, soft)
+    GUI_DOF_MODE,                 // Depth of Field mode (disabled, fixed focus, auto focus)
+    GUI_DOF_MODE_NO_AUTO,         // Depth of Field mode (disabled, fixed focus)
+    GUI_PARTICLE_DEPTH,           // Particle depth mode (billboard, ellipsoid, max density plane)
+    GUI_BILLBOARD_BOUNDING_MODE,  // Billboard bounding mode (fitted, uniform)
+    GUI_COVARIANCE_DILATION       // 2D covariance low-pass kernel size
   };
 
   // UI utility for choice (a.k.a. "combo") menus
@@ -287,14 +340,24 @@ private:
   {
     GUI_NONE,
     GUI_RENDERER,
+    GUI_RASTERIZATION,
+    GUI_RAYTRACING,
+    GUI_DENOISING,
+    GUI_TONEMAPPING,
     GUI_CAMERA,
     GUI_LIGHT,
     GUI_SPLATSET,
     GUI_MESH,
+    GUI_SKY,
+    GUI_SETTINGS,
   } m_selectedAsset = GUI_RENDERER;
 
   bool        m_objListUpdated = false;
   const float TREE_INDENT      = 16.0f;
+
+  // Camera preset playback (demo mode)
+  bool m_autoPlayPresets = false;  // Persisted: auto-start playback on project load
+  bool m_playPresets     = false;  // Runtime: actively cycling through presets
 
   // Summary info overlay
   bool m_showSummaryOverlay = false;  // Toggle for the summary overlay

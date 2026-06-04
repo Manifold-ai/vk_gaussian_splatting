@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2023-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -13,152 +13,139 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  *
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2019-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef _GUT_PROJECTIOR_H_
-#define _GUT_PROJECTIOR_H_
+#ifndef _GUT_H_
+#define _GUT_H_
 
-// File translated from github-grut\threedgut_tracer\include\3dgut\kernels\cuda\renderers\gutProjector.cuh
+// 3DGUT hit processing functions for the rasterization fragment shader.
+// These wrap the 3DGRT ellipsoidal kernel (from threedgrt.h.slang) but take
+// pre-fetched particle attributes as parameters — the mesh shader fetches
+// once per particle, and the fragment shader evaluates per fragment.
+// Only opacity is returned; color is handled by the mesh shader and blended
+// by the Vulkan alpha-blending stage.
 
-#include "threedgut_definitions.h.slang"
-#include "threedgut_camera_projections.h.slang"
+#include "threedgrt.h.slang"
 
-bool threedgutParticleProjection(float2      resolution,
-                                 SensorModel sensorModel,
-                                 float4x4    toWorldMatrix,
-                                 SensorState sensorShutterState,
-                                 float3      particlePosition,
-                                 float3      particleScale,
-                                 float3x3    particleRotation,
-                                 out float2  particleProjCenter,
-                                 out float3  particleProjCovariance)
+bool threedgutProcessHit(in FrameInfo frameInfo,
+                         in float3    modelRayOrigin,
+                         in float3    modelRayDirection,
+                         in int       splatId,
+                         in float4    splatColor,
+                         in float3    particlePosition,
+                         in float3    particleScale,
+                         in float3x3  particleInvRotation,
+                         out float    opacity)
+
 {
-  float3 particleMean = particlePosition;
-
-  /* no Znear culling for now
-  if((particleMean.x * sensorMatrix[0][2] + particleMean.y * sensorMatrix[1][2] + particleMean.z * sensorMatrix[2][2]
-      + sensorMatrix[3][2])
-     < 0.2) // Params.ParticleMinSensorZ)
-  {
-    return false;
-  }
-  */
-
-  int    numValidPoints = 0;
-  float2 projectedSigmaPoints[2 * GUT_D + 1];
-
-  const float Lambda = GUT_LAMBDA;
-
-  if(projectPointWithShutter(mul(float4(particleMean, 1.0), toWorldMatrix).xyz, resolution, sensorModel,
-                             sensorShutterState, GUT_IN_IMAGE_MARGIN_FACTOR, projectedSigmaPoints[0]))
-  {
-    numValidPoints++;
-  }
-  particleProjCenter = projectedSigmaPoints[0] * (GUT_LAMBDA / (GUT_D + GUT_LAMBDA));
-
-  const float weightI = 1.0 / (2.0 * (GUT_D + GUT_LAMBDA));
-  [[unroll]]
-  for(int i = 0; i < GUT_D; ++i)
-  {
-    float3 delta = GUT_DELTA * particleScale[i] * particleRotation[i];
-
-    if(projectPointWithShutter(mul(float4(particleMean + delta, 1.0), toWorldMatrix).xyz, resolution, sensorModel,
-                               sensorShutterState, GUT_IN_IMAGE_MARGIN_FACTOR, projectedSigmaPoints[i + 1]))
-    {
-      numValidPoints++;
-    }
-    particleProjCenter += weightI * projectedSigmaPoints[i + 1];
-
-    if(projectPointWithShutter(mul(float4(particleMean - delta, 1.0), toWorldMatrix).xyz, resolution, sensorModel,
-                               sensorShutterState, GUT_IN_IMAGE_MARGIN_FACTOR, projectedSigmaPoints[i + 1 + GUT_D]))
-    {
-      numValidPoints++;
-    }
-    particleProjCenter += weightI * projectedSigmaPoints[i + 1 + GUT_D];
-  }
-
-  if(GUT_REQUIRE_ALL_SIGMA_POINTS_VALID)
-  {
-    if(numValidPoints < (2 * GUT_D + 1))
-    {
-#pragma warning(disable: 41018)  // Disable warning 41018 : returning without initializing some variables/parameters
-      return false;
-#pragma warning(default: 41018)
-    }
-  }
-  else if(numValidPoints == 0)
-  {
-#pragma warning(disable: 41018)  // Disable warning 41018 : returning without initializing some variables/parameters
+  const float particleDensity = splatColor.a;
+  if(particleDensity <= frameInfo.alphaCullThreshold)
+#pragma warning(disable: 41018)
     return false;
 #pragma warning(default: 41018)
+
+  float3 particleRayOrigin;
+  float3 particleRayDirection;
+  particleCannonicalRay(modelRayOrigin, modelRayDirection, particlePosition, particleScale, particleInvRotation,
+                        particleRayOrigin, particleRayDirection);
+
+  const float rayDist = particleRayMinSquaredDistance(particleRayOrigin, particleRayDirection);
+
+  const float maxResponse = particleRayMaxKernelResponse<KERNEL_DEGREE>(rayDist);
+  const float alpha       = min(frameInfo.alphaClamp, maxResponse * particleDensity);
+
+  // Kept as float: alpha is already a float quantized at 1/255 granularity, so a
+  // double-precision comparison brings no benefit and would otherwise force the
+  // module to declare the Float64 SPIR-V capability (broken on devices without
+  // VkPhysicalDeviceFeatures::shaderFloat64, e.g. Intel Arc).
+  const float minParticleAlpha = 1.0f / 255.0f;
+  const bool  acceptHit        = (alpha > minParticleAlpha) && (maxResponse > KERNEL_MIN_RESPONSE);
+
+  if(acceptHit)
+  {
+#if DISABLE_OPACITY_GAUSSIAN
+    opacity = 1.0;
+#else
+    opacity = alpha;
+#endif
   }
 
-  {
-    float2      centeredPoint = projectedSigmaPoints[0] - particleProjCenter;
-    const float weight0       = GUT_LAMBDA / (GUT_D + GUT_LAMBDA) + (1.0 - GUT_ALPHA * GUT_ALPHA + GUT_BETA);
-    particleProjCovariance =
-        weight0
-        * float3(centeredPoint.x * centeredPoint.x, centeredPoint.x * centeredPoint.y, centeredPoint.y * centeredPoint.y);
-  }
-  [[unroll]]
-  for(int i = 0; i < 2 * GUT_D; ++i)
-  {
-    float2 centeredPoint = projectedSigmaPoints[i + 1] - particleProjCenter;
-    particleProjCovariance +=
-        weightI
-        * float3(centeredPoint.x * centeredPoint.x, centeredPoint.x * centeredPoint.y, centeredPoint.y * centeredPoint.y);
-  }
-
-  return true;
+  return acceptHit;
 }
 
+// Version with normal output for surface generation.
+bool threedgutProcessHitWithNormal(in FrameInfo frameInfo,
+                                   in float3    modelRayOrigin,
+                                   in float3    modelRayDirection,
+                                   in int       splatId,
+                                   in float4    splatColor,
+                                   in float3    particlePosition,
+                                   in float3    particleScale,
+                                   in float3x3  particleInvRotation,
+                                   in float4x4  splatSetTransform,  // For world space normal transform
+                                   out float    opacity,
+                                   out float3   normalWorld)  // Output: normal in world space
 
-bool threedgutProjectedExtentConicOpacity(float3 covariance, float opacity, out float2 extent, out float4 conicOpacity, out float maxConicOpacityPower)
 {
-  float3 dilatedCovariance = float3(covariance.x + GUT_COVARIANCE_DILATION, covariance.y, covariance.z + GUT_COVARIANCE_DILATION);
-  float dilatedCovDet = dilatedCovariance.x * dilatedCovariance.z - dilatedCovariance.y * dilatedCovariance.y;
-  if(dilatedCovDet == 0.0)
-  {
-#pragma warning(disable: 41018)  // Disable warning 41018 : returning without initializing some variables/parameters
+  const float particleDensity = splatColor.a;
+  if(particleDensity <= frameInfo.alphaCullThreshold)
+#pragma warning(disable: 41018)
     return false;
 #pragma warning(default: 41018)
-  }
-  conicOpacity.xyz = float3(dilatedCovariance.z, -dilatedCovariance.y, dilatedCovariance.x) / dilatedCovDet;
 
-  // See Yu et al. in "Mip-Splatting: Alias-free 3D Gaussian Splatting" https://github.com/autonomousvision/mip-splatting
-#if MS_ANTIALIASING == 1
-  float covDet            = covariance.x * covariance.z - covariance.y * covariance.y;
-  float convolutionFactor = sqrt(max(0.000025, covDet / dilatedCovDet));
-  conicOpacity.w          = opacity * convolutionFactor;
+  float3 particleRayOrigin;
+  float3 particleRayDirection;
+  particleCannonicalRay(modelRayOrigin, modelRayDirection, particlePosition, particleScale, particleInvRotation,
+                        particleRayOrigin, particleRayDirection);
+
+  const float rayDist = particleRayMinSquaredDistance(particleRayOrigin, particleRayDirection);
+
+  const float maxResponse = particleRayMaxKernelResponse<KERNEL_DEGREE>(rayDist);
+  const float alpha       = min(frameInfo.alphaClamp, maxResponse * particleDensity);
+
+  // Kept as float: see comment in threedgutProcessHit above.
+  const float minParticleAlpha = 1.0f / 255.0f;
+  const bool  acceptHit        = (alpha > minParticleAlpha) && (maxResponse > KERNEL_MIN_RESPONSE);
+
+  if(acceptHit)
+  {
+#if DISABLE_OPACITY_GAUSSIAN
+    opacity = 1.0;
 #else
-  conicOpacity.w = opacity;
+    opacity = alpha;
 #endif
 
-  if(conicOpacity.w < GUT_ALPHA_THRESHOLD)
-  {
-#pragma warning(disable: 41018)  // Disable warning 41018 : returning without initializing some variables/parameters
-    return false;
-#pragma warning(default: 41018)
+    // Compute normal using max density plane approximation
+    // Create a ThreedgsParticle struct for the normal computation
+    ThreedgsParticle particle;
+    particle.id          = splatId;
+    particle.position    = particlePosition;
+    particle.scale       = particleScale;
+    particle.invRotation = particleInvRotation;
+    // color not needed for normal computation
+
+#if USE_MAX_DENSITY_PLANE_NORMAL
+    float3 normalModel = computeEllipsoidNormalMaxDensityPlane(frameInfo, modelRayOrigin, modelRayDirection, particle);
+#else
+    float3 normalModel =
+        computeEllipsoidNormal(frameInfo, modelRayOrigin, modelRayDirection, particleRayOrigin, particleRayDirection, particle);
+#endif
+
+    // Transform normal from model space to world space
+    // For normals: use transpose(inverse(RS)) but for rotation-scale matrix this is simplified
+    // Extract upper-left 3x3 of splatSetTransform for the rotation-scale part
+    float3x3 modelToWorldRS = float3x3(splatSetTransform[0].xyz, splatSetTransform[1].xyz, splatSetTransform[2].xyz);
+    // For normals, we need inverse-transpose: transpose(inverse(RS))
+    // Since modelToWorldRS is RS, inverse(RS) = S^-1 * R^T, and transpose of that = R * S^-1
+    // However, for uniform scale or rotation-only, we can just use the matrix directly
+    // For correctness with non-uniform scale, we'd need proper inverse-transpose
+    // But the normal is already computed in model space accounting for scale
+    normalWorld = normalize(mul(normalModel, modelToWorldRS));
   }
 
-  maxConicOpacityPower = log(conicOpacity.w / GUT_ALPHA_THRESHOLD);
-  float extentFactor   = GUT_TIGHT_OPACITY_BOUNDING ? min(3.33, sqrt(2.0 * maxConicOpacityPower)) : 3.33;
-  float minLambda      = 0.01;
-  float mid            = 0.5 * (dilatedCovariance.x + dilatedCovariance.z);
-  float lambda         = mid + sqrt(max(minLambda, mid * mid - dilatedCovDet));
-  float radius         = extentFactor * sqrt(lambda);
-  if(GUT_RECT_BOUNDING)
-  {
-    extent = min(extentFactor * sqrt(float2(dilatedCovariance.x, dilatedCovariance.z)), float2(radius));
-  }
-  else
-  {
-    extent = float2(radius);
-  }
-
-  return radius > 0.0;
+  return acceptHit;
 }
 
-#endif 
+#endif
