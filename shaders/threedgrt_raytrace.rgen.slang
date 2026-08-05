@@ -205,7 +205,8 @@ void main()
 #else
   if(!generateFisheyeRay(launchIdFloat, launchSizeFloat, frameInfo.fovRad, float2(0.0), frameInfo.viewInverse, rayOrigin, rayDirection))
   {
-    image[launchID] = float4(0.0, 0.0, 0.0, 1.0);
+    // outside the fisheye image circle: no scene coverage, alpha = 0
+    image[launchID] = float4(0.0, 0.0, 0.0, 0.0);
     return;
   }
 #endif
@@ -1907,6 +1908,13 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
   float3 pixelColor = float3(0.0, 0.0, 0.0);
 #endif
 
+  // Alpha output. For the final render it is the accumulated scene coverage
+  // (1 - remaining transmittance), matching the raster pipelines which accumulate
+  // coverage in alpha through premultiplied blending (threedgs_raster.frag.slang).
+  // The environment background is composited through the remaining transmittance
+  // and thus intentionally excluded from coverage. Debug visualization modes keep 1.0.
+  float pixelAlpha = 1.0;
+
   // Write depth for additional passes (like 3D helpers)
   // Use PRIMARY depth (bounce 0)
   if(pixel.primaryHitDist < PAYLOAD_INF_DISTANCE)
@@ -1947,15 +1955,19 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
           pixelColor *= frameInfo.rtxFireflyClampThreshold / lum;
       }
 
+      // Accumulated coverage for alpha output (same convention as the opacity
+      // computation for stochastic splats, see traceBounceRayParticles)
+      pixelAlpha = float(1.0 - maxComponent(pixel.transmittance));
+
       if(kHybridEnabled == 1)
       {
         const bool generateSurface = (NEED_SURFACE_INFO != 0);
         if(pixel.meshHit || generateSurface)
         {
           if(frameInfo.frameSampleId <= 0)  // < 0 means temporal sampling off, 0 means first frame
-            image[pixelId] = float4(pixelColor, 1.0);
+            image[pixelId] = float4(pixelColor, pixelAlpha);
           else
-            imageAux[pixelId] = float4(pixelColor, 1.0);
+            imageAux[pixelId] = float4(pixelColor, pixelAlpha);
         }
 #if !DLSS_ENABLED
         return;
@@ -1969,7 +1981,9 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
         {
           const float  a        = 1.0F / float(frameInfo.frameSampleId + 1);
           const float4 oldColor = image[pixelId];
-          pixelColor            = lerp(oldColor, float4(pixelColor, 1.0), a).xyz;
+          const float4 newColor = lerp(oldColor, float4(pixelColor, pixelAlpha), a);
+          pixelColor            = newColor.xyz;
+          pixelAlpha            = newColor.w;
         }
 #endif
       }
@@ -2098,9 +2112,9 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
   }
 #else
   if(kHybridEnabled == 1 && frameInfo.frameSampleId > 0)
-    imageAux[pixelId] = float4(pixelColor, 1.0);
+    imageAux[pixelId] = float4(pixelColor, pixelAlpha);
   else
-    image[pixelId] = float4(pixelColor, 1.0);
+    image[pixelId] = float4(pixelColor, pixelAlpha);
 #endif
 }
 

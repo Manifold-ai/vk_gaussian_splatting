@@ -120,6 +120,19 @@ void GaussianSplattingUI::registerParameters(nvutils::ParameterRegistry* paramet
            [&](const nvutils::ParameterBase* const) { saveBufferToFile(m_saveImageFilename, m_saveImageBufferIndex); }},
       {".png"}, &m_saveImageFilename);
 
+  parameterRegistry->add({.name = "saveProject",
+                          .help = "Save current scene state to a .vkgs project file. Use in benchmark scripts after "
+                                  "loading/composing a scene. Note: the save runs when the parameter is applied at "
+                                  "sequence start, so it captures state as of the previous sequence end.",
+                          .callbackSuccess =
+                              [&](const nvutils::ParameterBase* const) {
+                                if(!saveProject(m_saveProjectFilename.string()))
+                                {
+                                  LOGW("Failed to save project to '%s'\n", m_saveProjectFilename.string().c_str());
+                                }
+                              }},
+                         {".vkgs"}, &m_saveProjectFilename);
+
   parameterRegistry->add({.name = "loadCameraPresets",
                           .help = "Load camera presets from an INRIA-format JSON file. Presets are appended to the existing list.",
                           .callbackSuccess =

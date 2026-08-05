@@ -10,3 +10,7 @@ site/
 
 # Python
 __pycache__/
+
+# Python package dev artifacts
+python/.venv/
+python/*.egg-info/
