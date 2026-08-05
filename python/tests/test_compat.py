@@ -277,21 +277,79 @@ def test_none_light_skipped():
 
 
 # --------------------------------------------------------------------------
-# Shadow catcher / raygen (unsupported surface)
+# Shadow catcher (GS shadow mask mapping) / raygen (unsupported surface)
 # --------------------------------------------------------------------------
 
 
-def test_shadow_catcher_raises_everywhere(engine):
-    with pytest.warns(CompatWarning):
-        with pytest.raises(NotImplementedError, match="shadow-catcher|SHADOW_CATCHER"):
-            primitive_type_to_material(OptixPrimitiveTypes.SHADOW_CATCHER)
-    with pytest.warns(CompatWarning):
-        with pytest.raises(NotImplementedError):
-            engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.SHADOW_CATCHER)
-    with pytest.warns(CompatWarning):
-        with pytest.raises(NotImplementedError):
-            engine.load_shadow_catcher("floor.obj")
-    assert list(engine.primitives.objects) == ["Sphere 1"]  # nothing was added
+def test_shadow_catcher_maps_to_gs_shadow_mask(engine):
+    """SHADOW_CATCHER no longer raises: it warns and, at flush, turns into
+    renderer.gs_shadow_mask + one shadow_only twin per analytic light; the
+    catcher mesh itself never enters the scene."""
+    with pytest.warns(CompatWarning, match="GS shadow mask"):
+        assert primitive_type_to_material(OptixPrimitiveTypes.SHADOW_CATCHER) is None
+
+    engine.add_light(light_type=int(LightType.DIRECTIONAL), direction=(0.2, -1.0, 0.1))
+    with pytest.warns(CompatWarning, match="GS shadow mask"):
+        name = engine.primitives.add_primitive("Quad", OptixPrimitiveTypes.SHADOW_CATCHER)
+    assert name in engine.primitives.objects  # record kept for transforms
+    assert engine._shadow_catcher_requested
+
+    scene = engine._build_scene()
+    assert scene.renderer.gs_shadow_mask is True
+    # catcher mesh not in the scene: only the seeded glass sphere remains
+    assert [m.name for m in scene.mesh_instances] == ["Sphere 1"]
+
+    lit = [a for a in scene.light_assets if not a.shadow_only]
+    mask = [a for a in scene.light_assets if a.shadow_only]
+    assert len(lit) == 1 and len(mask) == 1  # original keeps illuminating
+    assert mask[0].type == lit[0].type == VkgsLightType.DIRECTIONAL
+    assert mask[0].color == lit[0].color
+    assert mask[0].intensity == lit[0].intensity
+    assert mask[0].radius == 0.0  # hard mask shadow (original falls back to 1.0)
+    lit_inst = next(i for i in scene.light_instances if i.asset_id == lit[0].id)
+    mask_inst = next(i for i in scene.light_instances if i.asset_id == mask[0].id)
+    assert mask_inst.rotation == pytest.approx(lit_inst.rotation)
+    assert mask_inst.translation == pytest.approx(lit_inst.translation)
+    assert scene.renderer.shadows_mode == ShadowsMode.HARD
+
+
+def test_shadow_catcher_soft_light_copy_keeps_radius(engine):
+    theta = 0.05
+    engine.add_light(light_type=int(LightType.POINT), position=(0, 1, 0), angular_radius=theta)
+    with pytest.warns(CompatWarning, match="GS shadow mask"):
+        engine.primitives.add_primitive("Quad", OptixPrimitiveTypes.SHADOW_CATCHER)
+    scene = engine._build_scene()
+    assert scene.renderer.shadows_mode == ShadowsMode.SOFT
+    mask = [a for a in scene.light_assets if a.shadow_only]
+    assert mask[0].radius == pytest.approx(math.tan(theta) * SOFT_SHADOW_REFERENCE_DISTANCE)
+
+
+def test_load_shadow_catcher_requests_mask_without_lights(engine, tmp_path):
+    floor = tmp_path / "floor.obj"
+    floor.write_text("v -1 0 -1\nv 1 0 -1\nv 1 0 1\nv -1 0 1\nf 1 2 3 4\n")
+    with pytest.warns(CompatWarning, match="GS shadow mask"):
+        name = engine.load_shadow_catcher(str(floor))
+    assert name == "Floor 1"
+    assert engine.primitives.objects[name].primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER
+
+    scene = engine._build_scene()
+    assert scene.renderer.gs_shadow_mask is True
+    assert scene.light_assets == []  # no lights -> no shadow_only twins
+    assert [m.name for m in scene.mesh_instances] == ["Sphere 1"]
+
+    # removing the catcher withdraws the request
+    engine.primitives.remove_primitive(name)
+    assert not engine._shadow_catcher_requested
+    assert engine._build_scene().renderer.gs_shadow_mask is False
+
+
+def test_shadow_catcher_warns_on_raster_pipeline(engine):
+    with pytest.warns(CompatWarning, match="GS shadow mask"):
+        engine.primitives.add_primitive("Quad", OptixPrimitiveTypes.SHADOW_CATCHER)
+    engine.pipeline = Pipeline.MESH  # raster-only: the mask has no effect
+    with pytest.warns(CompatWarning, match="RTX"):
+        scene = engine._build_scene()
+    assert scene.renderer.gs_shadow_mask is True  # still serialized
 
 
 def test_raygen_raises_with_workaround(engine):

@@ -242,6 +242,9 @@ class LightAsset:
     attenuation_mode: int = AttenuationMode.QUADRATIC
     radius: float = 1.0
     enabled: bool = True
+    # gs-shadow light: only darkens the GS shadow mask (renderer.gs_shadow_mask,
+    # RTX pipelines), never illuminates (src/light_manager_vk.h:60)
+    shadow_only: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -254,8 +257,9 @@ class LightAsset:
             "outerConeAngle": float(self.outer_cone_angle),
             "attenuationMode": int(self.attenuation_mode),
             "radius": float(self.radius),
-            # LightSourceVk.enabled is an int (0/1)
+            # LightSourceVk.enabled / .shadowOnly are ints (0/1)
             "enabled": int(bool(self.enabled)),
+            "shadowOnly": int(bool(self.shadow_only)),
         }
 
 
@@ -388,6 +392,15 @@ class RendererSettings:
     dlss_size_mode: Optional[int] = None
     lighting_enabled: bool = False
     shadows_mode: int = 0
+    # GS shadow mask (src/parameters.h:185-188): analytic-light shadows cast
+    # onto the splat emissive; RTX pipelines (2/3/5) only, driven by
+    # shadow_only lights. gs_shadow_mask_min is the shadow floor (0 = black,
+    # 1 = no visible shadow); gs_shadow_mask_from_particles lets particles
+    # occlude the mask rays too (mesh instances are always occluders).
+    gs_shadow_mask: bool = False
+    gs_shadow_mask_min: float = 0.2
+    gs_shadow_mask_from_particles: bool = False
+    force_surfel: bool = False
     color_format: int = VkColorFormat.R32G32B32A32_SFLOAT  # raw VkFormat value
     rtx_max_bounces: int = 3
     rtx_secondary_ray_offset: float = 0.001
@@ -449,6 +462,10 @@ class RendererSettings:
         ("dlss_size_mode", "dlssSizeMode", int),
         ("lighting_enabled", "lightingEnabled", bool),
         ("shadows_mode", "shadowsMode", int),
+        ("gs_shadow_mask", "gsShadowMask", bool),
+        ("gs_shadow_mask_min", "gsShadowMaskMin", float),
+        ("gs_shadow_mask_from_particles", "gsShadowMaskFromParticles", bool),
+        ("force_surfel", "forceSurfel", bool),
         ("color_format", "colorFormat", int),
         ("rtx_max_bounces", "rtxMaxBounces", int),
         ("rtx_secondary_ray_offset", "rtxSecondaryRayOffset", float),
@@ -819,8 +836,14 @@ class Scene:
         outer_cone_angle: float = 45.0,
         attenuation_mode: int = AttenuationMode.QUADRATIC,
         enabled: bool = True,
+        shadow_only: bool = False,
     ) -> LightInstance:
-        """Create a light (asset + one instance) and return the instance."""
+        """Create a light (asset + one instance) and return the instance.
+
+        ``shadow_only=True`` makes a gs-shadow light: it only darkens the GS
+        shadow mask (renderer.gs_shadow_mask, RTX pipelines 2/3/5) and never
+        illuminates anything; use radius=0 for noise-free hard mask shadows.
+        """
         asset = LightAsset(
             id=len(self.light_assets),
             type=int(type),
@@ -832,6 +855,7 @@ class Scene:
             attenuation_mode=int(attenuation_mode),
             radius=float(radius),
             enabled=enabled,
+            shadow_only=bool(shadow_only),
         )
         self.light_assets.append(asset)
         return self.add_light_instance(asset, name=name, translation=translation, rotation=rotation)
@@ -1039,6 +1063,7 @@ class Scene:
                 asset.attenuation_mode = int(_get(item, "attenuationMode", asset.attenuation_mode))
                 asset.radius = float(_get(item, "radius", asset.radius))
                 asset.enabled = bool(_get(item, "enabled", asset.enabled))
+                asset.shadow_only = bool(_get(item, "shadowOnly", asset.shadow_only))
                 scene.light_assets.append(asset)
             for item in lights.get("instances", []):
                 inst = LightInstance(asset_id=int(item["assetId"]))

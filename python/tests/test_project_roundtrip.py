@@ -26,6 +26,10 @@ def build_scene(tmp_path):
     scene = Scene()
     scene.renderer.pipeline = Pipeline.HYBRID
     scene.renderer.lighting_enabled = True
+    scene.renderer.gs_shadow_mask = True
+    scene.renderer.gs_shadow_mask_min = 0.35
+    scene.renderer.gs_shadow_mask_from_particles = True
+    scene.renderer.force_surfel = True
     scene.add_splats(str(tmp_path / "garden.ply"), position=(1, 2, 3), rotation=(0, 90, 0), scale=2.0)
     scene.add_splats(str(tmp_path / "garden.ply"), name="copy")  # dedup asset
     scene.add_mesh(
@@ -35,6 +39,8 @@ def build_scene(tmp_path):
     )
     scene.add_light(LightType.POINT, translation=(2, 3, 1), intensity=40.0, radius=0.1)
     scene.add_light(LightType.DIRECTIONAL, rotation=(45, 0, 0), intensity=2.0)
+    # gs-shadow light: only darkens the GS shadow mask, radius=0 = hard shadow
+    scene.add_light(LightType.DIRECTIONAL, rotation=(60, 0, 0), radius=0.0, shadow_only=True)
     scene.set_environment(EnvMode.HDR, hdr_file=str(tmp_path / "env.hdr"), ibl_intensity=1.2)
     scene.set_tonemapping(True, exposure=1.5, method=2)
     scene.set_camera(Camera(eye=(3, 1.5, 2), ctr=(0, 0.5, 0)))
@@ -154,6 +160,40 @@ def test_golden_sample_roundtrip(sample, tmp_path):
     cam0 = original["cameras"][0]
     assert scene.camera_presets[0].eye == pytest.approx(tuple(cam0["eye"]), abs=1e-6)
     assert scene.camera_presets[0].fov == pytest.approx(cam0["fov"], abs=1e-6)
+
+
+def test_gs_shadow_mask_serialization(tmp_path):
+    """The v7-optional GS shadow mask keys must use the exact C++ names
+    (vkgs_project_writer.cpp:156-159,271) and survive save/load."""
+    scene = build_scene(tmp_path)
+    data = scene.to_json(str(tmp_path))
+
+    renderer = data["renderer"]
+    assert renderer["gsShadowMask"] is True
+    assert renderer["gsShadowMaskMin"] == pytest.approx(0.35)
+    assert renderer["gsShadowMaskFromParticles"] is True
+    assert renderer["forceSurfel"] is True
+
+    # shadowOnly is an int 0/1 like enabled (LightSourceVk convention)
+    assert [a["shadowOnly"] for a in data["lights"]["assets"]] == [0, 0, 1]
+    assert data["lights"]["assets"][2]["radius"] == 0.0
+
+    loaded = Scene.load(scene.save(str(tmp_path / "mask.vkgs")))
+    assert loaded.renderer.gs_shadow_mask is True
+    assert loaded.renderer.gs_shadow_mask_min == pytest.approx(0.35)
+    assert loaded.renderer.gs_shadow_mask_from_particles is True
+    assert loaded.renderer.force_surfel is True
+    assert [a.shadow_only for a in loaded.light_assets] == [False, False, True]
+
+
+def test_gs_shadow_mask_defaults_omit_nothing(tmp_path):
+    """Defaults mirror src/parameters.h:185-188; the keys are always written
+    (the C++ reader treats them as optional via LOAD1)."""
+    renderer = Scene().to_json(str(tmp_path))["renderer"]
+    assert renderer["gsShadowMask"] is False
+    assert renderer["gsShadowMaskMin"] == pytest.approx(0.2)
+    assert renderer["gsShadowMaskFromParticles"] is False
+    assert renderer["forceSurfel"] is False
 
 
 def test_version_gate(tmp_path):

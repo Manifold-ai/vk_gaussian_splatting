@@ -43,7 +43,6 @@ from ..geometry import ensure_procedural
 from ..project import Scene
 from . import tonemap as tonemap_mod
 from .convert import (
-    SHADOW_CATCHER_WORKAROUND,
     Light,
     OptixPrimitiveTypes,
     camera_to_vkgs,
@@ -56,6 +55,10 @@ from .primitives import PrimitivesVKGS, ply_scene_extent
 # Pipelines where the camera DoF parameters take effect
 # (shaders/cameras.h.slang callers; raster primaries ignore them).
 _DOF_PIPELINES = {Pipeline.RTX, Pipeline.MESH_3DGUT, Pipeline.HYBRID_3DGUT}
+
+# Pipelines where the GS shadow mask takes effect (RTX-traced splats only,
+# src/parameters.h:185-188): RTX(2) / HYBRID(3) / HYBRID_3DGUT(5).
+_GS_SHADOW_MASK_PIPELINES = {Pipeline.RTX, Pipeline.HYBRID, Pipeline.HYBRID_3DGUT}
 
 _EXPORT_PLY_HINT = (
     ".pt/.ingp checkpoints are not auto-converted (project decision B1). "
@@ -401,11 +404,16 @@ class EngineVKGS:
         self.lights.clear()
         self._lights_dirty = True
 
-    # ------------------------------------------------------- unsupported API
+    # ------------------------------------- shadow catcher / unsupported API
 
     def load_shadow_catcher(self, path: str, name: Optional[str] = None) -> str:
-        warn_compat(SHADOW_CATCHER_WORKAROUND)
-        raise NotImplementedError(SHADOW_CATCHER_WORKAROUND)
+        """Import a mesh as a shadow catcher (engine.py:629-709 with
+        primitive_type=SHADOW_CATCHER). Mapped to the GS shadow mask: the
+        catcher mesh is never rendered, its presence only requests
+        renderer.gs_shadow_mask + per-light shadow_only copies at flush
+        (CompatWarning explains the approximation). Returns the primitive
+        name."""
+        return self.primitives.load_external_primitive(path, OptixPrimitiveTypes.SHADOW_CATCHER, name=name)
 
     def raygen(self, camera, use_spp: bool = False):
         raise NotImplementedError(
@@ -431,6 +439,17 @@ class EngineVKGS:
 
     # ------------------------------------------------------------ scene flush
 
+    @property
+    def _shadow_catcher_requested(self) -> bool:
+        """Lazy state derived from the primitives manager: True when any
+        visible SHADOW_CATCHER primitive exists. At flush this turns into
+        renderer.gs_shadow_mask + one shadow_only copy per analytic light
+        (the catcher mesh itself never enters the scene)."""
+        return self.primitives.enabled and any(
+            prim.primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER and prim.show
+            for prim in self.primitives.objects.values()
+        )
+
     def _build_scene(self) -> Scene:
         """Serialize the lazy state into a vkgs.project.Scene (called on
         every render; also stable API for tests)."""
@@ -442,6 +461,8 @@ class EngineVKGS:
 
         show_meshes = self.primitives.enabled
         for prim in self.primitives.objects.values():
+            if prim.primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER:
+                continue  # never rendered; only requests the GS shadow mask
             material = primitive_type_to_material(prim.primitive_type, ior=prim.refractive_index)
             scene.add_mesh(
                 prim.path,
@@ -456,6 +477,7 @@ class EngineVKGS:
         any_light = False
         any_soft = False
         quad_path = None
+        light_specs = []  # analytic-light specs, for the shadow-mask copies
         for light in self.lights:
             spec = light_to_vkgs(light)
             if spec["kind"] == "skip":
@@ -474,6 +496,7 @@ class EngineVKGS:
                 continue
             any_light = True
             any_soft = any_soft or spec["soft"]
+            light_specs.append(spec)
             scene.add_light(
                 spec["type"],
                 color=spec["color"],
@@ -487,6 +510,32 @@ class EngineVKGS:
             # light has angular_radius > 0 (radius from the tan() heuristic).
             scene.renderer.lighting_enabled = True
             scene.renderer.shadows_mode = int(ShadowsMode.SOFT if any_soft else ShadowsMode.HARD)
+
+        if self._shadow_catcher_requested:
+            # SHADOW_CATCHER -> GS shadow mask (see SHADOW_CATCHER_WORKAROUND):
+            # every analytic light gets a shadow_only twin that only darkens
+            # the mask; the original keeps illuminating the mesh/shaded set.
+            scene.renderer.gs_shadow_mask = True
+            if self.pipeline not in _GS_SHADOW_MASK_PIPELINES:
+                warn_compat(
+                    f"the GS shadow mask only takes effect in the RTX-traced "
+                    f"pipelines {sorted(int(p) for p in _GS_SHADOW_MASK_PIPELINES)}; "
+                    f"current pipeline {int(self.pipeline)} ignores it. Set "
+                    "engine.pipeline = vkgs.constants.Pipeline.RTX (or HYBRID)."
+                )
+            for spec in light_specs:
+                scene.add_light(
+                    spec["type"],
+                    name="shadow mask light",
+                    color=spec["color"],
+                    intensity=spec["intensity"],
+                    translation=spec["translation"],
+                    rotation=spec["rotation"],
+                    # radius=0 -> hard, noise-free mask shadow; soft lights
+                    # keep the tan() radius and converge over the spp frames.
+                    radius=spec["radius"] if spec["soft"] else 0.0,
+                    shadow_only=True,
+                )
 
         env = self.environment
         hdr = env.hdr_path()

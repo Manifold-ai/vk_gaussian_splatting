@@ -1741,7 +1741,7 @@ void GaussianSplattingUI::guiDrawLightingModeSelector(bool inMenuBar)
   if(changed)
   {
     m_requestUpdateShaders = true;
-    m_tonemapperData.isActive = (prmRender.lightingEnabled == LIGHTING_ENABLED) ? 1 : 0;
+    m_tonemapperData.isActive = (effectiveLightingMode() == LIGHTING_ENABLED) ? 1 : 0;
   }
 }
 
@@ -1755,7 +1755,7 @@ void GaussianSplattingUI::guiDrawShadowsModeSelector(bool inMenuBar)
       "- Hard shadows: sharp point-sampled shadows.\n"
       "- Soft shadows: stochastic disk-sampled shadows around lights.";
 
-  bool disabled = (!prmRender.lightingEnabled || !isRtxPipelineActive());
+  bool disabled = (effectiveLightingMode() == LIGHTING_DISABLED || !isRtxPipelineActive());
 
   bool changed = false;
   if(inMenuBar)
@@ -3386,6 +3386,49 @@ void GaussianSplattingUI::guiDrawRendererProperties()
       guiDrawLightingModeSelector(false);
       guiDrawShadowsModeSelector(false);
 
+      // GS shadow mask: shadow-only lights darken splat emissive at the surfel (RTX pipelines)
+      {
+        ImGui::BeginDisabled(!isRtxPipelineActive());
+        if(PE::Checkbox("GS shadow mask", &prmRender.gsShadowMask,
+                        "Lights marked \"GS shadow only\" cast shadows that darken the splat\n"
+                        "emissive output at the reconstructed surface (RTX pipelines only).\n"
+                        "Preserves the baked appearance of pure-emissive splat sets while\n"
+                        "compositing shadows from meshes on top.\n"
+                        "Note: implies lighting-mode compilation (meshes become PBR-shaded,\n"
+                        "tonemapper activates) and surface reconstruction."))
+        {
+          m_tonemapperData.isActive = (effectiveLightingMode() == LIGHTING_ENABLED) ? 1 : 0;
+          m_requestUpdateShaders    = true;
+          resetFrameCounter();
+        }
+
+        ImGui::BeginDisabled(!prmRender.gsShadowMask);
+        if(PE::SliderFloat("Shadow mask min", &prmRender.gsShadowMaskMin, 0.0f, 1.0f, "%.2f", 0,
+                           "Shadow floor: 0 = shadows go fully black, 1 = no visible shadow."))
+        {
+          resetFrameCounter();
+        }
+        if(PE::Checkbox("Mask particle occluders", &prmRender.gsShadowMaskFromParticles,
+                        "Also let Gaussian particles occlude the shadow-mask rays.\n"
+                        "Warning: the receiving splat set occludes itself (large areas may\n"
+                        "darken incorrectly) and baked radiance already contains self-shadowing.\n"
+                        "Default off: only meshes cast onto the splat emissive."))
+        {
+          m_requestUpdateShaders = true;
+          resetFrameCounter();
+        }
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+      }
+
+      if(PE::Checkbox("Force surfel", &prmRender.forceSurfel,
+                      "Force splat surface reconstruction (depth/normal picking) even when\n"
+                      "lighting is disabled. Useful for depth/normal export and AOVs."))
+      {
+        m_requestUpdateShaders = true;
+        resetFrameCounter();
+      }
+
       if(PE::entry(
              "Temporal sampling",
              [&]() { return m_ui.enumCombobox(GUI_TEMPORAL_SAMPLING, "##ID", &prmRtx.temporalSamplingMode); },
@@ -3775,7 +3818,7 @@ void GaussianSplattingUI::guiDrawRasterizationProperties()
     {
       PE::begin("## Shading", ImGuiTableFlags_Resizable | ImGuiTableFlags_SizingStretchSame);
 
-      ImGui::BeginDisabled(!prmRender.lightingEnabled);
+      ImGui::BeginDisabled(effectiveLightingMode() == LIGHTING_DISABLED);
       {
         if(PE::Checkbox("Quantize Normals", &prmRaster.quantizeNormals,
                         "Use octahedral encoding for normals (Meyer et al. 2010).\n"
@@ -3784,7 +3827,8 @@ void GaussianSplattingUI::guiDrawRasterizationProperties()
           m_requestUpdateShaders = true;
         }
 
-        const bool ftbDisabled = !prmRender.lightingEnabled || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
+        const bool ftbDisabled =
+            (effectiveLightingMode() == LIGHTING_DISABLED) || (prmRaster.sortingMethod == SORTING_STOCHASTIC_SPLAT);
         ImGui::BeginDisabled(ftbDisabled);
         if(PE::entry(
                "FTB Sync Mode", [&]() { return m_ui.enumCombobox(GUI_FTB_SYNC_MODE, "##ID", &prmRaster.ftbSyncMode); },
@@ -4731,6 +4775,19 @@ void GaussianSplattingUI::guiDrawLightProperties()
     {
       asset->enabled  = enabled ? 1 : 0;
       needAssetUpdate = true;
+    }
+  }
+
+  {
+    bool shadowOnly = (asset->shadowOnly != 0);
+    if(PE::Checkbox("GS shadow only", &shadowOnly,
+                    "gs-shadow light: only casts shadow-mask rays onto splat emissive\n"
+                    "(requires \"GS shadow mask\" in Lighting and Temporal, RTX pipelines).\n"
+                    "Never contributes illumination to meshes or shaded splat sets.\n"
+                    "Tip: keep Radius = 0 for noise-free hard shadows."))
+    {
+      asset->shadowOnly = shadowOnly ? 1 : 0;
+      needAssetUpdate   = true;
     }
   }
 

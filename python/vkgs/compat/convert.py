@@ -186,10 +186,13 @@ def camera_to_vkgs(camera, fov: float = 45.0, model: Optional[int] = None) -> Tu
 # --------------------------------------------------------------------------
 
 SHADOW_CATCHER_WORKAROUND = (
-    "SHADOW_CATCHER primitives are not supported: the VKGS shaders have no "
-    "shadow-catcher branch (plan gap A3). Workarounds: use a DIFFUSE floor "
-    "mesh (different look), or render twice (with/without occluders) and "
-    "composite the shadow ratio in Python."
+    "SHADOW_CATCHER primitives are mapped to the VKGS GS shadow mask "
+    "approximation (renderer.gs_shadow_mask, RTX pipelines): analytic-light "
+    "shadows fall directly onto the GS surfels and the catcher mesh itself "
+    "is never rendered. For the usual ground-plane catcher coincident with "
+    "GS geometry the result is equivalent or better (no proxy-mesh seams); "
+    "a catcher floating in empty space casts no shadow, since there are no "
+    "surfels beneath it to darken."
 )
 
 
@@ -201,14 +204,16 @@ def primitive_type_to_material(primitive_type, ior: Optional[float] = None, **ov
     - DIFFUSE -> materials.diffuse()
     - PBR / NONE -> None (PBR keeps the mesh file's authored glTF materials;
       NONE primitives are hidden by the caller)
-    - SHADOW_CATCHER -> CompatWarning + NotImplementedError with workaround
+    - SHADOW_CATCHER -> CompatWarning + None (the catcher mesh is never
+      rendered; it only requests the GS shadow mask, see
+      SHADOW_CATCHER_WORKAROUND and EngineVKGS._build_scene)
 
     ``overrides`` are forwarded to the material factory.
     """
     primitive_type = OptixPrimitiveTypes(int(primitive_type))
     if primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER:
         warn_compat(SHADOW_CATCHER_WORKAROUND)
-        raise NotImplementedError(SHADOW_CATCHER_WORKAROUND)
+        return None
     if primitive_type in (OptixPrimitiveTypes.PBR, OptixPrimitiveTypes.NONE):
         return None
     if primitive_type == OptixPrimitiveTypes.MIRROR:

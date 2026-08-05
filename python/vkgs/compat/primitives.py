@@ -302,7 +302,7 @@ class PrimitivesVKGS:
         scene-relative scaling (engine.py:563-627). ``device`` is accepted
         for signature parity and ignored. Returns the generated name
         ("{geometry_type} {count}"; 3dgrut returns None here)."""
-        primitive_type = _reject_shadow_catcher(primitive_type)
+        primitive_type = _coerce_primitive_type(primitive_type)
         path = self._resolve_path(geometry_type)
         name = self._next_name(geometry_type)
         factor = autoscale_factor(self.scene_extent, mesh_file_extent(path))
@@ -319,7 +319,7 @@ class PrimitivesVKGS:
     def load_external_primitive(self, path: str, primitive_type, device=None, name: Optional[str] = None) -> str:
         """Import a mesh from an arbitrary path, as-authored: no recenter,
         no autoscale (engine.py:629-709). Returns the primitive name."""
-        primitive_type = _reject_shadow_catcher(primitive_type)
+        primitive_type = _coerce_primitive_type(primitive_type)
         abspath = os.path.abspath(path)
         if Path(abspath).suffix.lower() not in self.SUPPORTED_MESH_EXTENSIONS:
             raise ValueError(f"unsupported mesh file {path!r}; expected one of {self.SUPPORTED_MESH_EXTENSIONS}")
@@ -362,10 +362,13 @@ class PrimitivesVKGS:
         )
 
 
-def _reject_shadow_catcher(primitive_type) -> OptixPrimitiveTypes:
-    """Fail at add time (not at flush) for the one unsupported type."""
+def _coerce_primitive_type(primitive_type) -> OptixPrimitiveTypes:
+    """Coerce to the enum; SHADOW_CATCHER warns at add time (not at flush)
+    that it maps to the GS shadow mask approximation (the record is kept so
+    scripts can transform/remove it, but it never becomes a scene mesh —
+    EngineVKGS._build_scene turns it into renderer.gs_shadow_mask +
+    shadow_only light copies instead)."""
     primitive_type = OptixPrimitiveTypes(int(primitive_type))
     if primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER:
         warn_compat(SHADOW_CATCHER_WORKAROUND)
-        raise NotImplementedError(SHADOW_CATCHER_WORKAROUND)
     return primitive_type
