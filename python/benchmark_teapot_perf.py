@@ -22,7 +22,8 @@
 #   C temporal    : DLSS OFF, temporal ENABLED, count=spp in         (dlss off)
 #                   {100,200,300,400,500}  (each 100 -> convergence step)
 #   D dlss_spp    : DLSS Optimal on, temporal off, spp in 1..15      (DLSS
-#                   history warm-up / accumulation speed)
+#                   history warm-up / accumulation speed). Runs in ONE
+#                   process (single cold start) since only spp varies.
 #
 # Requires: a built `vk_gaussian_splatting` binary (RTX GPU + DLSS runtime
 # .so for DLSS configs) reachable via $VKGS_BIN or --exe, and the scene's
@@ -43,9 +44,17 @@ import shutil
 import sys
 import time
 import warnings
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
-from vkgs import Pipeline, Scene, TemporalSamplingMode, render_scene
+from vkgs import (
+    HeadlessRunner,
+    Pipeline,
+    RenderScript,
+    Scene,
+    TemporalSamplingMode,
+    find_outputs,
+    render_scene,
+)
 
 # DLSS size modes (src/gaussian_splatting_ui.cpp: "Min"/"Optimal"/"Max"; -1 =
 # disabled, expressed here via dlss_enabled=False).
@@ -55,6 +64,9 @@ ALL_PASS = 0  # RtxTraceStrategy.FULL_ANYHIT
 # The camera position rendered from the scene's preset list (teapot+scene.vkgs
 # ships exactly one preset -> index 0).
 CAMERA = 0
+
+# Load/settle frames before the first capture (matches facade._MIN_SETTLE_FRAMES).
+SETTLE_FRAMES = 32
 
 # Timer stages worth surfacing in the printed table (full set still goes to
 # the CSV). "Primary Timeline" is the whole-frame GPU total when present.
@@ -142,27 +154,48 @@ def build_configs(warmup_spp: int, temporal_steps: List[int], dlss_spp_max: int)
 
 
 # --------------------------------------------------------------- metrics
-def extract_metrics(result) -> Tuple[Dict[str, Dict[str, float]], Optional[float]]:
-    """Return (per-stage timers, whole-frame GPU ms) for the render sequence
-    (named 'cam0'; the 'cam0 save' 1-frame sequence is ignored)."""
-    seq = next((s for s in result.sequences if s.name == f"cam{CAMERA}"), None)
-    if seq is None:  # fall back to the richest timer set
-        seq = max(result.sequences, key=lambda s: len(s.timers), default=None)
-    timers = dict(seq.timers) if seq else {}
+def frame_gpu_from_timers(timers: Dict[str, Dict[str, float]]) -> Optional[float]:
+    """Whole-frame GPU ms: 'Primary Timeline' when present, else the sum of
+    stage timers (only reached if that top-level timer is ever renamed)."""
     frame = timers.get("Primary Timeline", {}).get("gpu_ms")
     if frame is None and timers:
         frame = sum(t["gpu_ms"] for t in timers.values())
-    return timers, frame
+    return frame
 
 
-def final_image_path(result) -> Optional[str]:
-    """Prefer the tonemapped LDR image, else the main color buffer."""
+def timers_for_sequence(sequences, name: str, fallback_richest: bool = True) -> Dict[str, Dict[str, float]]:
+    """Timers of the sequence named `name`. When absent and `fallback_richest`,
+    use the richest timer set (safe only when one capture sequence exists; a
+    multi-capture batch must key exactly, so it passes fallback_richest=False)."""
+    seq = next((s for s in sequences if s.name == name), None)
+    if seq is None and fallback_richest:
+        seq = max(sequences, key=lambda s: len(s.timers), default=None)
+    return dict(seq.timers) if seq else {}
+
+
+def copy_final_image(buffer_paths: Dict[str, str], out_root: str, key: str) -> Optional[str]:
+    """Pick the tonemapped LDR (else main) image from a buffer->path map and copy
+    it into out_root/images/<key><ext>. Returns the copied path (or the source if
+    it cannot be copied, or None)."""
+    img_src = (buffer_paths or {}).get("ldr") or (buffer_paths or {}).get("main")
+    if not (img_src and os.path.isfile(img_src)):
+        return img_src or None
+    images_dir = os.path.join(out_root, "images")
+    os.makedirs(images_dir, exist_ok=True)
+    dst = os.path.join(images_dir, key + os.path.splitext(img_src)[1])
+    shutil.copyfile(img_src, dst)
+    return dst
+
+
+def result_buffer_paths(result, camera: int) -> Dict[str, str]:
+    """buffer->path map for one camera of a RenderResult (missing buffers skipped)."""
+    paths: Dict[str, str] = {}
     for buf in ("ldr", "main"):
         try:
-            return result.path(CAMERA, buf)
+            paths[buf] = result.path(camera, buf)
         except KeyError:
-            continue
-    return None
+            pass
+    return paths
 
 
 # --------------------------------------------------------------- run one
@@ -188,17 +221,10 @@ def run_one(base: Scene, cfg: Config, out_root: str, size, gpu, exe, timeout, bu
         )
     wall = time.monotonic() - t0
 
-    timers, frame_gpu = extract_metrics(result)
+    timers = timers_for_sequence(result.sequences, f"cam{CAMERA}")
+    frame_gpu = frame_gpu_from_timers(timers)
     fps = 1000.0 / frame_gpu if frame_gpu else None
-
-    # Copy the final image into a flat, browsable set.
-    img_src = final_image_path(result)
-    img_dst = None
-    if img_src and os.path.isfile(img_src):
-        images_dir = os.path.join(out_root, "images")
-        os.makedirs(images_dir, exist_ok=True)
-        img_dst = os.path.join(images_dir, cfg.key + os.path.splitext(img_src)[1])
-        shutil.copyfile(img_src, img_dst)
+    image = copy_final_image(result_buffer_paths(result, CAMERA), out_root, cfg.key)
 
     return {
         "sweep": cfg.sweep,
@@ -208,10 +234,101 @@ def run_one(base: Scene, cfg: Config, out_root: str, size, gpu, exe, timeout, bu
         "frame_gpu_ms": round(frame_gpu, 4) if frame_gpu else "",
         "fps": round(fps, 2) if fps else "",
         "wall_s": round(wall, 2),
-        "image": img_dst or (img_src or ""),
+        "image": image or "",
         "log": result.log_path,
         "_timers": timers,
     }
+
+
+# ------------------------------------------------ D sweep in a single process
+def run_dlss_spp_batch(base: Scene, spp_list, out_root: str, size, gpu, exe, timeout, buffers):
+    """Render the DLSS spp sweep (1..N) in ONE process -> a single cold start
+    for all spp instead of one per spp.
+
+    Each spp still measures a *fresh* k-frame DLSS accumulation, identical to
+    the per-process version. The trick: DLSS history only resets when the frame
+    counter resets, and the frame counter resets only when the view matrix/fov
+    changes (updateFrameCounter, gaussian_splatting.cpp:3795; DLSS reset =
+    frameSampleId==0, :623/:1081). Re-activating the *same* preset 0 does NOT
+    change the view -> no reset -> spp would accumulate cumulatively. So before
+    each real capture we activate a throwaway 'park' preset (a different pose);
+    the following activateCameraPreset(0) is then a real view change -> reset ->
+    frameSampleId=0 -> DLSS history cleared -> exactly k fresh frames.
+
+    Returns (rows, batch_wall_s). Outputs are validated per-spp (not batch-wide),
+    so a single missing capture only blanks that one row.
+    """
+    scene = copy.deepcopy(base)
+    scene.renderer.dlss_enabled = True
+    scene.renderer.dlss_size_mode = DLSS_OPTIMAL
+    scene.renderer.temporal_sampling_mode = int(TemporalSamplingMode.DISABLED)
+    scene.renderer.temporal_sampling = False
+
+    if not scene.camera_presets:
+        raise ValueError("scene has no camera presets; add preset 0 before the D sweep")
+
+    # Park preset: preset 0 offset far away, so it differs from preset 0 for any
+    # scene and re-activating preset 0 always counts as a view change (reset).
+    p0 = scene.camera_presets[0]
+    park = copy.deepcopy(p0)
+    park.eye = (p0.eye[0] + 1000.0, p0.eye[1] + 1000.0, p0.eye[2] + 1000.0)
+    park_idx = scene.add_camera_preset(park)
+
+    out_dir = os.path.join(out_root, "D_dlss_spp")
+    os.makedirs(out_dir, exist_ok=True)
+    vkgs_path = scene.save(os.path.join(out_dir, "scene.vkgs"))
+
+    script = RenderScript()
+    script.load_block(frames=SETTLE_FRAMES)  # load + settle (home camera != preset 0)
+
+    stems: Dict[int, str] = {}
+    for spp in spp_list:
+        # throwaway frame at the park view -> forces the next preset-0 activation
+        # to reset the accumulation.
+        script.sequence(f"park{spp:02d}", frames=1, averages=1, reset_frames=0,
+                        activateCameraPreset=park_idx)
+        stem = os.path.join(out_dir, f"D_spp{spp:02d}")
+        script.capture(f"D_spp{spp:02d}", camera_preset=0, out_stem=stem,
+                       frames=spp, averages=min(spp, 32), buffers=buffers)
+        stems[spp] = stem
+
+    cfg_path = script.write(os.path.join(out_dir, "render.cfg"))
+    # expected_outputs=() so one missing capture does not fail the whole batch;
+    # each spp's output is checked individually below (find_outputs).
+    run = HeadlessRunner(exe).run(
+        cfg_path, project=vkgs_path, size=size, gpu=gpu, timeout=timeout,
+        log_path=os.path.join(out_dir, "render.log"), expected_outputs=(),
+    )
+
+    seq_by_name = {s.name: s for s in run.sequences}
+    rows: List[Dict[str, object]] = []
+    for spp in spp_list:
+        seq = seq_by_name.get(f"D_spp{spp:02d}")
+        # Exact key only: a global richest-set fallback would grab another spp's
+        # timers in this multi-capture run, so leave blank if this seq is absent.
+        timers = dict(seq.timers) if seq else {}
+        frame_gpu = frame_gpu_from_timers(timers)
+        fps = 1000.0 / frame_gpu if frame_gpu else None
+        image = copy_final_image(find_outputs(stems[spp]), out_root, f"D_dlss_spp__spp{spp:02d}")
+
+        rows.append({
+            "sweep": "D_dlss_spp", "label": f"spp{spp:02d}", "spp": spp,
+            "overrides": "dlss_size_mode=1;single-process batch",
+            "frame_gpu_ms": round(frame_gpu, 4) if frame_gpu else "",
+            "fps": round(fps, 2) if fps else "",
+            "wall_s": "",  # per-spp wall is not meaningful in a batch; see the summary note
+            "image": image or "",
+            "log": run.log_path,
+            "_timers": timers,
+        })
+    return rows, round(run.duration_s, 2)
+
+
+def _collect_stages(row, seen_stages, stage_names) -> None:
+    for s in row["_timers"]:
+        if s not in seen_stages:
+            seen_stages.add(s)
+            stage_names.append(s)
 
 
 # --------------------------------------------------------------- reporting
@@ -240,7 +357,7 @@ def print_table(rows: List[Dict[str, object]]) -> None:
               f"{str(r['frame_gpu_ms']):>9} {str(r['fps']):>7} {str(r['wall_s']):>7}")
 
 
-def write_summary_md(rows: List[Dict[str, object]], path: str) -> None:
+def write_summary_md(rows: List[Dict[str, object]], path: str, notes: Optional[List[str]] = None) -> None:
     lines = ["# teapot+scene 性能测试结果", "",
              "| sweep | label | spp | frame GPU ms | FPS | wall s | image |",
              "|---|---|---:|---:|---:|---:|---|"]
@@ -248,6 +365,8 @@ def write_summary_md(rows: List[Dict[str, object]], path: str) -> None:
         img = os.path.relpath(r["image"], os.path.dirname(path)) if r["image"] else ""
         lines.append(f"| {r['sweep']} | {r['label']} | {r['spp']} | "
                      f"{r['frame_gpu_ms']} | {r['fps']} | {r['wall_s']} | {img} |")
+    for note in notes or []:
+        lines += ["", note]
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
 
@@ -281,9 +400,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if args.list:
-        print(f"{len(configs)} configs; scene={args.scene}; size={w}x{h}; out={args.out}")
+        n_d = sum(1 for c in configs if c.sweep == "D_dlss_spp")
+        n_proc = (len(configs) - n_d) + (1 if n_d else 0)
+        print(f"{len(configs)} configs -> {n_proc} process(es); scene={args.scene}; "
+              f"size={w}x{h}; out={args.out}")
         for c in configs:
-            print(f"  {c.key:<24} spp={c.spp:<4} {c.renderer}")
+            tag = " [batched: 1 process]" if c.sweep == "D_dlss_spp" else ""
+            print(f"  {c.key:<24} spp={c.spp:<4} {c.renderer}{tag}")
         return 0
 
     if not os.path.isfile(args.scene):
@@ -304,9 +427,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     rows: List[Dict[str, object]] = []
     stage_names: List[str] = []
     seen_stages = set()
-    total = len(configs)
-    for i, cfg in enumerate(configs, 1):
-        print(f"[{i}/{total}] {cfg.key} (spp={cfg.spp}) ...", flush=True)
+    notes: List[str] = []
+
+    # D (DLSS spp sweep) shares one .vkgs / camera and only varies sequenceframes,
+    # so it runs in ONE process (single cold start). A/B/C change renderer
+    # settings baked into the .vkgs -> one process each (cold start unavoidable).
+    d_configs = [c for c in configs if c.sweep == "D_dlss_spp"]
+    other_configs = [c for c in configs if c.sweep != "D_dlss_spp"]
+    total = len(other_configs) + (1 if d_configs else 0)
+    step = 0
+
+    for cfg in other_configs:
+        step += 1
+        print(f"[{step}/{total}] {cfg.key} (spp={cfg.spp}) ...", flush=True)
         try:
             row = run_one(base, cfg, args.out, (w, h), args.gpu, args.exe, args.timeout, buffers)
         except Exception as exc:  # keep going; record the failure
@@ -316,12 +449,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "frame_gpu_ms": "", "fps": "", "wall_s": "", "image": "",
                          "log": str(exc), "_timers": {}})
             continue
-        for s in row["_timers"]:
-            if s not in seen_stages:
-                seen_stages.add(s)
-                stage_names.append(s)
+        _collect_stages(row, seen_stages, stage_names)
         rows.append(row)
         print(f"    frame={row['frame_gpu_ms']}ms fps={row['fps']} wall={row['wall_s']}s -> {row['image']}")
+
+    if d_configs:
+        step += 1
+        spp_list = [c.spp for c in d_configs]
+        print(f"[{step}/{total}] D_dlss_spp batch: {len(spp_list)} spp in ONE process "
+              f"(single cold start) ...", flush=True)
+        try:
+            d_rows, batch_wall = run_dlss_spp_batch(
+                base, spp_list, args.out, (w, h), args.gpu, args.exe, args.timeout, buffers)
+            for r in d_rows:
+                _collect_stages(r, seen_stages, stage_names)
+            rows.extend(d_rows)
+            notes.append(f"> D_dlss_spp ran in ONE process (single cold start): "
+                         f"{len(spp_list)} spp in {batch_wall}s wall total "
+                         f"(per-spp wall_s is blank by design; compare frame GPU ms).")
+            print(f"    {len(spp_list)} spp checkpoints, batch wall={batch_wall}s "
+                  f"(was ~{len(spp_list)} cold starts)")
+        except Exception as exc:
+            print(f"    D BATCH FAILED: {exc}", file=sys.stderr)
+            for c in d_configs:
+                rows.append({"sweep": c.sweep, "label": c.label, "spp": c.spp,
+                             "overrides": "single-process batch", "frame_gpu_ms": "", "fps": "",
+                             "wall_s": "", "image": "", "log": str(exc), "_timers": {}})
 
     # Order stage columns: key stages first (if present), then the rest.
     ordered_stages = [s for s in KEY_STAGES if s in seen_stages] + \
@@ -330,7 +483,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     csv_path = os.path.join(args.out, "metrics.csv")
     md_path = os.path.join(args.out, "summary.md")
     write_csv(rows, ordered_stages, csv_path)
-    write_summary_md(rows, md_path)
+    write_summary_md(rows, md_path, notes)
     print_table(rows)
     print(f"\nmetrics : {csv_path}\nsummary : {md_path}\nimages  : {os.path.join(args.out, 'images')}")
     return 0
