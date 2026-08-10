@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vkgs"
+version = "0.1.0"
+description = "Python scripting layer for vk_gaussian_splatting: build scenes as .vkgs projects, drive headless renders via .cfg sequences, read back images"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+image = ["imageio"]
+video = ["imageio", "imageio-ffmpeg"]
+dev = ["pytest", "imageio"]
+
+[tool.setuptools.packages.find]
+include = ["vkgs*"]
+
+[tool.pytest.ini_options]
+markers = [
+    "gpu: tests that launch the real renderer executable (deselect with '-m \"not gpu\"')",
+]

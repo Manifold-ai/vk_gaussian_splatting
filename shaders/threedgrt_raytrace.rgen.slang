@@ -205,7 +205,8 @@ void main()
 #else
   if(!generateFisheyeRay(launchIdFloat, launchSizeFloat, frameInfo.fovRad, float2(0.0), frameInfo.viewInverse, rayOrigin, rayDirection))
   {
-    image[launchID] = float4(0.0, 0.0, 0.0, 1.0);
+    // outside the fisheye image circle: no scene coverage, alpha = 0
+    image[launchID] = float4(0.0, 0.0, 0.0, 0.0);
     return;
   }
 #endif
@@ -1420,6 +1421,14 @@ void evaluateLightingAndShadingParticles(in int           bounce,
   }
 #endif
 
+  // GS shadow mask: shadow-only (gs-shadow) lights darken the emissive term at the
+  // surfel. Same rationale as the AO block above: the emissive term has no other
+  // occlusion, while shaded contributions get their shadows from NEE shadow rays
+  // (gs-shadow lights are skipped by NEE, so nothing is counted twice).
+#if GS_SHADOW_MASK
+  emissiveContribution *= computeGsShadowMask(pixel.isoSurfPos, pixel.integratedNormal, seedRayPass, payload);
+#endif
+
   // Early exit for pure emissive materials - no lighting interaction
   // No clay mode in pure emissive
   if(splatSetDesc.material.needShading != 1)
@@ -1679,6 +1688,57 @@ float computeSplatEmissiveAO(in float3 surfacePos, in float3 surfaceNormal, in f
 }
 #endif  // PARTICLE_AO_ENABLED
 
+#if GS_SHADOW_MASK
+// GS shadow mask: weighted-average visibility of the surfel toward all shadow-only
+// (gs-shadow) lights, remapped through the gsShadowMaskMin floor. Occluders are
+// meshes by default; particles opt in via GS_SHADOW_MASK_PARTICLES (the receiving
+// splat set then occludes itself — use with care). Baked radiance approximates the
+// sum of all incident lighting, so per-light visibilities are averaged weighted by
+// light importance (not multiplied): overlapping shadows do not double-darken.
+// Returns 1.0 when no shadow-only light reaches the surfel.
+float3 computeGsShadowMask(in float3 surfPos, in float3 surfNormal, inout uint seed, inout HitPayload payload)
+{
+  float3 maskSum   = float3(0.0);
+  float  weightSum = 0.0;
+
+  for(uint i = 0; i < assets.lightCount; ++i)
+  {
+    LightSource light = assets.lights[i];
+    if(light.enabled == 0 || light.shadowOnly == 0)
+      continue;
+
+    // Direction/distance to the light; with SHADOWS_SOFT and radius > 0 this
+    // jitters on the light disk, converging over temporal accumulation.
+    float3 lightDir;
+    float  lightDist;
+    if(!computeLightToSurfaceVector(light, surfPos, seed, lightDir, lightDist))
+      continue;  // out of range: the light does not reach this surfel, no vote
+
+    const float3 shadowOrigin = surfPos + surfNormal * frameInfo.rtxSecondaryRayOffset;
+
+    float3 visibility = float3(1.0);
+#if RTX_HAS_MESHES
+    if(assets.meshCount > 0)
+      visibility *= traceShadowRayMesh(assets, shadowOrigin, lightDir, lightDist, payload).transmittance;
+#endif
+#if GS_SHADOW_MASK_PARTICLES && RTX_HAS_PARTICLES
+    if(maxComponent(visibility) > 0.001 && assets.totalGlobalSplatCount > 0)
+      visibility *= traceShadowRayParticle(frameInfo, assets, shadowOrigin, lightDir, lightDist, payload).transmittance;
+#endif
+
+    const float weight = max(light.intensity, 0.0) * luminance(light.color);
+    maskSum += weight * visibility;
+    weightSum += weight;
+  }
+
+  if(weightSum <= 0.0)
+    return float3(1.0);
+
+  const float3 mask = maskSum / weightSum;
+  return float3(frameInfo.gsShadowMaskMin) + (1.0 - frameInfo.gsShadowMaskMin) * mask;
+}
+#endif  // GS_SHADOW_MASK
+
 // Trace shadow ray for a single light and compute transmission
 ShadowInfo traceShadowRayForLight(in FrameInfo     frameInfo,
                                   in SceneAssets   assets,
@@ -1907,6 +1967,13 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
   float3 pixelColor = float3(0.0, 0.0, 0.0);
 #endif
 
+  // Alpha output. For the final render it is the accumulated scene coverage
+  // (1 - remaining transmittance), matching the raster pipelines which accumulate
+  // coverage in alpha through premultiplied blending (threedgs_raster.frag.slang).
+  // The environment background is composited through the remaining transmittance
+  // and thus intentionally excluded from coverage. Debug visualization modes keep 1.0.
+  float pixelAlpha = 1.0;
+
   // Write depth for additional passes (like 3D helpers)
   // Use PRIMARY depth (bounce 0)
   if(pixel.primaryHitDist < PAYLOAD_INF_DISTANCE)
@@ -1947,15 +2014,19 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
           pixelColor *= frameInfo.rtxFireflyClampThreshold / lum;
       }
 
+      // Accumulated coverage for alpha output (same convention as the opacity
+      // computation for stochastic splats, see traceBounceRayParticles)
+      pixelAlpha = float(1.0 - maxComponent(pixel.transmittance));
+
       if(kHybridEnabled == 1)
       {
         const bool generateSurface = (NEED_SURFACE_INFO != 0);
         if(pixel.meshHit || generateSurface)
         {
           if(frameInfo.frameSampleId <= 0)  // < 0 means temporal sampling off, 0 means first frame
-            image[pixelId] = float4(pixelColor, 1.0);
+            image[pixelId] = float4(pixelColor, pixelAlpha);
           else
-            imageAux[pixelId] = float4(pixelColor, 1.0);
+            imageAux[pixelId] = float4(pixelColor, pixelAlpha);
         }
 #if !DLSS_ENABLED
         return;
@@ -1969,7 +2040,9 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
         {
           const float  a        = 1.0F / float(frameInfo.frameSampleId + 1);
           const float4 oldColor = image[pixelId];
-          pixelColor            = lerp(oldColor, float4(pixelColor, 1.0), a).xyz;
+          const float4 newColor = lerp(oldColor, float4(pixelColor, pixelAlpha), a);
+          pixelColor            = newColor.xyz;
+          pixelAlpha            = newColor.w;
         }
 #endif
       }
@@ -2098,9 +2171,9 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
   }
 #else
   if(kHybridEnabled == 1 && frameInfo.frameSampleId > 0)
-    imageAux[pixelId] = float4(pixelColor, 1.0);
+    imageAux[pixelId] = float4(pixelColor, pixelAlpha);
   else
-    image[pixelId] = float4(pixelColor, 1.0);
+    image[pixelId] = float4(pixelColor, pixelAlpha);
 #endif
 }
 

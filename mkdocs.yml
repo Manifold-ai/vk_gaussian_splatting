@@ -109,4 +109,5 @@ nav:
     - Lighting and Shadows: deep-dives/lighting_and_shadows.md
     - Billboard Ray Tracing: deep-dives/billboard_ray_tracing.md
   - Benchmarking: benchmarking.md
+  - Python Scripting: python-scripting.md
   - References: references.md

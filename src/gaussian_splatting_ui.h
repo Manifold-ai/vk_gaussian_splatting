@@ -272,6 +272,8 @@ private:
   // saveImage file name and buffer index (used by benchmark)
   std::filesystem::path m_saveImageFilename;
   int32_t               m_saveImageBufferIndex = -1;
+  // saveProject file name (used by benchmark)
+  std::filesystem::path m_saveProjectFilename;
   // camera presets file path (used by benchmark)
   std::filesystem::path m_cameraPresetsFilename;
   // camera preset index to activate (used by benchmark)
