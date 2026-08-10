@@ -82,6 +82,14 @@ struct SceneParameters
 // Parameters that controls the scene
 extern SceneParameters prmScene;
 
+// Parameters controlling the persistent SPIR-V shader cache
+struct ShaderCacheParameters
+{
+  // Directory for cached .spv files. Empty => default (<exeDir>/spirv_cache), resolved at init.
+  std::filesystem::path spirvCacheDir;
+};
+extern ShaderCacheParameters prmShaderCache;
+
 // Parameters that controls data format in VRAM, shared by all pipeline
 struct VramDataParameters
 {

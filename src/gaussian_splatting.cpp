@@ -224,6 +224,24 @@ void GaussianSplatting::onAttach(nvapp::Application* app)
     NVVK_DBG_NAME(m_envAccelDummyBuffer.buffer);
   }
 
+  // Initialize the persistent SPIR-V cache before compiling any shader (the tonemapper just
+  // below, and the main initShaders() batch later). Directory from --spirvCacheDir, else a
+  // default next to the executable. The options string is folded into every cache key so an
+  // option/build change invalidates the cache.
+  {
+    const std::filesystem::path cacheDir =
+        prmShaderCache.spirvCacheDir.empty() ? getDefaultSpirvCacheDir() : prmShaderCache.spirvCacheDir;
+    const std::string optionsDesc = std::string("spirv1.6/vk1.4;matrixRow=1;debug=")
+                                    + std::to_string((int)SLANG_DEBUG_INFO_LEVEL_MAXIMAL)
+                                    + ";opt=" + std::to_string((int)SLANG_OPTIMIZATION_LEVEL_DEFAULT) + ";caps=ballot+arith;"
+#ifdef NDEBUG
+                                      "build=release";
+#else
+                                      "build=debug";
+#endif
+    m_spirvCache.init(cacheDir, getShaderDirs(), optionsDesc);
+  }
+
   // Initialize Tonemapper
   initTonemapper();
 
@@ -1119,13 +1137,33 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
 //--------------------------------------------------------------------------------------------------
 void GaussianSplatting::initTonemapper()
 {
-  if(!m_slangCompiler.compileFile("nvshaders/tonemapper.slang"))
+  // The tonemapper compiles with no vkgs macros (it runs before updateSlangMacros()), so its
+  // cache entry uses an empty macro set — never m_shaderMacros (stale/unset at this point).
+  static const std::vector<std::pair<std::string, std::string>> kNoMacros;
+  const std::string                                             shaderName = "nvshaders/tonemapper.slang";
+
+  std::vector<uint32_t>     cachedSpirv;
+  std::span<const uint32_t> spirv;
+
+  if(auto hit = m_spirvCache.load(shaderName, kNoMacros))
   {
-    LOGE("Tonemapper: failed to compile tonemapper.slang\n");
-    m_tonemapperData.isActive = 0;
-    return;
+    cachedSpirv = std::move(*hit);
+    spirv       = std::span<const uint32_t>(cachedSpirv.data(), cachedSpirv.size());
   }
-  auto spirv = std::span<const uint32_t>(m_slangCompiler.getSpirv(), m_slangCompiler.getSpirvSize() / sizeof(uint32_t));
+  else
+  {
+    if(!m_slangCompiler.compileFile(shaderName))
+    {
+      LOGE("Tonemapper: failed to compile tonemapper.slang\n");
+      m_tonemapperData.isActive = 0;
+      return;
+    }
+    const uint32_t* words = m_slangCompiler.getSpirv();
+    const size_t    bytes = m_slangCompiler.getSpirvSize();
+    m_spirvCache.store(shaderName, kNoMacros, words, bytes);
+    spirv = std::span<const uint32_t>(words, bytes / sizeof(uint32_t));
+  }
+
   if(m_tonemapper.init(&m_alloc, spirv) != VK_SUCCESS)
   {
     LOGE("Tonemapper: Vulkan init failed - disabling tone mapping.\n");
@@ -2398,10 +2436,30 @@ void GaussianSplatting::updateSlangMacros()
 
 bool GaussianSplatting::compileSlangShader(const std::string& filename, VkShaderModule& module)
 {
+  std::vector<uint32_t> cachedSpirv;  // owns the bytes when served from the disk cache
+  const uint32_t*       spirvWords = nullptr;
+  size_t                spirvBytes = 0;
 
-  if(!m_slangCompiler.compileFile(filename))
+  if(auto hit = m_spirvCache.load(filename, m_shaderMacros))
   {
-    return false;
+    // Cache hit: reuse SPIR-V from disk, skip slang compilation entirely.
+    cachedSpirv = std::move(*hit);
+    spirvWords  = cachedSpirv.data();
+    spirvBytes  = cachedSpirv.size() * sizeof(uint32_t);
+  }
+  else
+  {
+    // Cache miss: compile with the current macro set, then persist for the next process.
+    if(!m_slangCompiler.compileFile(filename))
+      return false;
+    spirvWords = m_slangCompiler.getSpirv();
+    spirvBytes = m_slangCompiler.getSpirvSize();
+    if(spirvBytes == 0)
+    {
+      LOGE("Missing entry point in shader %s\n", filename.c_str());
+      return false;
+    }
+    m_spirvCache.store(filename, m_shaderMacros, spirvWords, spirvBytes);
   }
 
   if(module != VK_NULL_HANDLE)
@@ -2409,14 +2467,9 @@ bool GaussianSplatting::compileSlangShader(const std::string& filename, VkShader
 
   // Create the VK module
   VkShaderModuleCreateInfo createInfo{.sType    = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-                                      .codeSize = m_slangCompiler.getSpirvSize(),
-                                      .pCode    = m_slangCompiler.getSpirv()};
+                                      .codeSize = spirvBytes,
+                                      .pCode    = spirvWords};
 
-  if(m_slangCompiler.getSpirvSize() == 0)
-  {
-    LOGE("Missing entry point in shader %s\n", filename.c_str());
-    return false;
-  }
   NVVK_CHECK(vkCreateShaderModule(m_device, &createInfo, nullptr, &module));
   NVVK_DBG_NAME(module);
 

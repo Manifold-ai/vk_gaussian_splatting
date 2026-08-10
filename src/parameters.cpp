@@ -24,6 +24,8 @@ namespace vk_gaussian_splatting {
 // no reset function on purpose
 SceneParameters prmScene{};
 
+ShaderCacheParameters prmShaderCache{};
+
 VramDataParameters    prmData{};
 RtxVramDataParameters prmRtxData{};
 
@@ -121,6 +123,11 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
                           .help            = "load a vkgs project file",
                           .callbackSuccess = [](const nvutils::ParameterBase* const) { prmScene.projectLoadPorcelain = true; }},
                          {".vkgs"}, &prmScene.projectToLoadFilename);
+
+  // Persistent SPIR-V shader cache directory (default: <exeDir>/spirv_cache when empty)
+  parameterRegistry->add({.name = "spirvCacheDir",
+                          .help = "directory for the persistent SPIR-V shader cache (default: <exeDir>/spirv_cache)"},
+                         &prmShaderCache.spirvCacheDir);
 
   // Data
   parameterRegistry->add({"shformat", "0=fp32 1=fp16 2=uint8"}, &prmData.shFormat);

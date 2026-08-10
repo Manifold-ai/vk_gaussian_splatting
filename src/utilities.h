@@ -91,6 +91,13 @@ inline static std::vector<std::filesystem::path> getShaderDirs()
   };
 }
 
+// Default location for the persistent SPIR-V cache when --spirvCacheDir is not given: a
+// "spirv_cache" folder next to the executable.
+inline static std::filesystem::path getDefaultSpirvCacheDir()
+{
+  return std::filesystem::absolute(nvutils::getExecutablePath().parent_path() / "spirv_cache");
+}
+
 static std::string formatMemorySize(size_t sizeInBytes)
 {
   static const std::string units[]     = {"B", "KB", "MB", "GB"};

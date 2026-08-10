@@ -89,6 +89,7 @@
 #include "parameters.h"
 #include "memory_statistics.h"
 #include "utilities.h"
+#include "spirv_cache.h"
 #include "splat_set.h"
 #include "splat_set_vk.h"
 #include "asset_manager_vk.h"
@@ -475,6 +476,8 @@ protected:
   std::vector<std::pair<std::string, std::string>> m_shaderMacros;
   // used to load and compile shaders
   nvslang::SlangCompiler m_slangCompiler{};
+  // Persistent SPIR-V disk cache (skips slang compilation on warm start)
+  SpirvCache m_spirvCache;
 
   // The different shaders that are used in the pipelines
   struct Shaders
