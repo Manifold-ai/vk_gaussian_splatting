@@ -89,6 +89,7 @@
 #include "parameters.h"
 #include "memory_statistics.h"
 #include "utilities.h"
+#include "spirv_cache.h"
 #include "splat_set.h"
 #include "splat_set_vk.h"
 #include "asset_manager_vk.h"
@@ -401,6 +402,10 @@ protected:
 
   // Trigger a rebuild of the shaders and pipelines at next frame
   bool m_requestUpdateShaders = false;
+  // Teardown-only guard (set in onDetach): skips the reset() shader recompile of the
+  // emptied scene right before deinitShaders() destroys the modules. Must stay false during
+  // runtime reset()/project-switch so those still recompile.
+  bool m_isShuttingDown = false;
   // Defer shader rebuild until camera animation completes
   bool m_requestUpdateShadersAfterCameraAnim = false;
   // Track scene composition for RTX_HAS_MESHES / RTX_HAS_PARTICLES macro changes
@@ -471,6 +476,8 @@ protected:
   std::vector<std::pair<std::string, std::string>> m_shaderMacros;
   // used to load and compile shaders
   nvslang::SlangCompiler m_slangCompiler{};
+  // Persistent SPIR-V disk cache (skips slang compilation on warm start)
+  SpirvCache m_spirvCache;
 
   // The different shaders that are used in the pipelines
   struct Shaders
