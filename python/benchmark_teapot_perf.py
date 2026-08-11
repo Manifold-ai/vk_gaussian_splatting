@@ -66,7 +66,7 @@ ALL_PASS = 0  # RtxTraceStrategy.FULL_ANYHIT
 CAMERA = 0
 
 # Load/settle frames before the first capture (matches facade._MIN_SETTLE_FRAMES).
-SETTLE_FRAMES = 32
+SETTLE_FRAMES = 5
 
 # Timer stages worth surfacing in the printed table (full set still goes to
 # the CSV). "Primary Timeline" is the whole-frame GPU total when present.

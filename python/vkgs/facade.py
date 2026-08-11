@@ -24,7 +24,7 @@ from .sequence import RenderScript
 
 # Minimum frames for the load/settle block: lets async scene loading, shader
 # builds and sorting warm up before the first activateCameraPreset.
-_MIN_SETTLE_FRAMES = 32
+_MIN_SETTLE_FRAMES = 5
 
 # Pipelines whose output is stochastic and converges via temporal
 # accumulation (RTX/hybrids); raster pipelines only need it for
