@@ -515,6 +515,8 @@ class EngineVKGS:
             # SHADOW_CATCHER -> GS shadow mask (see SHADOW_CATCHER_WORKAROUND):
             # every analytic light gets a shadow_only twin that only darkens
             # the mask; the original keeps illuminating the mesh/shaded set.
+            # (Future: LightAsset.cast_on_gs=True lets one light do both, which
+            # could replace the twin — kept as-is to preserve the hard-mask twin.)
             scene.renderer.gs_shadow_mask = True
             if self.pipeline not in _GS_SHADOW_MASK_PIPELINES:
                 warn_compat(
