@@ -227,6 +227,7 @@ class EngineVKGS:
         size: Tuple[int, int] = (1920, 1080),
         return_torch: bool = False,
         pipeline: int = Pipeline.HYBRID,
+        extra_args: Sequence[str] = (),
     ):
         ext = os.path.splitext(gs_object)[1].lower()
         if ext in (".pt", ".ingp"):
@@ -246,6 +247,9 @@ class EngineVKGS:
         self.size = (int(size[0]), int(size[1]))
         self.return_torch = bool(return_torch)
         self.pipeline = Pipeline(int(pipeline))
+        # Extra CLI args appended verbatim to every render subprocess command
+        # (e.g. ["--spirvCacheDir", "/var/cache/vkgs"]).
+        self.extra_args = tuple(extra_args)
         # Not applicable in the subprocess model; kept for script portability
         # (3dgrut scripts pass engine.device into add_primitive, which we ignore).
         self.device = None
@@ -504,12 +508,27 @@ class EngineVKGS:
                 translation=spec["translation"],
                 rotation=spec["rotation"],
                 radius=spec["radius"] if spec["radius"] > 0 else 1.0,
+                # cast_on_gs: one light both illuminates and casts onto the GS
+                # shadow mask (no shadow_only twin needed); ignored by the
+                # renderer when shadow_only is set (which it never is here).
+                cast_on_gs=spec.get("cast_on_gs", False),
             )
         if any_light:
             # 3dgrut always traces shadows when lights exist; soft when any
             # light has angular_radius > 0 (radius from the tan() heuristic).
             scene.renderer.lighting_enabled = True
             scene.renderer.shadows_mode = int(ShadowsMode.SOFT if any_soft else ShadowsMode.HARD)
+            if any(spec.get("cast_on_gs") for spec in light_specs):
+                # cast_on_gs lights darken the splat emissive via the GS shadow
+                # mask, so enable it (RTX pipelines only). One flag replaces the
+                # shadow_only twin path below.
+                scene.renderer.gs_shadow_mask = True
+                if self.pipeline not in _GS_SHADOW_MASK_PIPELINES:
+                    warn_compat(
+                        "cast_on_gs lights only cast onto the GS shadow mask in the "
+                        f"RTX-traced pipelines {sorted(int(p) for p in _GS_SHADOW_MASK_PIPELINES)}; "
+                        f"current pipeline {int(self.pipeline)} ignores it."
+                    )
 
         if self._shadow_catcher_requested:
             # SHADOW_CATCHER -> GS shadow mask (see SHADOW_CATCHER_WORKAROUND):
@@ -654,6 +673,7 @@ class EngineVKGS:
             out_dir=out_dir,
             hdr=True,
             executable=self.executable,
+            extra_args=self.extra_args,
         )
 
         buffers: List[Dict[str, np.ndarray]] = []

@@ -112,6 +112,7 @@ def render_scene(
     gpu: Optional[int] = None,
     keep_files: bool = True,
     timeout: float = 1800,
+    extra_args: Sequence[str] = (),
 ) -> RenderResult:
     """Render ``scene`` from each camera and return the images.
 
@@ -182,6 +183,7 @@ def render_scene(
         timeout=timeout,
         log_path=os.path.join(out_dir, "render.log"),
         expected_outputs=expected,
+        extra_args=extra_args,
     )
 
     # Map every buffer file actually present (robust to conditional buffers),

@@ -98,6 +98,9 @@ class Light:
     position: Vec3 = (0.0, 0.0, 0.0)
     tangent_u: Vec3 = (0.0, 0.0, 0.0)  # AREA half-edge U (world)
     tangent_v: Vec3 = (0.0, 0.0, 0.0)  # AREA half-edge V (world)
+    # both light and shadow: illuminate normally AND cast onto the GS shadow
+    # mask (renderer.gs_shadow_mask, RTX pipelines) — no shadow_only twin needed
+    cast_on_gs: bool = False
 
     def to_row(self) -> List[float]:
         """3dgrut contract-C8 18-column row (engine.py:150-179); used here
@@ -115,6 +118,7 @@ class Light:
             *(float(c) for c in self.position),
             *(float(c) for c in self.tangent_u),
             *(float(c) for c in self.tangent_v),
+            float(self.cast_on_gs),
         ]
 
 
@@ -336,6 +340,7 @@ def light_to_vkgs(light: Light) -> dict:
             "rotation": direction_to_euler_deg(emit_dir),
             "radius": radius,
             "soft": soft,
+            "cast_on_gs": bool(light.cast_on_gs),
         }
 
     # POINT: position only (3dgrut ignores direction for point lights)
@@ -348,6 +353,7 @@ def light_to_vkgs(light: Light) -> dict:
         "rotation": (0.0, 0.0, 0.0),
         "radius": radius,
         "soft": soft,
+        "cast_on_gs": bool(light.cast_on_gs),
     }
 
 
