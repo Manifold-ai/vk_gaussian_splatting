@@ -14,3 +14,6 @@ __pycache__/
 # Python package dev artifacts
 python/.venv/
 python/*.egg-info/
+
+# Claude Code local session data (worktrees, settings, memory)
+.claude/
