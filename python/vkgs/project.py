@@ -245,6 +245,9 @@ class LightAsset:
     # gs-shadow light: only darkens the GS shadow mask (renderer.gs_shadow_mask,
     # RTX pipelines), never illuminates (src/light_manager_vk.h:60)
     shadow_only: bool = False
+    # both light and shadow: illuminates normally AND also casts onto the GS shadow
+    # mask (renderer.gs_shadow_mask); orthogonal to shadow_only (which turns lighting off)
+    cast_on_gs: bool = False
 
     def to_json(self) -> dict:
         return {
@@ -257,9 +260,10 @@ class LightAsset:
             "outerConeAngle": float(self.outer_cone_angle),
             "attenuationMode": int(self.attenuation_mode),
             "radius": float(self.radius),
-            # LightSourceVk.enabled / .shadowOnly are ints (0/1)
+            # LightSourceVk.enabled / .shadowOnly / .castOnGs are ints (0/1)
             "enabled": int(bool(self.enabled)),
             "shadowOnly": int(bool(self.shadow_only)),
+            "castOnGs": int(bool(self.cast_on_gs)),
         }
 
 
@@ -837,12 +841,16 @@ class Scene:
         attenuation_mode: int = AttenuationMode.QUADRATIC,
         enabled: bool = True,
         shadow_only: bool = False,
+        cast_on_gs: bool = False,
     ) -> LightInstance:
         """Create a light (asset + one instance) and return the instance.
 
         ``shadow_only=True`` makes a gs-shadow light: it only darkens the GS
         shadow mask (renderer.gs_shadow_mask, RTX pipelines 2/3/5) and never
         illuminates anything; use radius=0 for noise-free hard mask shadows.
+        ``cast_on_gs=True`` keeps the light illuminating normally but ALSO casts
+        onto the GS shadow mask (one light that both shadows meshes and darkens
+        splats); requires renderer.gs_shadow_mask on. Ignored when shadow_only.
         """
         asset = LightAsset(
             id=len(self.light_assets),
@@ -856,6 +864,7 @@ class Scene:
             radius=float(radius),
             enabled=enabled,
             shadow_only=bool(shadow_only),
+            cast_on_gs=bool(cast_on_gs),
         )
         self.light_assets.append(asset)
         return self.add_light_instance(asset, name=name, translation=translation, rotation=rotation)
@@ -1064,6 +1073,7 @@ class Scene:
                 asset.radius = float(_get(item, "radius", asset.radius))
                 asset.enabled = bool(_get(item, "enabled", asset.enabled))
                 asset.shadow_only = bool(_get(item, "shadowOnly", asset.shadow_only))
+                asset.cast_on_gs = bool(_get(item, "castOnGs", asset.cast_on_gs))
                 scene.light_assets.append(asset)
             for item in lights.get("instances", []):
                 inst = LightInstance(asset_id=int(item["assetId"]))

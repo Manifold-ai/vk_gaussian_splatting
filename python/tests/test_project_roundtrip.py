@@ -41,6 +41,8 @@ def build_scene(tmp_path):
     scene.add_light(LightType.DIRECTIONAL, rotation=(45, 0, 0), intensity=2.0)
     # gs-shadow light: only darkens the GS shadow mask, radius=0 = hard shadow
     scene.add_light(LightType.DIRECTIONAL, rotation=(60, 0, 0), radius=0.0, shadow_only=True)
+    # both light and shadow: illuminates AND casts onto the GS mask
+    scene.add_light(LightType.DIRECTIONAL, rotation=(30, 0, 0), cast_on_gs=True)
     scene.set_environment(EnvMode.HDR, hdr_file=str(tmp_path / "env.hdr"), ibl_intensity=1.2)
     scene.set_tonemapping(True, exposure=1.5, method=2)
     scene.set_camera(Camera(eye=(3, 1.5, 2), ctr=(0, 0.5, 0)))
@@ -174,8 +176,9 @@ def test_gs_shadow_mask_serialization(tmp_path):
     assert renderer["gsShadowMaskFromParticles"] is True
     assert renderer["forceSurfel"] is True
 
-    # shadowOnly is an int 0/1 like enabled (LightSourceVk convention)
-    assert [a["shadowOnly"] for a in data["lights"]["assets"]] == [0, 0, 1]
+    # shadowOnly / castOnGs are ints 0/1 like enabled (LightSourceVk convention)
+    assert [a["shadowOnly"] for a in data["lights"]["assets"]] == [0, 0, 1, 0]
+    assert [a["castOnGs"] for a in data["lights"]["assets"]] == [0, 0, 0, 1]
     assert data["lights"]["assets"][2]["radius"] == 0.0
 
     loaded = Scene.load(scene.save(str(tmp_path / "mask.vkgs")))
@@ -183,7 +186,8 @@ def test_gs_shadow_mask_serialization(tmp_path):
     assert loaded.renderer.gs_shadow_mask_min == pytest.approx(0.35)
     assert loaded.renderer.gs_shadow_mask_from_particles is True
     assert loaded.renderer.force_surfel is True
-    assert [a.shadow_only for a in loaded.light_assets] == [False, False, True]
+    assert [a.shadow_only for a in loaded.light_assets] == [False, False, True, False]
+    assert [a.cast_on_gs for a in loaded.light_assets] == [False, False, False, True]
 
 
 def test_gs_shadow_mask_defaults_omit_nothing(tmp_path):
