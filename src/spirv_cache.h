@@ -55,12 +55,21 @@ public:
   //               shared header (incl. nvshaders/) invalidates the cache.
   // optionsDesc : a string describing the fixed compiler target/options/capabilities and
   //               build type; folded into every key so an option/build change invalidates.
+  // maxBytes    : soft cap on total cache size; when exceeded, least-recently-used .spv
+  //               entries are evicted at init (0 = unlimited).
+  // init also wipes the whole cache when the "generation" (CACHE_VERSION + source stamp +
+  // options stamp) changes, so stale entries from a shader/compiler change don't pile up.
   // On any failure the cache disables itself (enabled()==false).
   void init(const std::filesystem::path&             cacheDir,
             const std::vector<std::filesystem::path>& sourceDirs,
-            const std::string&                        optionsDesc);
+            const std::string&                        optionsDesc,
+            size_t                                    maxBytes);
 
   bool enabled() const { return m_enabled; }
+
+  // Print a one-line "<N> loaded from cache, <M> compiled" summary for the loads since the
+  // last call and reset the counters. Call after a compile batch (e.g. initShaders()).
+  void logStats(const char* context);
 
   // Cached SPIR-V words on hit (validated magic + size), std::nullopt on miss/corrupt/disabled.
   std::optional<std::vector<uint32_t>> load(const std::string&                                      shaderName,
@@ -80,6 +89,9 @@ private:
   std::filesystem::path m_cacheDir;
   uint64_t              m_sourceStamp  = 0;  // FNV-1a over all shader-source file contents
   uint64_t              m_optionsStamp = 0;  // FNV-1a over optionsDesc
+  // Hit/miss counters since the last logStats() (shader compilation is main-thread only).
+  mutable uint32_t m_hits   = 0;
+  mutable uint32_t m_misses = 0;
 };
 
 }  // namespace vk_gaussian_splatting

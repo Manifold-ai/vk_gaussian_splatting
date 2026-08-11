@@ -87,6 +87,9 @@ struct ShaderCacheParameters
 {
   // Directory for cached .spv files. Empty => default (<exeDir>/spirv_cache), resolved at init.
   std::filesystem::path spirvCacheDir;
+  // Soft cap on total cache size (MB). When exceeded, least-recently-used .spv are evicted at
+  // startup. 0 => unlimited. Note: a shader/compiler change wipes the whole cache regardless.
+  int32_t spirvCacheMaxMB = 512;
 };
 extern ShaderCacheParameters prmShaderCache;
 

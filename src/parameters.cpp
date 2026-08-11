@@ -128,6 +128,10 @@ void registerCommandLineParameters(nvutils::ParameterRegistry* parameterRegistry
   parameterRegistry->add({.name = "spirvCacheDir",
                           .help = "directory for the persistent SPIR-V shader cache (default: <exeDir>/spirv_cache)"},
                          &prmShaderCache.spirvCacheDir);
+  // Soft size cap for the SPIR-V cache (MB); over the cap, least-recently-used entries are evicted.
+  parameterRegistry->add({.name = "spirvCacheMaxMB",
+                          .help = "max SPIR-V cache size in MB before LRU eviction (0=unlimited, default 512)"},
+                         &prmShaderCache.spirvCacheMaxMB);
 
   // Data
   parameterRegistry->add({"shformat", "0=fp32 1=fp16 2=uint8"}, &prmData.shFormat);

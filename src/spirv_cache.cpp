@@ -56,11 +56,137 @@ inline bool endsWith(const std::string& s, const char* suffix)
   const size_t n = std::char_traits<char>::length(suffix);
   return s.size() >= n && s.compare(s.size() - n, n, suffix) == 0;
 }
+
+// (A) Wipe-on-generation-change. The "generation signature" folds only the parts shared by
+//     EVERY key — CACHE_VERSION, the source stamp, and the options stamp — but not the
+//     per-shader name or per-render macro set. When it differs from the value persisted in
+//     <cacheDir>/cache.stamp, every existing .spv was produced by a dead generation (a shader
+//     edit, compiler-option change, or format bump), so the whole cache is cleared and the new
+//     signature written. Deletion happens ONLY when a prior stamp exists and differs (a dir we
+//     previously owned); a first run just records the baseline and deletes nothing, so aiming
+//     --spirvCacheDir at a dir holding unrelated .spv files is safe. Rendering settings
+//     (DLSS/pipeline/temporal/...) are MACROS, so they do NOT enter this signature and never
+//     trigger a wipe — new macro combos just add coexisting entries, which (B) bounds instead.
+void wipeIfGenerationChanged(const std::filesystem::path& cacheDir, uint32_t version, uint64_t sourceStamp, uint64_t optionsStamp)
+{
+  uint64_t sig = kFnvOffset;
+  fnvAppend(sig, &version, sizeof(version));
+  fnvAppend(sig, &sourceStamp, sizeof(sourceStamp));
+  fnvAppend(sig, &optionsStamp, sizeof(optionsStamp));
+  char sigStr[24];
+  std::snprintf(sigStr, sizeof(sigStr), "%016llx", (unsigned long long)sig);
+
+  const std::filesystem::path stampPath = cacheDir / "cache.stamp";
+  std::string                 prev;
+  {
+    std::ifstream sin(stampPath);
+    if(sin)
+      std::getline(sin, prev);
+  }
+  if(prev == sigStr)
+    return;  // same generation -> keep all entries
+
+  // Only wipe when a PRIOR stamp exists and differs — i.e. a directory THIS cache previously
+  // owned whose generation genuinely changed. With no prior stamp (first run on a fresh or a
+  // user-supplied dir, or a dir populated by a pre-eviction build) we delete NOTHING and just
+  // record the baseline signature. This keeps `--spirvCacheDir <dir-with-unrelated-.spv>` from
+  // destroying the user's files, and lets a valid pre-upgrade cache survive (stale entries are
+  // then bounded by (B) LRU, and real generation changes still wipe once the baseline is set).
+  const bool hadPriorStamp = !prev.empty();
+  uint32_t   cleared       = 0;
+  if(hadPriorStamp)
+  {
+    std::error_code ec;
+    for(auto it = std::filesystem::directory_iterator(cacheDir, ec);
+        !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+    {
+      std::error_code fec;
+      if(!it->is_regular_file(fec) || fec)  // files only — never a subdir/symlink named *.spv
+        continue;
+      const std::string n = it->path().filename().string();
+      if(endsWith(n, ".spv") || n.find(".spv.tmp.") != std::string::npos)  // final blobs + stale temps
+      {
+        std::error_code rec;
+        if(std::filesystem::remove(it->path(), rec))
+          ++cleared;
+      }
+    }
+  }
+
+  // Persist the new signature via a per-process-unique temp + rename (same pattern as store())
+  // so concurrent starters never share or clobber one temp; a losing rename drops its own temp.
+  static std::atomic<uint64_t> s_stampCounter{0};
+  std::filesystem::path        tmp = stampPath;
+  tmp += ".tmp." + std::to_string((long long)VKGS_GETPID()) + "." + std::to_string(s_stampCounter.fetch_add(1));
+  {
+    std::ofstream sout(tmp, std::ios::trunc);
+    sout << sigStr << "\n";
+  }
+  std::error_code rec;
+  std::filesystem::rename(tmp, stampPath, rec);
+  if(rec)
+    std::filesystem::remove(tmp, rec);
+  if(cleared > 0)
+    LOGI("SpirvCache: generation changed - cleared %u stale entries\n", cleared);
+}
+
+// (B) Size-cap LRU. Sums the .spv entries; if over maxBytes, deletes them oldest-mtime-first
+//     until under cap. load() bumps an entry's mtime on every hit, so "oldest mtime" means
+//     "least recently used" — frequently-read shaders survive, only stale macro-set variants
+//     are evicted. cache.stamp and *.tmp are excluded from the size accounting.
+void enforceSizeCap(const std::filesystem::path& cacheDir, size_t maxBytes)
+{
+  if(maxBytes == 0)
+    return;  // unlimited
+  struct Ent
+  {
+    std::filesystem::path           path;
+    std::uintmax_t                  size;
+    std::filesystem::file_time_type mtime;
+  };
+  std::vector<Ent> ents;
+  std::uintmax_t   total = 0;
+  std::error_code  ec;
+  for(auto it = std::filesystem::directory_iterator(cacheDir, ec);
+      !ec && it != std::filesystem::directory_iterator(); it.increment(ec))
+  {
+    const std::string n = it->path().filename().string();
+    if(!endsWith(n, ".spv"))  // only final .spv blobs (skip cache.stamp / *.tmp)
+      continue;
+    std::error_code      sec, tec;
+    const std::uintmax_t sz = std::filesystem::file_size(it->path(), sec);
+    const auto           mt = std::filesystem::last_write_time(it->path(), tec);
+    if(sec || tec)
+      continue;
+    ents.push_back({it->path(), sz, mt});
+    total += sz;
+  }
+  if(total <= maxBytes)
+    return;
+  std::sort(ents.begin(), ents.end(), [](const Ent& a, const Ent& b) { return a.mtime < b.mtime; });  // oldest first
+  uint32_t       evicted = 0;
+  std::uintmax_t freed   = 0;
+  for(const auto& e : ents)
+  {
+    if(total <= maxBytes)
+      break;
+    std::error_code rec;
+    if(std::filesystem::remove(e.path, rec))
+    {
+      total -= e.size;
+      freed += e.size;
+      ++evicted;
+    }
+  }
+  if(evicted > 0)
+    LOGI("SpirvCache: over cap - evicted %u LRU entries (freed %.1f MB)\n", evicted, (double)freed / (1024.0 * 1024.0));
+}
 }  // namespace
 
 void SpirvCache::init(const std::filesystem::path&              cacheDir,
                       const std::vector<std::filesystem::path>& sourceDirs,
-                      const std::string&                        optionsDesc)
+                      const std::string&                        optionsDesc,
+                      size_t                                    maxBytes)
 {
   m_enabled = false;
   try
@@ -118,7 +244,14 @@ void SpirvCache::init(const std::filesystem::path&              cacheDir,
       return;
     }
     m_cacheDir = cacheDir;
-    m_enabled  = true;
+
+    // Bound the cache before first use. (A) drops entries left over from a previous generation
+    // (shader/compiler change); (B) caps total size, evicting least-recently-used entries.
+    // Both are best-effort — a cleanup failure must never disable the cache (see catch below).
+    wipeIfGenerationChanged(m_cacheDir, CACHE_VERSION, m_sourceStamp, m_optionsStamp);  // (A)
+    enforceSizeCap(m_cacheDir, maxBytes);                                               // (B)
+
+    m_enabled = true;
     LOGI("SpirvCache: enabled at '%s' (source %016llx, options %016llx)\n", m_cacheDir.string().c_str(),
          (unsigned long long)m_sourceStamp, (unsigned long long)m_optionsStamp);
   }
@@ -168,27 +301,49 @@ std::optional<std::vector<uint32_t>> SpirvCache::load(
 {
   if(!m_enabled)
     return std::nullopt;
-  try
-  {
-    const std::filesystem::path p = keyPath(shaderName, macros);
-    std::ifstream               in(p, std::ios::binary | std::ios::ate);
-    if(!in)
+
+  auto attempt = [&]() -> std::optional<std::vector<uint32_t>> {
+    try
+    {
+      const std::filesystem::path p = keyPath(shaderName, macros);
+      std::ifstream               in(p, std::ios::binary | std::ios::ate);
+      if(!in)
+        return std::nullopt;
+      const std::streamsize bytes = in.tellg();
+      if(bytes <= 0 || (bytes % 4) != 0)
+        return std::nullopt;
+      in.seekg(0);
+      std::vector<uint32_t> words(static_cast<size_t>(bytes) / 4);
+      if(!in.read(reinterpret_cast<char*>(words.data()), bytes))
+        return std::nullopt;
+      if(words.empty() || words[0] != kSpirvMagic)  // reject non-SPIR-V / truncated
+        return std::nullopt;
+      // LRU bookkeeping: mark this entry as just-used so the size-cap eviction keeps hot shaders
+      // and only drops genuinely-unused macro-set variants. Best-effort (ignore read-only dirs).
+      std::error_code tec;
+      std::filesystem::last_write_time(p, std::filesystem::file_time_type::clock::now(), tec);
+      return words;
+    }
+    catch(...)
+    {
       return std::nullopt;
-    const std::streamsize bytes = in.tellg();
-    if(bytes <= 0 || (bytes % 4) != 0)
-      return std::nullopt;
-    in.seekg(0);
-    std::vector<uint32_t> words(static_cast<size_t>(bytes) / 4);
-    if(!in.read(reinterpret_cast<char*>(words.data()), bytes))
-      return std::nullopt;
-    if(words.empty() || words[0] != kSpirvMagic)  // reject non-SPIR-V / truncated
-      return std::nullopt;
-    return words;
-  }
-  catch(...)
-  {
-    return std::nullopt;
-  }
+    }
+  };
+
+  std::optional<std::vector<uint32_t>> result = attempt();
+  if(result)
+    ++m_hits;  // served from disk (skips slang compilation)
+  else
+    ++m_misses;  // caller will compile + store()
+  return result;
+}
+
+void SpirvCache::logStats(const char* context)
+{
+  if(m_enabled)
+    LOGI("SpirvCache: %s: %u loaded from cache, %u compiled\n", context, m_hits, m_misses);
+  m_hits   = 0;
+  m_misses = 0;
 }
 
 void SpirvCache::store(const std::string&                                      shaderName,

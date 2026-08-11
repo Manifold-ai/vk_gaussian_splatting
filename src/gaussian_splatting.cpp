@@ -239,7 +239,11 @@ void GaussianSplatting::onAttach(nvapp::Application* app)
 #else
                                       "build=debug";
 #endif
-    m_spirvCache.init(cacheDir, getShaderDirs(), optionsDesc);
+    // Convert the MB cap to bytes (0 or negative => unlimited). init() also wipes the cache on
+    // a generation change and evicts LRU entries beyond this cap before the first compile.
+    const size_t maxBytes =
+        prmShaderCache.spirvCacheMaxMB > 0 ? static_cast<size_t>(prmShaderCache.spirvCacheMaxMB) * 1024u * 1024u : 0u;
+    m_spirvCache.init(cacheDir, getShaderDirs(), optionsDesc, maxBytes);
   }
 
   // Initialize Tonemapper
@@ -2546,6 +2550,7 @@ bool GaussianSplatting::initShaders(void)
   auto      endTime   = std::chrono::high_resolution_clock::now();
   long long buildTime = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
   LOGI("Shaders updated in %lldms\n", buildTime);
+  m_spirvCache.logStats("initShaders");
 
   return (m_shaders.valid = true);
 }
