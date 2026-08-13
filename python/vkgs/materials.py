@@ -49,6 +49,7 @@ __all__ = [
     "glass",
     "mirror",
     "diffuse",
+    "flat",
     "solid",
     "brushed_copper",
     "rose_gold",
@@ -116,6 +117,37 @@ def diffuse(color=(0.7, 0.7, 0.7), **overrides) -> Material:
         metallic=0.0,
         roughness=1.0,
         max_bounces=3,
+    )
+
+
+def flat(color=(1.0, 1.0, 1.0), unlit: bool = True, **overrides) -> Material:
+    """Flat reference material for matte ID / white-model / occlusion passes.
+
+    ``unlit=True`` (default) renders ``color`` directly, ignoring scene
+    lighting — implemented via emissive with ``base_color=0`` and
+    ``max_bounces=0`` (the same trick splat materials use, project.py
+    Material.splat_default). ``unlit=False`` gives a Lambertian ``color``
+    surface instead. Typical use: ``flat((1, 1, 1))`` white, ``flat((0, 0, 0))``
+    black, as a per-instance ``set_primitive_material`` override.
+    """
+    if unlit:
+        return _make(
+            overrides,
+            name="flat",
+            base_color=(0.0, 0.0, 0.0),
+            emissive=tuple(color),
+            emissive_strength=1.0,
+            metallic=0.0,
+            roughness=1.0,
+            max_bounces=0,
+        )
+    return _make(
+        overrides,
+        name="flat",
+        base_color=tuple(color),
+        metallic=0.0,
+        roughness=1.0,
+        max_bounces=0,
     )
 
 

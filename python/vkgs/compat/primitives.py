@@ -21,6 +21,7 @@ from typing import Dict, Optional, Tuple
 import numpy as np
 
 from .. import geometry, materials
+from ..project import Material
 from .convert import (
     DEFAULT_REFRACTIVE_INDEX,
     SHADOW_CATCHER_WORKAROUND,
@@ -212,6 +213,9 @@ class PrimitiveVKGS:
     rotation: Vec3 = (0.0, 0.0, 0.0)
     scale: Vec3 = (1.0, 1.0, 1.0)
     show: bool = True
+    # Per-instance material override; when set it replaces the material derived
+    # from ``primitive_type`` at scene flush (None = use the type preset).
+    material_override: Optional[Material] = None
 
     def set_transform(self, matrix) -> None:
         """Set position/rotation/scale from a 3dgrut ObjectTransform model
@@ -229,6 +233,7 @@ class PrimitiveVKGS:
             tuple(self.rotation),
             tuple(self.scale),
             bool(self.show),
+            repr(self.material_override),
         )
 
 
@@ -297,10 +302,11 @@ class PrimitivesVKGS:
             path = geometry.ensure_procedural(geometry_type, cache_dir=self.cache_dir)
         return path
 
-    def add_primitive(self, geometry_type: str, primitive_type, device=None) -> str:
+    def add_primitive(self, geometry_type: str, primitive_type, device=None, material: Optional[Material] = None) -> str:
         """Create a primitive from a registered geometry type with automatic
         scene-relative scaling (engine.py:563-627). ``device`` is accepted
-        for signature parity and ignored. Returns the generated name
+        for signature parity and ignored. ``material`` optionally overrides the
+        primitive_type preset. Returns the generated name
         ("{geometry_type} {count}"; 3dgrut returns None here)."""
         primitive_type = _coerce_primitive_type(primitive_type)
         path = self._resolve_path(geometry_type)
@@ -312,13 +318,17 @@ class PrimitivesVKGS:
             path=path,
             primitive_type=primitive_type,
             scale=(factor, factor, factor),
+            material_override=material,
         )
         self.dirty = True
         return name
 
-    def load_external_primitive(self, path: str, primitive_type, device=None, name: Optional[str] = None) -> str:
+    def load_external_primitive(
+        self, path: str, primitive_type, device=None, name: Optional[str] = None, material: Optional[Material] = None
+    ) -> str:
         """Import a mesh from an arbitrary path, as-authored: no recenter,
-        no autoscale (engine.py:629-709). Returns the primitive name."""
+        no autoscale (engine.py:629-709). ``material`` optionally overrides the
+        primitive_type preset. Returns the primitive name."""
         primitive_type = _coerce_primitive_type(primitive_type)
         abspath = os.path.abspath(path)
         if Path(abspath).suffix.lower() not in self.SUPPORTED_MESH_EXTENSIONS:
@@ -327,13 +337,22 @@ class PrimitivesVKGS:
         if name is None:
             name = self._next_name(geometry_type)
         self.objects[name] = PrimitiveVKGS(
-            name=name, geometry_type=geometry_type, path=abspath, primitive_type=primitive_type
+            name=name, geometry_type=geometry_type, path=abspath, primitive_type=primitive_type,
+            material_override=material,
         )
         self.dirty = True
         return name
 
     def remove_primitive(self, name: str) -> None:
         del self.objects[name]
+        self.dirty = True
+
+    def set_primitive_material(self, name: str, material: Optional[Material]) -> None:
+        """Override (``material``) or clear (``None``) a primitive's material.
+        The override wins over the primitive_type preset at scene flush."""
+        if name not in self.objects:
+            raise KeyError(f"unknown primitive {name!r}; available: {sorted(self.objects)}")
+        self.objects[name].material_override = material
         self.dirty = True
 
     def duplicate_primitive(self, name: str) -> str:

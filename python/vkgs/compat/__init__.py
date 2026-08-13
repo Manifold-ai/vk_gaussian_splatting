@@ -29,7 +29,7 @@ from .convert import (
     transform_to_vkgs_trs,
 )
 from .engine import DepthOfFieldVKGS, EngineVKGS, EnvironmentVKGS, SPPVKGS
-from .primitives import PrimitivesVKGS, PrimitiveVKGS
+from .primitives import PrimitivesVKGS, PrimitiveVKGS, ply_scene_extent
 from .tonemap import apply_gamma, tonemap
 
 __all__ = [
@@ -40,6 +40,7 @@ __all__ = [
     "LightType",
     "PrimitivesVKGS",
     "PrimitiveVKGS",
+    "ply_scene_extent",
     "DepthOfFieldVKGS",
     "SPPVKGS",
     "EnvironmentVKGS",

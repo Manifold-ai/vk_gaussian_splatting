@@ -5,20 +5,20 @@ Mirrors the outward surface of ``Engine3DGRUT``
 (threedgrut_playground/engine.py:895-1667) on a lazy execution model: every
 setter only mutates in-memory state; ``render(camera)`` serializes the
 scene to .vkgs + .cfg, runs one headless subprocess
-(vkgs.facade.render_scene, hdr=True) and returns
+(vkgs.facade.render_scene, image_format='raw') and returns
 ``{'rgb': (1, H, W, 3) float32 in [0, 1], 'opacity': (1, H, W, 1),
-'rgb_buffer': alias of rgb}`` — numpy by default, torch-wrapped with
-``return_torch=True``.
+'rgb_buffer': alias of rgb}`` (plus 'depth' when ``return_depth=True``) —
+numpy by default, torch-wrapped with ``return_torch=True``.
 
 Tonemapping/gamma are applied in Python on the HDR readback using 3dgrut's
 exact formulas (vkgs.compat.tonemap), so 'None'/'Reinhard'/'Filmic' match
 pixel-for-pixel modulo the renderer's own output differences.
 
-Opacity note: the .hdr readback carries no alpha, so ``opacity`` is
-currently all-ones. Real coverage requires the .raw RGBA32F dump path plus
-— for the RTX pipelines — the C++ alpha patch (RTX writes alpha=1.0 today,
-shaders/threedgrt_raytrace.rgen.slang:1956,2103); raster pipelines already
-accumulate a meaningful alpha.
+Opacity note: ``opacity`` is real per-pixel coverage, read from the 4th
+channel of the ``.raw`` RGBA32F main-buffer dump. Both pipelines write it:
+RTX as ``1 - transmittance`` (shaders/threedgrt_raytrace.rgen.slang), raster
+via premultiplied alpha. (A ``.hdr`` readback would drop alpha and yield
+all-ones; the compat engine uses ``.raw`` precisely to keep coverage.)
 
 Progressive-rendering surface (render_pass/is_dirty/...) is ported to the
 batch model: ``render_pass`` performs one full-quality render and then
@@ -227,6 +227,7 @@ class EngineVKGS:
         size: Tuple[int, int] = (1920, 1080),
         return_torch: bool = False,
         pipeline: int = Pipeline.HYBRID,
+        return_depth: bool = False,
         extra_args: Sequence[str] = (),
     ):
         ext = os.path.splitext(gs_object)[1].lower()
@@ -247,6 +248,9 @@ class EngineVKGS:
         self.size = (int(size[0]), int(size[1]))
         self.return_torch = bool(return_torch)
         self.pipeline = Pipeline(int(pipeline))
+        # When True, render_many also requests the depth buffer and returns it
+        # under a "depth" key (NDC [0,1]); off by default to skip the extra I/O.
+        self.return_depth = bool(return_depth)
         # Extra CLI args appended verbatim to every render subprocess command
         # (e.g. ["--spirvCacheDir", "/var/cache/vkgs"]).
         self.extra_args = tuple(extra_args)
@@ -436,6 +440,23 @@ class EngineVKGS:
     def invalidate_materials_on_gpu(self) -> None:
         self.is_materials_dirty = True
 
+    def set_primitive_material(self, name: str, material=None) -> None:
+        """Override (or, with ``material=None``, clear) the material of one
+        primitive instance. The override wins over the primitive_type preset at
+        flush, so e.g. ``materials.flat((1, 1, 1))`` gives a white-model
+        reference render and ``materials.flat((0, 0, 0))`` a black occluder.
+        Native Scene already supports per-instance materials; this exposes it
+        through the compat shim."""
+        self.primitives.set_primitive_material(name, material)
+        self.is_materials_dirty = True
+
+    def get_scene_bounds(self) -> Tuple[float, float, float]:
+        """Per-axis extent (max - min) of the splat cloud in the PLY-native
+        frame — NOT AABB corners and NOT a metric center. ``(1, 1, 1)``
+        fallback for non-.ply inputs (.spz/.splat have no cheap position
+        scan). Useful for framing a default camera."""
+        return self.primitives.scene_extent
+
     def has_progressive_effects_to_render(self) -> bool:
         """Always False: render()/render_pass() runs accumulate every sample
         inside one subprocess call (plan gap A2)."""
@@ -467,7 +488,12 @@ class EngineVKGS:
         for prim in self.primitives.objects.values():
             if prim.primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER:
                 continue  # never rendered; only requests the GS shadow mask
-            material = primitive_type_to_material(prim.primitive_type, ior=prim.refractive_index)
+            # A per-instance override wins over the primitive_type preset — and
+            # applies even to PBR/NONE, whose preset is None.
+            if prim.material_override is not None:
+                material = prim.material_override
+            else:
+                material = primitive_type_to_material(prim.primitive_type, ior=prim.refractive_index)
             scene.add_mesh(
                 prim.path,
                 name=prim.name,
@@ -665,13 +691,15 @@ class EngineVKGS:
 
         out_dir = os.path.join(self.out_dir, f"render_{self._render_index:04d}")
         self._render_index += 1
+        buffers = ["main"] + (["depth"] if self.return_depth else [])
         result = facade.render_scene(
             scene,
             cams,
             size=size,
             spp=self._frames(),
+            buffers=buffers,
             out_dir=out_dir,
-            hdr=True,
+            image_format="raw",  # RGBA32F -> real alpha coverage in channel 3
             executable=self.executable,
             extra_args=self.extra_args,
         )
@@ -701,6 +729,19 @@ class EngineVKGS:
             opacity = np.ones(rgb.shape[:3] + (1,), dtype=np.float32)
 
         rb = {"rgb": rgb, "opacity": opacity, "rgb_buffer": rgb}
+        if self.return_depth:
+            try:
+                depth_img = result.image(position, "depth")
+            except KeyError:
+                warn_compat("return_depth=True but no depth buffer was saved; skipping depth")
+            else:
+                # Channel R = depth in NDC [0,1] (NOT metric world distance —
+                # un-project with the camera projection for view-space Z);
+                # channel G = transmittance.
+                rb["depth"] = depth_img[..., 0:1].astype(np.float32)[np.newaxis]  # (1, H, W, 1)
+                if depth_img.ndim == 3 and depth_img.shape[2] >= 2:
+                    rb["depth_transmittance"] = depth_img[..., 1:2].astype(np.float32)[np.newaxis]
+
         if self.return_torch:
             try:
                 import torch

@@ -108,6 +108,7 @@ def render_scene(
     buffers: Sequence[str] = ("main",),
     out_dir: str,
     hdr: bool = False,
+    image_format: Optional[str] = None,
     executable: Optional[str] = None,
     gpu: Optional[int] = None,
     keep_files: bool = True,
@@ -123,8 +124,12 @@ def render_scene(
       temporal pipelines need this >= the desired sample count to converge.
     - ``buffers``: which saved buffers to expect/read ("main", "depth",
       "normal", "aux1", and "ldr" when tonemapping is active).
-    - ``hdr``: save .hdr (float32 RGB, rendered into an RGBA32F color
-      buffer) instead of .png (RGBA8).
+    - ``hdr``: legacy toggle — save .hdr (float32, but stb_image_write drops
+      the alpha channel) instead of .png (RGBA8). Prefer ``image_format``.
+    - ``image_format``: explicit save format ("png" | "hdr" | "raw"); when
+      given it wins over ``hdr``. Use "raw" (RGBA32F) for lossless float that
+      **keeps alpha coverage** — ``.hdr`` drops alpha, ``.png`` keeps RGBA8
+      alpha. The ``main`` buffer's 4th channel is the per-pixel coverage.
     - ``keep_files``: when False, images are loaded eagerly and the
       intermediate files (images, .vkgs, .cfg) are deleted; the log is kept.
     """
@@ -148,14 +153,15 @@ def render_scene(
     _warn_if_underconverged(scene, indices, spp)
     vkgs_path = scene.save(os.path.join(out_dir, "scene.vkgs"))
 
-    ext = ".hdr" if hdr else ".png"
+    ext = _resolve_ext(hdr, image_format)
+    float_format = ext in (".hdr", ".raw")
     script = RenderScript(frames=spp, averages=min(spp, 32))
     # Load/settle block: the project loads during this sequence; camera
     # presets only become available after it. colorBufferFormat 2 keeps full
-    # float32 precision for .hdr readback.
+    # float32 precision for float readback (.hdr / .raw).
     script.load_block(
         frames=max(spp, _MIN_SETTLE_FRAMES),
-        colorBufferFormat=ColorBufferFormat.RGBA32F if hdr else None,
+        colorBufferFormat=ColorBufferFormat.RGBA32F if float_format else None,
     )
 
     expected: List[str] = []
@@ -167,7 +173,7 @@ def render_scene(
             os.path.join(out_dir, f"cam{position}"),
             frames=spp,
             buffers=buffers,
-            hdr=hdr,
+            ext=ext,
         )
         stems[position] = stem
         expected += [stem + BUFFER_POSTFIXES[b] + ext for b in buffers]
@@ -202,6 +208,26 @@ def render_scene(
         _remove_quiet(cfg_path)
 
     return result
+
+
+_VALID_IMAGE_FORMATS = (".png", ".jpg", ".hdr", ".raw")
+
+
+def _resolve_ext(hdr: bool, image_format: Optional[str]) -> str:
+    """Resolve the save-file extension. ``image_format`` (png/jpg/hdr/raw)
+    wins when given; otherwise fall back to the legacy ``hdr`` bool. ``.raw``
+    (RGBA32F) and ``.png`` (RGBA8) keep the alpha channel; ``.hdr`` drops it
+    (stb_image_write)."""
+    if image_format is not None:
+        ext = image_format.lower()
+        if not ext.startswith("."):
+            ext = "." + ext
+        if ext not in _VALID_IMAGE_FORMATS:
+            raise ValueError(
+                f"unknown image_format {image_format!r}; expected one of {list(_VALID_IMAGE_FORMATS)}"
+            )
+        return ext
+    return ".hdr" if hdr else ".png"
 
 
 def _warn_if_underconverged(scene: Scene, indices: Sequence[int], spp: int) -> None:

@@ -167,6 +167,59 @@ def test_gs_shadow_mask_smoke(tmp_path):
 
 
 @needs_gpu_assets
+@pytest.mark.parametrize("pipeline", [Pipeline.MESH, Pipeline.RTX])
+def test_alpha_coverage_via_raw(tmp_path, pipeline):
+    """image_format='raw' returns RGBA32F whose alpha channel is real
+    per-pixel coverage (not the old all-ones fake). Both the raster (MESH) and
+    RTX paths must populate it: RTX writes 1 - transmittance, raster writes
+    premultiplied alpha."""
+    scene = make_scene()
+    scene.renderer.pipeline = pipeline
+    preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
+    result = render_scene(
+        scene,
+        [preset],
+        size=(320, 240),
+        spp=8,
+        buffers=("main",),
+        out_dir=str(tmp_path / f"raw_{int(pipeline)}"),
+        image_format="raw",
+    )
+    path = result.path(0, "main")
+    assert path.endswith("_main.raw")
+    image = result.image(0, "main")
+    assert image.shape == (240, 320, 4) and image.dtype == np.float32
+    alpha = image[..., 3]
+    assert float(alpha.min()) >= -1e-4 and float(alpha.max()) <= 1.0 + 1e-4
+    assert float(alpha.max()) > 0.5, "dense splats should give high coverage"
+    assert float(alpha.min()) < 0.99, "alpha is all-ones; coverage not real"
+    assert float(alpha.std()) > 0.01, "alpha is ~constant; not real coverage"
+
+
+@needs_gpu_assets
+def test_depth_aov_readback(tmp_path):
+    """The depth buffer reads back as NDC [0,1] in channel R and varies across
+    the frame (near geometry < far)."""
+    scene = make_scene()
+    scene.renderer.pipeline = Pipeline.MESH
+    preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
+    result = render_scene(
+        scene,
+        [preset],
+        size=(320, 240),
+        spp=8,
+        buffers=("main", "depth"),
+        out_dir=str(tmp_path / "depth"),
+        image_format="raw",
+    )
+    depth = result.image(0, "depth")
+    assert depth.ndim == 3 and depth.shape[:2] == (240, 320)
+    d = depth[..., 0]  # NDC depth in channel R
+    assert float(d.min()) >= -1e-4 and float(d.max()) <= 1.0 + 1e-4
+    assert float(d.std()) > 0.0, "depth is constant; expected near/far variation"
+
+
+@needs_gpu_assets
 def test_saveimage_pairing_semantics(tmp_path):
     """Empirically verify the render/save pairing: saveImage captures the
     framebuffer from the END of the PREVIOUS sequence, so two capture pairs

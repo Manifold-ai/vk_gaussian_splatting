@@ -6,6 +6,7 @@ import math
 import numpy as np
 import pytest
 
+from vkgs import materials
 from vkgs.camera import THREEDGRUT_TO_VKGS, Camera, rotation_matrix_from_euler_deg
 from vkgs.constants import CameraModel, DofMode, LightType as VkgsLightType, Pipeline, ShadowsMode
 from vkgs.compat import (
@@ -598,3 +599,100 @@ def test_postprocess_contract_shapes_tonemap_gamma(engine):
     rgba[..., 3] = 0.25
     rb = engine._postprocess(_StubResult(rgba), 0)
     assert np.all(rb["opacity"] == 0.25)
+
+
+# --------------------------------------------------------------------------
+# Backend AOVs: real alpha via .raw, optional depth (Phase 1)
+# --------------------------------------------------------------------------
+
+
+class _MultiBufferResult:
+    """Duck-typed RenderResult returning a distinct array per buffer name."""
+
+    def __init__(self, images):
+        self._images = images
+
+    def image(self, position, buffer):
+        return self._images[buffer]
+
+
+def test_render_many_requests_raw_and_optional_depth(engine, monkeypatch):
+    calls = {}
+    main = np.zeros((2, 3, 4), dtype=np.float32)
+    main[..., 3] = 0.5  # real coverage in the alpha channel of the .raw dump
+    depth = np.zeros((2, 3, 4), dtype=np.float32)
+    depth[..., 0] = 0.7  # NDC depth
+    depth[..., 1] = 0.1  # transmittance
+
+    def fake_render_scene(scene, cams, **kw):
+        calls.clear()
+        calls.update(kw)
+        calls["ncams"] = len(list(cams))
+        return _MultiBufferResult({"main": main, "depth": depth})
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+
+    # Default: .raw format (keeps alpha), main only, no depth key returned.
+    rb = engine.render(Camera(eye=(3, 1, 3)))
+    assert calls["image_format"] == "raw"
+    assert calls["buffers"] == ["main"]
+    assert "depth" not in rb
+    assert np.all(rb["opacity"] == 0.5)  # coverage read from raw channel 3
+
+    # return_depth: requests depth too and returns NDC depth + transmittance.
+    engine.return_depth = True
+    rb = engine.render(Camera(eye=(3, 1, 3)))
+    assert calls["buffers"] == ["main", "depth"]
+    assert rb["depth"].shape == (1, 2, 3, 1)
+    assert np.all(rb["depth"] == 0.7)  # channel R only
+    assert np.all(rb["depth_transmittance"] == 0.1)  # channel G
+
+
+# --------------------------------------------------------------------------
+# Per-instance material override + scene bounds (Phase 1)
+# --------------------------------------------------------------------------
+
+
+def test_set_primitive_material_overrides_preset(engine):
+    # Seeded Sphere 1 is GLASS; override it with a mirror.
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    mat = engine._build_scene().mesh_instances[0].materials[0]
+    assert mat.metallic == 1.0 and mat.roughness == 0.0  # mirror, not glass
+
+
+def test_material_override_wins_on_pbr(engine):
+    # PBR's preset is None (keep authored materials); an override still wins.
+    engine.primitives.objects["Sphere 1"].primitive_type = OptixPrimitiveTypes.PBR
+    engine.set_primitive_material("Sphere 1", materials.flat((1.0, 1.0, 1.0)))
+    mat = engine._build_scene().mesh_instances[0].materials[0]
+    assert mat.emissive == (1.0, 1.0, 1.0) and mat.max_bounces == 0
+
+
+def test_material_override_reverts_with_none(engine):
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    engine.set_primitive_material("Sphere 1", None)
+    mat = engine._build_scene().mesh_instances[0].materials[0]
+    assert mat.transmission == 1.0  # back to the glass preset
+
+
+def test_material_override_dirties_cache_and_unknown_name_raises(engine):
+    cam = Camera(eye=(3, 1, 3))
+    _seed_cache(engine, cam)
+    assert not engine.is_dirty(cam)
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    assert engine.is_dirty(cam)  # material change invalidates the render cache
+    with pytest.raises(KeyError):
+        engine.set_primitive_material("no such primitive", materials.mirror())
+
+
+def test_get_scene_bounds_matches_ply_extent(engine):
+    # toy_ply fixture spans (0,0,0)..(2,2,2) -> per-axis extent (2, 2, 2).
+    assert engine.get_scene_bounds() == pytest.approx((2.0, 2.0, 2.0))
+
+
+def test_ply_scene_extent_is_publicly_exported():
+    import vkgs.compat as compat
+    from vkgs.compat import ply_scene_extent as public_extent
+
+    assert "ply_scene_extent" in compat.__all__
+    assert public_extent is ply_scene_extent
