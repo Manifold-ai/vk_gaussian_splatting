@@ -60,6 +60,14 @@ static VkResult saveRawImageToFile(VkDevice                     device,
                                    VkExtent2D                   size,
                                    const std::filesystem::path& filename);
 
+// Raw dump for single-channel R32_UINT buffers (e.g. the mesh-instance-ID AOV).
+// Header: {width, height, channels=1, bytesPerChannel=4}; body: row-major uint32.
+static VkResult saveRawUintImageToFile(VkDevice                     device,
+                                       VkImage                      dstImage,
+                                       VkDeviceMemory               dstImageMemory,
+                                       VkExtent2D                   size,
+                                       const std::filesystem::path& filename);
+
 GaussianSplattingUI::GaussianSplattingUI(nvutils::ProfilerManager*   profilerManager,
                                          nvutils::ParameterRegistry* parameterRegistry,
                                          bool*                       benchmarkEnabled)
@@ -778,10 +786,17 @@ void GaussianSplattingUI::saveBufferToFile(const std::filesystem::path& filename
     VkImage         dstImage  = {};
     VkDeviceMemory  dstMemory = {};
 
-    nvvk::imageToLinear(cmd, m_device, m_app->getPhysicalDevice(), buf.image, buf.size, dstImage, dstMemory, dstFormat);
+    // Integer AOVs (the mesh-instance-ID, R32_UINT) must NOT be blitted to a
+    // float/unorm target: imageToLinear would numerically convert and corrupt
+    // the ids. Copy same-format and write raw uint32 instead.
+    const bool     isUint    = (buf.format == VK_FORMAT_R32_UINT);
+    const VkFormat linFormat = isUint ? buf.format : dstFormat;
+    nvvk::imageToLinear(cmd, m_device, m_app->getPhysicalDevice(), buf.image, buf.size, dstImage, dstMemory, linFormat);
     m_app->submitAndWaitTempCmdBuffer(cmd);
 
-    if(isFloat && ext == ".raw")
+    if(isUint)
+      saveRawUintImageToFile(m_device, dstImage, dstMemory, buf.size, outPath);
+    else if(isFloat && ext == ".raw")
       saveRawImageToFile(m_device, dstImage, dstMemory, buf.size, outPath);
     else
       nvvk::saveImageToFile(m_device, dstImage, dstMemory, buf.size, outPath, 90);
@@ -5949,6 +5964,42 @@ static VkResult saveRawImageToFile(VkDevice                     device,
     for(uint32_t y = 0; y < size.height; y++)
     {
       fwrite(data + y * subResourceLayout.rowPitch, sizeof(float), size.width * 4, fp);
+    }
+    fclose(fp);
+  }
+
+  vkUnmapMemory(device, dstImageMemory);
+  return VK_SUCCESS;
+}
+
+// Same layout as saveRawImageToFile but for a single-channel R32_UINT source:
+// header {width, height, channels=1, bytesPerChannel=4}, body row-major uint32.
+// Used for integer AOVs (mesh-instance-ID) that must not be numerically converted.
+static VkResult saveRawUintImageToFile(VkDevice                     device,
+                                       VkImage                      dstImage,
+                                       VkDeviceMemory               dstImageMemory,
+                                       VkExtent2D                   size,
+                                       const std::filesystem::path& filename)
+{
+  VkImageSubresource  subResource{VK_IMAGE_ASPECT_COLOR_BIT, 0, 0};
+  VkSubresourceLayout subResourceLayout{};
+  vkGetImageSubresourceLayout(device, dstImage, &subResource, &subResourceLayout);
+
+  const char* data   = nullptr;
+  VkResult    result = vkMapMemory(device, dstImageMemory, 0, VK_WHOLE_SIZE, 0, (void**)&data);
+  if(result != VK_SUCCESS)
+    return result;
+  data += subResourceLayout.offset;
+
+  std::string filenameUtf8 = nvutils::utf8FromPath(filename);
+  FILE*       fp           = fopen(filenameUtf8.c_str(), "wb");
+  if(fp)
+  {
+    uint32_t header[4] = {size.width, size.height, 1, sizeof(uint32_t)};  // 1 channel, 4 bytes each
+    fwrite(header, sizeof(uint32_t), 4, fp);
+    for(uint32_t y = 0; y < size.height; y++)
+    {
+      fwrite(data + y * subResourceLayout.rowPitch, sizeof(uint32_t), size.width, fp);
     }
     fclose(fp);
   }

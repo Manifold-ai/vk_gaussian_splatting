@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .. import facade
+from .. import facade, images
 from ..camera import Camera
 from ..constants import CameraModel, DofMode, EnvMode, Pipeline, ShadowsMode
 from ..geometry import ensure_procedural
@@ -59,6 +59,11 @@ _DOF_PIPELINES = {Pipeline.RTX, Pipeline.MESH_3DGUT, Pipeline.HYBRID_3DGUT}
 # Pipelines where the GS shadow mask takes effect (RTX-traced splats only,
 # src/parameters.h:185-188): RTX(2) / HYBRID(3) / HYBRID_3DGUT(5).
 _GS_SHADOW_MASK_PIPELINES = {Pipeline.RTX, Pipeline.HYBRID, Pipeline.HYBRID_3DGUT}
+
+# Pipelines that populate the mesh-instance-id AOV: the hybrid raygen writes it
+# (shader gate HYBRID_ENABLED && NEED_SURFACE_INFO), i.e. HYBRID(3) / HYBRID_3DGUT(5).
+# Pure RTX(2) and the raster pipelines leave the AOV at the sentinel.
+_INSTANCE_ID_PIPELINES = {Pipeline.HYBRID, Pipeline.HYBRID_3DGUT}
 
 _EXPORT_PLY_HINT = (
     ".pt/.ingp checkpoints are not auto-converted (project decision B1). "
@@ -711,6 +716,65 @@ class EngineVKGS:
         self._cache_last_state(cams[-1], buffers[-1])
         self.frame_id += self._frames()
         return buffers
+
+    # ------------------------------------------------- per-product AOV masks
+
+    def _mesh_instance_order(self) -> List[str]:
+        """Primitive names in the order they become mesh instances in the built
+        scene — which equals the C++ TLAS InstanceID and the value written into
+        the instance-id AOV. Mirrors _build_scene's mesh add order: every
+        non-SHADOW_CATCHER primitive (visible or not), in insertion order.
+        Area-light quads (added afterwards) get later ids and are not products."""
+        return [
+            prim.name
+            for prim in self.primitives.objects.values()
+            if prim.primitive_type != OptixPrimitiveTypes.SHADOW_CATCHER
+        ]
+
+    def render_masks(self, camera, names: Optional[Sequence[str]] = None) -> Dict[str, np.ndarray]:
+        """Per-product visibility masks from ONE render via the instance-id AOV
+        (no per-product paint-white/paint-black passes). Returns
+        ``{name: bool (H, W)}`` — True where that product's mesh instance is the
+        visible primary surface.
+
+        Requires an RTX-traced hybrid pipeline (HYBRID / HYBRID_3DGUT) with
+        surface info; other pipelines leave the AOV at the sentinel and yield
+        empty masks (a CompatWarning is emitted). ``names`` selects a subset
+        (default: every mesh primitive)."""
+        order = self._mesh_instance_order()
+        id_of = {name: index for index, name in enumerate(order)}
+        want = list(order) if names is None else list(names)
+        unknown = [n for n in want if n not in id_of]
+        if unknown:
+            raise KeyError(f"unknown primitive(s) {unknown}; known: {sorted(id_of)}")
+        if self.pipeline not in _INSTANCE_ID_PIPELINES:
+            warn_compat(
+                f"render_masks needs an RTX-traced hybrid pipeline "
+                f"{sorted(int(p) for p in _INSTANCE_ID_PIPELINES)} to populate the "
+                f"instance-id AOV; current pipeline {int(self.pipeline)} leaves the "
+                "sentinel (all masks empty). Set engine.pipeline = "
+                "vkgs.constants.Pipeline.HYBRID."
+            )
+
+        cam, size_hint = self._prepare_camera(camera)
+        size = size_hint if size_hint is not None else self.size
+        scene = self._build_scene()
+        scene.set_camera(cam)
+        out_dir = os.path.join(self.out_dir, f"masks_{self._render_index:04d}")
+        self._render_index += 1
+        result = facade.render_scene(
+            scene,
+            [cam],
+            size=size,
+            spp=self._frames(),
+            buffers=["main", "instance_id"],
+            out_dir=out_dir,
+            image_format="raw",
+            executable=self.executable,
+            extra_args=self.extra_args,
+        )
+        aov = images.load_raw_uint(result.path(0, "instance_id"))  # (H, W) uint32
+        return {name: (aov == id_of[name]) for name in want}
 
     def _postprocess(self, result, position: int) -> Dict[str, np.ndarray]:
         image = result.image(position, "main")

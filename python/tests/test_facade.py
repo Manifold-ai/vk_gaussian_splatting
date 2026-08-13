@@ -4,9 +4,12 @@ The headless subprocess is stubbed out (HeadlessRunner.run), so these assert
 on the generated .cfg text and the predicted output paths only.
 """
 
+import struct
+
+import numpy as np
 import pytest
 
-from vkgs import facade
+from vkgs import facade, images
 from vkgs.camera import Camera
 from vkgs.facade import _resolve_ext
 from vkgs.project import Scene
@@ -73,3 +76,16 @@ def test_render_scene_png_default_no_float_colorbuffer(tmp_path, monkeypatch):
     )
     assert "--colorBufferFormat" not in captured["cfg"]
     assert all(p.endswith("_main.png") for p in captured["expected"])
+
+
+def test_load_raw_uint_roundtrip(tmp_path):
+    # header {w, h, channels=1, bytesPerChannel=4} + row-major uint32 payload
+    w, h = 3, 2
+    vals = np.array([[10, 0xFFFFFFFF, 7], [0, 0xFFFFFFFF, 2]], dtype=np.uint32)
+    path = tmp_path / "cam0_instance_id.raw"
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4I", w, h, 1, 4))
+        f.write(vals.tobytes())
+    got = images.load_raw_uint(str(path))
+    assert got.shape == (2, 3) and got.dtype == np.uint32
+    assert np.array_equal(got, vals)  # sentinel 0xFFFFFFFF preserved, not float-reinterpreted

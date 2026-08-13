@@ -118,7 +118,7 @@ void GaussianSplatting::onAttach(nvapp::Application* app)
   m_gBuffers.init({
       .allocator      = &m_alloc,
       .colorFormats   = {prmRender.colorFormat, prmRender.colorFormat, prmRender.colorFormat, m_normalFormat,
-                         m_rasterDepthFormat, m_splatIdFormat, VK_FORMAT_R8G8B8A8_UNORM},
+                         m_rasterDepthFormat, m_splatIdFormat, VK_FORMAT_R8G8B8A8_UNORM, m_meshInstanceIdFormat},
       .depthFormat    = m_depthFormat,
       .imageSampler   = m_sampler,
       .descriptorPool = m_app->getTextureDescriptorPool(),
@@ -868,6 +868,36 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
       vkCmdPipelineBarrier2(cmd, &clearDepInfo);
     }
 
+    // Clear the mesh-instance-ID AOV to its sentinel every frame. It is a
+    // storage image (never a color attachment) and stays in GENERAL layout;
+    // the RTX/hybrid raygen overwrites the pixels it covers (writeToGBuffers).
+    {
+      VkClearColorValue       instClear = {};
+      instClear.uint32[0]               = 0xFFFFFFFFu;  // sentinel: background / no mesh
+      VkImageSubresourceRange instRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+      vkCmdClearColorImage(cmd, m_gBuffers.getColorImage(COLOR_MESH_INSTANCE_ID), VK_IMAGE_LAYOUT_GENERAL, &instClear, 1, &instRange);
+
+      VkImageMemoryBarrier2 instBarrier{
+          .sType               = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
+          .srcStageMask        = VK_PIPELINE_STAGE_2_CLEAR_BIT,
+          .srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
+          .dstStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+          .dstAccessMask       = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+          .oldLayout           = VK_IMAGE_LAYOUT_GENERAL,
+          .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
+          .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
+          .image               = m_gBuffers.getColorImage(COLOR_MESH_INSTANCE_ID),
+          .subresourceRange    = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1},
+      };
+      VkDependencyInfo instDepInfo{
+          .sType                   = VK_STRUCTURE_TYPE_DEPENDENCY_INFO,
+          .imageMemoryBarrierCount = 1,
+          .pImageMemoryBarriers    = &instBarrier,
+      };
+      vkCmdPipelineBarrier2(cmd, &instDepInfo);
+    }
+
     vkCmdBeginRendering(cmd, &renderingInfo);
 
     vkCmdSetViewportWithCount(cmd, 1, &viewport);
@@ -1271,7 +1301,7 @@ void GaussianSplatting::processGBufferUpdateRequests()
   m_gBuffers.init({
       .allocator      = &m_alloc,
       .colorFormats   = {prmRender.colorFormat, prmRender.colorFormat, prmRender.colorFormat, m_normalFormat,
-                         m_rasterDepthFormat, m_splatIdFormat, VK_FORMAT_R8G8B8A8_UNORM},
+                         m_rasterDepthFormat, m_splatIdFormat, VK_FORMAT_R8G8B8A8_UNORM, m_meshInstanceIdFormat},
       .depthFormat    = m_depthFormat,
       .imageSampler   = m_sampler,
       .descriptorPool = m_app->getTextureDescriptorPool(),
@@ -2621,6 +2651,9 @@ void GaussianSplatting::initPipelines()
                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT);
   m_descriptorBindings.addBinding(BINDING_RASTER_SPLATID, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
                                   VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT);
+  // Per-pixel visible mesh-instance ID AOV (written by the RTX/hybrid raygen)
+  m_descriptorBindings.addBinding(BINDING_RASTER_MESH_INSTANCE_ID, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1,
+                                  VK_SHADER_STAGE_FRAGMENT_BIT | VK_SHADER_STAGE_RAYGEN_BIT_KHR | VK_SHADER_STAGE_COMPUTE_BIT);
   m_descriptorBindings.addBinding(BINDING_RASTER_COLOR, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
   m_descriptorBindings.addBinding(BINDING_DEFERRED_OUTPUT, VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, 1, VK_SHADER_STAGE_COMPUTE_BIT);
   // AUX buffers for temporal accumulation (deferred shading selects based on frameSampleId)
@@ -2706,6 +2739,8 @@ void GaussianSplatting::initPipelines()
                         m_gBuffers.getColorImageView(COLOR_RASTER_DEPTH), VK_IMAGE_LAYOUT_GENERAL);
   writeContainer.append(m_descriptorBindings.getWriteSet(BINDING_RASTER_SPLATID, m_descriptorSet),
                         m_gBuffers.getColorImageView(COLOR_RASTER_SPLATID), VK_IMAGE_LAYOUT_GENERAL);
+  writeContainer.append(m_descriptorBindings.getWriteSet(BINDING_RASTER_MESH_INSTANCE_ID, m_descriptorSet),
+                        m_gBuffers.getColorImageView(COLOR_MESH_INSTANCE_ID), VK_IMAGE_LAYOUT_GENERAL);
   // Deferred shading: bind both MAIN and AUX buffers, shader selects based on frameSampleId
   writeContainer.append(m_descriptorBindings.getWriteSet(BINDING_RASTER_COLOR, m_descriptorSet),
                         m_gBuffers.getColorImageView(COLOR_MAIN), VK_IMAGE_LAYOUT_GENERAL);
@@ -3536,6 +3571,8 @@ void GaussianSplatting::updateRtDescriptorSet()
                           m_gBuffers.getColorImageView(COLOR_RASTER_DEPTH), VK_IMAGE_LAYOUT_GENERAL);
     writeContainer.append(m_descriptorBindings.getWriteSet(BINDING_RASTER_SPLATID, m_descriptorSet),
                           m_gBuffers.getColorImageView(COLOR_RASTER_SPLATID), VK_IMAGE_LAYOUT_GENERAL);
+    writeContainer.append(m_descriptorBindings.getWriteSet(BINDING_RASTER_MESH_INSTANCE_ID, m_descriptorSet),
+                          m_gBuffers.getColorImageView(COLOR_MESH_INSTANCE_ID), VK_IMAGE_LAYOUT_GENERAL);
     // Deferred shading: bind both MAIN and AUX buffers, shader selects based on frameSampleId
     writeContainer.append(m_descriptorBindings.getWriteSet(BINDING_RASTER_COLOR, m_descriptorSet),
                           m_gBuffers.getColorImageView(COLOR_MAIN), VK_IMAGE_LAYOUT_GENERAL);
@@ -4161,6 +4198,10 @@ std::vector<BufferDumpInfo> GaussianSplatting::getAllDumpableBuffers() const
 
   // Raster depth (always)
   buffers.push_back({m_gBuffers.getColorImage(COLOR_RASTER_DEPTH), m_rasterDepthFormat, gBufSize, "_depth"});
+
+  // Per-pixel visible mesh-instance ID (always dumped). Sentinel 0xFFFFFFFF = background/no mesh.
+  // Only the RTX-traced (hybrid) pipelines populate it today; other pipelines leave the sentinel.
+  buffers.push_back({m_gBuffers.getColorImage(COLOR_MESH_INSTANCE_ID), m_meshInstanceIdFormat, gBufSize, "_instance_id"});
 
   // LDR tone-mapped output (only when tonemapping is active)
   if(m_tonemapperData.isActive)

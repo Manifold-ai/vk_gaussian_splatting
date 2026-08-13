@@ -220,6 +220,43 @@ def test_depth_aov_readback(tmp_path):
 
 
 @needs_gpu_assets
+def test_instance_id_aov(tmp_path):
+    """The mesh-instance-ID AOV (HYBRID pipeline) marks the visible mesh's
+    pixels with its instance index (0 for the only mesh) as an R32_UINT .raw,
+    and leaves the sentinel 0xFFFFFFFF for splat/background pixels. If this
+    fails all-sentinel, the shader gate (HYBRID_ENABLED && NEED_SURFACE_INFO)
+    is not active for this render — see the Phase 2 build notes."""
+    from vkgs.images import load_raw_uint
+
+    mesh = write_sphere_obj(str(tmp_path / "sphere.obj"), radius=1.0)
+    scene = Scene()
+    scene.renderer.pipeline = Pipeline.HYBRID
+    scene.add_splats(TEST_PLY)
+    scene.add_mesh(
+        mesh,
+        position=(0.0, 0.0, 0.0),
+        scale=0.5,
+        materials=[Material(name="m", base_color=(1.0, 1.0, 1.0), roughness=1.0)],
+    )
+    preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
+    result = render_scene(
+        scene,
+        [preset],
+        size=(320, 240),
+        spp=8,
+        buffers=("main", "instance_id"),
+        out_dir=str(tmp_path / "iid"),
+        image_format="raw",
+    )
+    aov_path = result.path(0, "instance_id")
+    assert aov_path.endswith("_instance_id.raw")
+    aov = load_raw_uint(aov_path)
+    assert aov.shape == (240, 320) and aov.dtype == np.uint32
+    assert int((aov == 0).sum()) > 0, "mesh instance id 0 not present in the AOV"
+    assert int((aov == 0xFFFFFFFF).sum()) > 0, "no background sentinel pixels in the AOV"
+
+
+@needs_gpu_assets
 def test_saveimage_pairing_semantics(tmp_path):
     """Empirically verify the render/save pairing: saveImage captures the
     framebuffer from the END of the PREVIOUS sequence, so two capture pairs

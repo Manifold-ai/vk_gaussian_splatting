@@ -48,6 +48,7 @@
 [[vk::binding(BINDING_RASTER_NORMAL, 0)]] RWTexture2D<float4> rasterNormalBuffer;
 [[vk::binding(BINDING_RASTER_DEPTH, 0)]] RWTexture2D<float2> rasterDepthBuffer;  // R=depth, G=transmittance
 [[vk::binding(BINDING_RASTER_SPLATID, 0)]] RWTexture2D<uint> rasterSplatIdBuffer;
+[[vk::binding(BINDING_RASTER_MESH_INSTANCE_ID, 0)]] RWTexture2D<uint> rasterInstanceIdBuffer;  // primary mesh-instance ID
 #endif
 // TODO to be removed, just for debug readback
 [[vk::binding(BINDING_INDIRECT_BUFFER, 0)]] RWStructuredBuffer<IndirectParams> indirectBuffer;
@@ -116,8 +117,9 @@ struct PixelData
   int    isoSurfSplatSetId = PAYLOAD_INVALID_ID;
 
   // Primary surface depth (bounce 0 only, for depth buffer write)
-  float  primaryHitDist = PAYLOAD_INF_DISTANCE;
-  float3 primaryHitPos  = float3(0.0);
+  float  primaryHitDist  = PAYLOAD_INF_DISTANCE;
+  float3 primaryHitPos   = float3(0.0);
+  int    primaryHitObjId = PAYLOAD_INVALID_ID;  // primary (bounce-0) mesh instance index, for the instance-id AOV
 
   bool    closestParticleFound         = false;
   int     closestParticleGlobalId      = PAYLOAD_INVALID_ID;  // Global splat ID across all instances
@@ -666,8 +668,9 @@ void traceBounceRayMeshes(in int           bounce,
 
     if(bounce == 0)
     {
-      pixel.primaryHitDist = tMax;
-      pixel.primaryHitPos  = rayOrigin + tMax * rayDirection;
+      pixel.primaryHitDist  = tMax;
+      pixel.primaryHitPos   = rayOrigin + tMax * rayDirection;
+      pixel.primaryHitObjId = objId;  // primary visible mesh instance -> instance-id AOV
     }
   }
 }
@@ -1996,6 +1999,14 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
   {
     depthBuffer[pixelId] = 1.0;  // Far plane in NDC - no hit
   }
+#endif
+
+#if HYBRID_ENABLED && NEED_SURFACE_INFO
+  // Per-pixel visible mesh-instance ID AOV: the primary (bounce-0) mesh hit's
+  // object index (== TLAS InstanceID == Scene.mesh_instances order), else the
+  // sentinel for background / splat-only pixels.
+  rasterInstanceIdBuffer[pixelId] =
+      (pixel.primaryHitObjId != PAYLOAD_INVALID_ID) ? uint(pixel.primaryHitObjId) : 0xFFFFFFFFu;
 #endif
 
   //

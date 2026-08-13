@@ -241,6 +241,7 @@ enum class SplatTexIndex : uint32_t
 #define BINDING_DEFERRED_OUTPUT 28      // Deferred shading: output image
 #define BINDING_RASTER_COLOR_AUX 29     // Rasterization: aux color buffer (for temporal accumulation)
 #define BINDING_DEFERRED_OUTPUT_AUX 30  // Deferred shading: aux output image (for temporal accumulation)
+#define BINDING_RASTER_MESH_INSTANCE_ID 31  // Per-pixel visible mesh-instance ID AOV (R32_UINT, sentinel 0xFFFFFFFF)
 
 // bindings for set 1 of RTX
 #define RTX_BINDING_OUTIMAGE 0     // Ray tracer output image

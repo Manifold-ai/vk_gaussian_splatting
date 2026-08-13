@@ -182,6 +182,7 @@ BUFFER_POSTFIXES = {
     "comparison": "_comparison",  # conditional: image compare active
     "normal": "_normal",          # always
     "depth": "_depth",            # always
+    "instance_id": "_instance_id",  # always dumped; R32_UINT, populated only by RTX-traced (hybrid) pipelines
     "ldr": "_ldr",                # conditional: tonemapping active
 }
 

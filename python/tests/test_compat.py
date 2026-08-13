@@ -2,6 +2,7 @@
 
 import json
 import math
+import struct
 
 import numpy as np
 import pytest
@@ -696,3 +697,77 @@ def test_ply_scene_extent_is_publicly_exported():
 
     assert "ply_scene_extent" in compat.__all__
     assert public_extent is ply_scene_extent
+
+
+# --------------------------------------------------------------------------
+# Per-product instance-id masks (Phase 2)
+# --------------------------------------------------------------------------
+
+
+def _write_instance_id_raw(path, ids):
+    """Write a single-channel R32_UINT .raw dump matching saveRawUintImageToFile
+    (header {w, h, 1, 4} + row-major uint32)."""
+    ids = np.asarray(ids, dtype=np.uint32)
+    h, w = ids.shape
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4I", w, h, 1, 4))
+        f.write(ids.tobytes())
+
+
+def test_mesh_instance_order_matches_add_order(engine):
+    # Seeded scene already has "Sphere 1"; add two more products.
+    engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.DIFFUSE)  # Sphere 2
+    engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.MIRROR)   # Sphere 3
+    assert engine._mesh_instance_order() == ["Sphere 1", "Sphere 2", "Sphere 3"]
+
+
+def test_render_masks_maps_instance_ids(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.HYBRID
+    engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.DIFFUSE)  # Sphere 2 -> id 1
+    # instance-id AOV: left half id 0, right half id 1, else sentinel
+    ids = np.full((2, 4), 0xFFFFFFFF, dtype=np.uint32)
+    ids[:, :2] = 0
+    ids[:, 2:] = 1
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, ids)
+
+    captured = {}
+
+    class _Result:
+        def path(self, position, buffer):
+            assert buffer == "instance_id"
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+    masks = engine.render_masks(Camera(eye=(3, 1, 3)))
+
+    assert captured["buffers"] == ["main", "instance_id"]
+    assert captured["image_format"] == "raw"
+    assert set(masks) == {"Sphere 1", "Sphere 2"}
+    assert masks["Sphere 1"].dtype == bool
+    assert masks["Sphere 1"].tolist() == [[True, True, False, False], [True, True, False, False]]
+    assert masks["Sphere 2"].tolist() == [[False, False, True, True], [False, False, True, True]]
+
+
+def test_render_masks_rejects_unknown_name(engine):
+    with pytest.raises(KeyError):
+        engine.render_masks(Camera(eye=(3, 1, 3)), names=["no such product"])
+
+
+def test_render_masks_warns_on_non_hybrid_pipeline(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.MESH  # raster -> AOV never populated
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, np.full((1, 1), 0xFFFFFFFF, dtype=np.uint32))
+
+    class _Result:
+        def path(self, position, buffer):
+            return str(aov_path)
+
+    monkeypatch.setattr("vkgs.facade.render_scene", lambda *a, **k: _Result())
+    with pytest.warns(CompatWarning, match="hybrid"):
+        masks = engine.render_masks(Camera(eye=(3, 1, 3)))
+    assert not masks["Sphere 1"].any()  # all sentinel -> empty mask
