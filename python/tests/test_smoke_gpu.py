@@ -175,6 +175,12 @@ def test_alpha_coverage_via_raw(tmp_path, pipeline):
     premultiplied alpha."""
     scene = make_scene()
     scene.renderer.pipeline = pipeline
+    # Real per-pixel coverage lives on the front-to-back surface path: the
+    # raster frag only emits premultiplied alpha under FRONT_TO_BACK &&
+    # NEED_SURFACE_INFO (else the 4th channel is an unbounded BTF blend
+    # accumulator). needSurfaceInfo() gates on force_surfel, so enable it —
+    # this mirrors how the backend always renders (force_surfel on).
+    scene.renderer.force_surfel = True
     preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
     result = render_scene(
         scene,
@@ -202,6 +208,10 @@ def test_depth_aov_readback(tmp_path):
     the frame (near geometry < far)."""
     scene = make_scene()
     scene.renderer.pipeline = Pipeline.MESH
+    # The depth AOV (depthTransmittanceBuffer) is written only inside the raster
+    # frag's FRONT_TO_BACK && NEED_SURFACE_INFO branch; without a needSurfaceInfo
+    # trigger it stays all-zero. force_surfel flips it on (as the backend does).
+    scene.renderer.force_surfel = True
     preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
     result = render_scene(
         scene,
@@ -231,6 +241,11 @@ def test_instance_id_aov(tmp_path):
     mesh = write_sphere_obj(str(tmp_path / "sphere.obj"), radius=1.0)
     scene = Scene()
     scene.renderer.pipeline = Pipeline.HYBRID
+    # The instance-id write is gated HYBRID_ENABLED && NEED_SURFACE_INFO; with no
+    # lighting/shadow-mask/surfel trigger the AOV is compiled inert and reads
+    # all-sentinel. force_surfel satisfies needSurfaceInfo() (the backend keeps
+    # it on for every product/AOV pass).
+    scene.renderer.force_surfel = True
     scene.add_splats(TEST_PLY)
     scene.add_mesh(
         mesh,
