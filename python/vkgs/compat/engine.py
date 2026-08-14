@@ -731,6 +731,69 @@ class EngineVKGS:
             if prim.primitive_type != OptixPrimitiveTypes.SHADOW_CATCHER
         ]
 
+    _AOV_BUFFERS = ("main", "depth", "instance_id")
+
+    def render_aovs(
+        self,
+        camera,
+        buffers: Sequence[str] = ("main", "depth", "instance_id"),
+        spp: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
+        """ONE raw render returning the requested AOV arrays.
+
+        Returns a dict holding only the requested buffers as numpy arrays —
+        ``main`` (H, W, 4) float32 RGBA with real coverage alpha, ``depth``
+        (H, W, C) float32 (channel R = NDC [0,1] depth, G = transmittance of
+        the splats in front of the primary mesh hit), ``instance_id`` (H, W)
+        uint32 (sentinel 0xFFFFFFFF) — plus ``"mesh_instance_order"``: the
+        primitive names in TLAS-InstanceID order for id->name mapping.
+
+        ``instance_id`` requires an RTX-traced hybrid pipeline
+        (HYBRID / HYBRID_3DGUT); other pipelines leave it at the sentinel
+        (a CompatWarning is emitted). ``spp`` overrides the accumulated
+        frame count for this render only. The exe run always dumps the
+        ``main`` buffer; only the buffers listed in ``buffers`` are loaded."""
+        want = list(dict.fromkeys(buffers))
+        unknown = [b for b in want if b not in self._AOV_BUFFERS]
+        if unknown:
+            raise ValueError(
+                f"unsupported AOV buffer(s) {unknown}; expected {list(self._AOV_BUFFERS)}"
+            )
+        if "instance_id" in want and self.pipeline not in _INSTANCE_ID_PIPELINES:
+            warn_compat(
+                f"the instance-id AOV needs an RTX-traced hybrid pipeline "
+                f"{sorted(int(p) for p in _INSTANCE_ID_PIPELINES)}; current pipeline "
+                f"{int(self.pipeline)} leaves the sentinel (all masks empty). Set "
+                "engine.pipeline = vkgs.constants.Pipeline.HYBRID."
+            )
+
+        cam, size_hint = self._prepare_camera(camera)
+        size = size_hint if size_hint is not None else self.size
+        scene = self._build_scene()
+        scene.set_camera(cam)
+        out_dir = os.path.join(self.out_dir, f"aovs_{self._render_index:04d}")
+        self._render_index += 1
+        request = ["main"] + [b for b in want if b != "main"]
+        result = facade.render_scene(
+            scene,
+            [cam],
+            size=size,
+            spp=int(spp) if spp is not None else self._frames(),
+            buffers=request,
+            out_dir=out_dir,
+            image_format="raw",
+            executable=self.executable,
+            extra_args=self.extra_args,
+        )
+        out: Dict[str, np.ndarray] = {"mesh_instance_order": self._mesh_instance_order()}
+        if "main" in want:
+            out["main"] = np.asarray(result.image(0, "main"), dtype=np.float32)
+        if "depth" in want:
+            out["depth"] = np.asarray(result.image(0, "depth"), dtype=np.float32)
+        if "instance_id" in want:
+            out["instance_id"] = images.load_raw_uint(result.path(0, "instance_id"))
+        return out
+
     def render_masks(self, camera, names: Optional[Sequence[str]] = None) -> Dict[str, np.ndarray]:
         """Per-product visibility masks from ONE render via the instance-id AOV
         (no per-product paint-white/paint-black passes). Returns
@@ -747,33 +810,7 @@ class EngineVKGS:
         unknown = [n for n in want if n not in id_of]
         if unknown:
             raise KeyError(f"unknown primitive(s) {unknown}; known: {sorted(id_of)}")
-        if self.pipeline not in _INSTANCE_ID_PIPELINES:
-            warn_compat(
-                f"render_masks needs an RTX-traced hybrid pipeline "
-                f"{sorted(int(p) for p in _INSTANCE_ID_PIPELINES)} to populate the "
-                f"instance-id AOV; current pipeline {int(self.pipeline)} leaves the "
-                "sentinel (all masks empty). Set engine.pipeline = "
-                "vkgs.constants.Pipeline.HYBRID."
-            )
-
-        cam, size_hint = self._prepare_camera(camera)
-        size = size_hint if size_hint is not None else self.size
-        scene = self._build_scene()
-        scene.set_camera(cam)
-        out_dir = os.path.join(self.out_dir, f"masks_{self._render_index:04d}")
-        self._render_index += 1
-        result = facade.render_scene(
-            scene,
-            [cam],
-            size=size,
-            spp=self._frames(),
-            buffers=["main", "instance_id"],
-            out_dir=out_dir,
-            image_format="raw",
-            executable=self.executable,
-            extra_args=self.extra_args,
-        )
-        aov = images.load_raw_uint(result.path(0, "instance_id"))  # (H, W) uint32
+        aov = self.render_aovs(camera, buffers=("instance_id",))["instance_id"]
         return {name: (aov == id_of[name]) for name in want}
 
     def _postprocess(self, result, position: int) -> Dict[str, np.ndarray]:

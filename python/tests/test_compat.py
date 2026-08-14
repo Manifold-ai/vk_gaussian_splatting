@@ -758,6 +758,75 @@ def test_render_masks_rejects_unknown_name(engine):
         engine.render_masks(Camera(eye=(3, 1, 3)), names=["no such product"])
 
 
+def test_render_aovs_returns_requested_buffers(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.HYBRID
+    ids = np.zeros((2, 4), dtype=np.uint32)
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, ids)
+    main = np.zeros((2, 4, 4), dtype=np.float32)
+    main[..., 3] = 0.5
+    depth = np.zeros((2, 4, 4), dtype=np.float32)
+    depth[..., 0] = 0.25  # NDC depth in R
+    depth[..., 1] = 0.75  # transmittance in G
+
+    captured = {}
+
+    class _Result:
+        def image(self, position, buffer):
+            assert position == 0
+            return {"main": main, "depth": depth}[buffer]
+
+        def path(self, position, buffer):
+            assert buffer == "instance_id"
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+    out = engine.render_aovs(Camera(eye=(3, 1, 3)), spp=8)
+
+    assert captured["buffers"] == ["main", "depth", "instance_id"]
+    assert captured["image_format"] == "raw"
+    assert captured["spp"] == 8
+    assert out["mesh_instance_order"] == ["Sphere 1"]
+    assert out["main"].shape == (2, 4, 4)
+    assert np.allclose(out["main"][..., 3], 0.5)
+    assert np.allclose(out["depth"][..., 1], 0.75)
+    assert out["instance_id"].dtype == np.uint32
+
+
+def test_render_aovs_loads_only_requested_buffers(engine, tmp_path, monkeypatch):
+    # instance_id-only request must still ask the exe for "main" (dump anchor)
+    # but must not try to load it — the mocked result has no image().
+    engine.pipeline = Pipeline.HYBRID
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, np.zeros((1, 1), dtype=np.uint32))
+
+    captured = {}
+
+    class _Result:
+        def path(self, position, buffer):
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+    out = engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("instance_id",))
+
+    assert captured["buffers"] == ["main", "instance_id"]
+    assert "main" not in out
+    assert out["instance_id"].shape == (1, 1)
+
+
+def test_render_aovs_rejects_unknown_buffer(engine):
+    with pytest.raises(ValueError):
+        engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("main", "normal"))
+
+
 def test_render_masks_warns_on_non_hybrid_pipeline(engine, tmp_path, monkeypatch):
     engine.pipeline = Pipeline.MESH  # raster -> AOV never populated
     aov_path = tmp_path / "cam0_instance_id.raw"
