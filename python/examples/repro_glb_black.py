@@ -114,7 +114,7 @@ def render_once(ply, glb, pipeline, with_glb, out_dir):
         buffers=("main",),
         out_dir=out_dir,
         image_format="raw",          # RGBA32F -> exact black detection
-        extra_args=("--validation",),  # surface Vulkan validation errors in the log
+        extra_args=("--validation", "1"),  # bool[1]: needs an explicit value -> surface Vulkan validation errors
     )
     img = result.image(0, "main")     # (H, W, 4) float32
     rgb_max = float(img[..., :3].max())
