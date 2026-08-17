@@ -673,6 +673,11 @@ void MeshManagerVk::rtxInitAccelerationStructures()
     NVVK_CHECK(rtAccelerationStructures.tlasSubmitBuildAndWait(tlasInstances, VK_BUILD_ACCELERATION_STRUCTURE_PREFER_FAST_TRACE_BIT_KHR
                                                                                   | VK_BUILD_ACCELERATION_STRUCTURE_ALLOW_UPDATE_BIT_KHR));
   }
+
+  // [MESH-BLACK-DIAG] confirm the mesh BLAS/TLAS were built — hybrid RTX mesh shading depends on this.
+  LOGW("[MESH-BLACK-DIAG] rtxInitAccelerationStructures: meshes=%zu instances=%zu blasSet=%zu tlas=%s\n", meshes.size(),
+       instances.size(), rtAccelerationStructures.blasSet.size(),
+       rtAccelerationStructures.tlas.accel ? "built" : "NULL");
 }
 
 void MeshManagerVk::rtxUpdateTopLevelAccelerationStructure()

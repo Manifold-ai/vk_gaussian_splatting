@@ -667,6 +667,25 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
 {
   NVVK_DBG_SCOPE(cmd);
 
+  // [MESH-BLACK-DIAG] log-on-change: top-of-frame gating + surface-info/FTB/pipeline state.
+  // Reveals whether the frame is skipped (gbufReinit/converged/!shadersValid) and whether adding
+  // a mesh flipped the scene into needSurfaceInfo()/FTB or a different pipeline.
+  {
+    static int  s_lastDiag   = -1;
+    const bool  dNeedSurf    = needSurfaceInfo();
+    const bool  dUseFTB      = dNeedSurf && (prmRaster.sortingMethod != SORTING_STOCHASTIC_SPLAT);
+    const bool  dHasMeshes   = !m_assets.meshes.instances.empty();
+    const int   diagState    = (m_requestGBufferReinit ? 1 : 0) | (temporalConverged ? 2 : 0) | (m_shaders.valid ? 4 : 0)
+                            | (dNeedSurf ? 8 : 0) | (dUseFTB ? 16 : 0) | (dHasMeshes ? 32 : 0) | ((int)prmSelectedPipeline << 6);
+    if(diagState != s_lastDiag)
+    {
+      LOGW("[MESH-BLACK-DIAG] frame: gbufReinit=%d converged=%d shadersValid=%d needSurfaceInfo=%d useFTB=%d hasMeshes=%d selected=%d splatCount=%u\n",
+           (int)m_requestGBufferReinit, (int)temporalConverged, (int)m_shaders.valid, (int)dNeedSurf, (int)dUseFTB,
+           (int)dHasMeshes, (int)prmSelectedPipeline, splatCount);
+      s_lastDiag = diagState;
+    }
+  }
+
   // Skip rendering while GBuffer reinit is pending (deferred two-pass).
   // The pipeline color format may already reflect the new prmRender.colorFormat
   // while the GBuffer images still use the old format, causing a validation error.
@@ -910,6 +929,19 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
     //   2. Splats FTB: depth test against mesh, accumulate color + transmittance
     //   3. Mesh color pass: read transmittance, add mesh_color * transmittance
     const bool hasMeshes = m_shaders.valid && !m_assets.meshes.instances.empty() && !raytraceMeshDepth;
+
+    // [MESH-BLACK-DIAG] log-on-change: does the raster path actually draw meshes, and via which mode?
+    {
+      static int s_lastDiag = -1;
+      const int  diagState  = (hasMeshes ? 1 : 0) | (useFTB ? 2 : 0) | (raytraceMeshDepth ? 4 : 0)
+                          | (m_assets.meshes.instances.empty() ? 0 : 8);
+      if(diagState != s_lastDiag)
+      {
+        LOGW("[MESH-BLACK-DIAG] raster mesh-draw: hasMeshes=%d useFTB=%d raytraceMeshDepth=%d instances=%zu (BTF path drawn when !useFTB)\n",
+             (int)hasMeshes, (int)useFTB, (int)raytraceMeshDepth, m_assets.meshes.instances.size());
+        s_lastDiag = diagState;
+      }
+    }
 
     if(useFTB)
     {
@@ -1413,6 +1445,9 @@ void GaussianSplatting::processUpdateRequests(bool forceAll)
   bool hasParticlesNow = m_assets.splatSets.getEffectiveGlobalSplatCount() > 0;
   if(hasMeshesNow != m_lastHadMeshes || hasParticlesNow != m_lastHadParticles)
   {
+    // [MESH-BLACK-DIAG] scene-composition change forces a full shader + pipeline rebuild
+    LOGW("[MESH-BLACK-DIAG] scene-composition change: meshes %d->%d, particles %d->%d -> requesting shader/pipeline rebuild\n",
+         (int)m_lastHadMeshes, (int)hasMeshesNow, (int)m_lastHadParticles, (int)hasParticlesNow);
     m_requestUpdateShaders = true;
     m_lastHadMeshes        = hasMeshesNow;
     m_lastHadParticles     = hasParticlesNow;
@@ -1491,6 +1526,14 @@ void GaussianSplatting::processUpdateRequests(bool forceAll)
       // Upload paths already synchronize via submitAndWaitTempCmdBuffer; a global device
       // idle here has hung some Intel drivers after large splat uploads.
       m_requestUpdateShaders = false;
+
+      // [MESH-BLACK-DIAG] report which pipeline objects survived the mesh-triggered rebuild.
+      // If a MESH/HYBRID pipeline is NULL while it is the selected pipeline, drawSplatPrimitives
+      // and drawMeshPrimitives will silently early-return -> full black frame.
+      LOGW("[MESH-BLACK-DIAG] post-rebuild pipelines: selected=%d shadersValid=%d | GsVert=%d GsMesh=%d 3dgutMesh=%d | SceneMesh=%d MeshFtbColor=%d\n",
+           (int)prmSelectedPipeline, (int)m_shaders.valid, (int)(m_graphicsPipelineGsVert != VK_NULL_HANDLE),
+           (int)(m_graphicsPipelineGsMesh != VK_NULL_HANDLE), (int)(m_graphicsPipeline3dgutMesh != VK_NULL_HANDLE),
+           (int)(m_graphicsPipelineMesh != VK_NULL_HANDLE), (int)(m_graphicsPipelineMeshFtbColor != VK_NULL_HANDLE));
     }
     else
     {
@@ -1997,17 +2040,40 @@ void GaussianSplatting::drawSplatPrimitives(VkCommandBuffer cmd, const uint32_t 
 {
   NVVK_DBG_SCOPE(cmd);
 
+  // [MESH-BLACK-DIAG] log-on-change: entry state that decides whether splats get drawn at all.
+  {
+    static int s_lastDiag = -1;
+    const int  diagState  = ((int)prmSelectedPipeline) | ((m_graphicsPipelineGsVert != VK_NULL_HANDLE) ? (1 << 8) : 0)
+                        | ((m_graphicsPipelineGsMesh != VK_NULL_HANDLE) ? (1 << 9) : 0)
+                        | ((m_graphicsPipeline3dgutMesh != VK_NULL_HANDLE) ? (1 << 10) : 0);
+    if(diagState != s_lastDiag)
+    {
+      LOGW("[MESH-BLACK-DIAG] drawSplatPrimitives entry: selected=%d GsVert=%d GsMesh=%d 3dgutMesh=%d splatCount=%u\n",
+           (int)prmSelectedPipeline, (int)(m_graphicsPipelineGsVert != VK_NULL_HANDLE),
+           (int)(m_graphicsPipelineGsMesh != VK_NULL_HANDLE), (int)(m_graphicsPipeline3dgutMesh != VK_NULL_HANDLE), splatCount);
+      s_lastDiag = diagState;
+    }
+  }
+
   // Early exit if the pipeline for the active raster path is missing (async load or create failure).
   if(prmSelectedPipeline == PIPELINE_VERT)
   {
     if(m_graphicsPipelineGsVert == VK_NULL_HANDLE)
+    {
+      static bool s_warnVert = false;  // [MESH-BLACK-DIAG]
+      if(!s_warnVert) { LOGW("[MESH-BLACK-DIAG] drawSplatPrimitives: SKIP splats — GsVert pipeline NULL (selected=VERT)\n"); s_warnVert = true; }
       return;
+    }
   }
   else if(prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_HYBRID
           || prmSelectedPipeline == PIPELINE_MESH_3DGUT || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT)
   {
     if(m_graphicsPipelineGsMesh == VK_NULL_HANDLE && m_graphicsPipeline3dgutMesh == VK_NULL_HANDLE)
+    {
+      static bool s_warnMesh = false;  // [MESH-BLACK-DIAG]
+      if(!s_warnMesh) { LOGW("[MESH-BLACK-DIAG] drawSplatPrimitives: SKIP splats — GsMesh & 3dgutMesh pipelines both NULL (selected=%d)\n", (int)prmSelectedPipeline); s_warnMesh = true; }
       return;
+    }
   }
 
   // Do we need to activate depth test and Write ?
@@ -2120,11 +2186,19 @@ void GaussianSplatting::drawMeshPrimitives(VkCommandBuffer cmd, bool ftbColorPas
 
   // Early exit if pipeline not initialized (can happen during async loading)
   if(m_graphicsPipelineMesh == VK_NULL_HANDLE)
+  {
+    static bool s_warnMeshPipe = false;  // [MESH-BLACK-DIAG]
+    if(!s_warnMeshPipe) { LOGW("[MESH-BLACK-DIAG] drawMeshPrimitives: SKIP mesh — m_graphicsPipelineMesh (SceneMesh) NULL\n"); s_warnMeshPipe = true; }
     return;
+  }
 
   // For FTB color pass, use the additive blend pipeline
   if(ftbColorPass && m_graphicsPipelineMeshFtbColor == VK_NULL_HANDLE)
+  {
+    static bool s_warnMeshFtb = false;  // [MESH-BLACK-DIAG]
+    if(!s_warnMeshFtb) { LOGW("[MESH-BLACK-DIAG] drawMeshPrimitives: SKIP mesh FTB color pass — m_graphicsPipelineMeshFtbColor NULL\n"); s_warnMeshFtb = true; }
     return;
+  }
 
   VkDeviceSize offset{0};
 
