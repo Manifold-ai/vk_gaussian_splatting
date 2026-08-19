@@ -748,9 +748,9 @@ class EngineVKGS:
         uint32 (sentinel 0xFFFFFFFF) — plus ``"mesh_instance_order"``: the
         primitive names in TLAS-InstanceID order for id->name mapping.
 
-        ``instance_id`` requires an RTX-traced hybrid pipeline
-        (HYBRID / HYBRID_3DGUT); other pipelines leave it at the sentinel
-        (a CompatWarning is emitted). ``spp`` overrides the accumulated
+        ``instance_id`` requires a hybrid pipeline (HYBRID / HYBRID_3DGUT:
+        raster mesh MRT and/or raygen write it); other pipelines leave it at
+        the sentinel (a CompatWarning is emitted). ``spp`` overrides the accumulated
         frame count for this render only. The exe run always dumps the
         ``main`` buffer; only the buffers listed in ``buffers`` are loaded."""
         want = list(dict.fromkeys(buffers))
@@ -761,7 +761,7 @@ class EngineVKGS:
             )
         if "instance_id" in want and self.pipeline not in _INSTANCE_ID_PIPELINES:
             warn_compat(
-                f"the instance-id AOV needs an RTX-traced hybrid pipeline "
+                f"the instance-id AOV needs a hybrid pipeline "
                 f"{sorted(int(p) for p in _INSTANCE_ID_PIPELINES)}; current pipeline "
                 f"{int(self.pipeline)} leaves the sentinel (all masks empty). Set "
                 "engine.pipeline = vkgs.constants.Pipeline.HYBRID."
@@ -800,7 +800,7 @@ class EngineVKGS:
         ``{name: bool (H, W)}`` — True where that product's mesh instance is the
         visible primary surface.
 
-        Requires an RTX-traced hybrid pipeline (HYBRID / HYBRID_3DGUT) with
+        Requires a hybrid pipeline (HYBRID / HYBRID_3DGUT) with
         surface info; other pipelines leave the AOV at the sentinel and yield
         empty masks (a CompatWarning is emitted). ``names`` selects a subset
         (default: every mesh primitive)."""

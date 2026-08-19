@@ -44,6 +44,18 @@ struct FragmentInput
 struct FragmentOutput
 {
   [[vk::location(0)]] float4 color : SV_Target0;
+#if HYBRID_ENABLED && NEED_SURFACE_INFO
+  // Mesh-instance-id AOV (R32_UINT). Written as an MRT color attachment so the
+  // hardware depth test resolves mesh-vs-mesh occlusion (closest instance wins),
+  // unlike a storage-image write which has no ordering guarantee.
+  // Location follows the raster pass attachment list: BTF = {color, normal,
+  // rasterDepth, splatId, instanceId}, FTB = {color, normal, splatId, instanceId}.
+#if !FRONT_TO_BACK
+  [[vk::location(4)]] uint instanceId : SV_Target4;
+#else
+  [[vk::location(3)]] uint instanceId : SV_Target3;
+#endif
+#endif
 };
 // clang-format on
 
@@ -58,6 +70,12 @@ FragmentOutput main(FragmentInput input
 
 #if HYBRID_ENABLED
   output.color = float4(0.0, 0.0, 0.0, 0.0);
+#if NEED_SURFACE_INFO
+  // Hybrid raster mesh pass: color comes from the raygen, but this is the pass
+  // that actually depth-tests meshes, so write the instance-id AOV here.
+  // Background/splat-only pixels keep the per-frame 0xFFFFFFFF sentinel clear.
+  output.instanceId = pcRaster.objIndex;
+#endif
 #else
 
 #if FRONT_TO_BACK && NEED_SURFACE_INFO

@@ -799,6 +799,19 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
       splatIdAttachment.imageView                  = m_gBuffers.getColorImageView(COLOR_RASTER_SPLATID);
       splatIdAttachment.clearValue.color.uint32[0] = 0xFFFFFFFF;  // Clear to invalid ID
       colorAttachments.push_back(splatIdAttachment);
+
+      if(isHybridPipeline())
+      {
+        // Hybrid: the raster mesh pass writes the mesh-instance-id AOV as an MRT
+        // attachment (threedmesh_raster.frag). Stays in GENERAL layout (also a
+        // storage image for the raygen); LOAD preserves the per-frame sentinel clear.
+        VkRenderingAttachmentInfo instanceIdAttachment = DEFAULT_VkRenderingAttachmentInfo;
+        instanceIdAttachment.imageView                 = m_gBuffers.getColorImageView(COLOR_MESH_INSTANCE_ID);
+        instanceIdAttachment.imageLayout               = VK_IMAGE_LAYOUT_GENERAL;
+        instanceIdAttachment.loadOp                    = VK_ATTACHMENT_LOAD_OP_LOAD;
+        instanceIdAttachment.storeOp                   = VK_ATTACHMENT_STORE_OP_STORE;
+        colorAttachments.push_back(instanceIdAttachment);
+      }
     }
 
     // Create the rendering info
@@ -868,9 +881,10 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
       vkCmdPipelineBarrier2(cmd, &clearDepInfo);
     }
 
-    // Clear the mesh-instance-ID AOV to its sentinel every frame. It is a
-    // storage image (never a color attachment) and stays in GENERAL layout;
-    // the RTX/hybrid raygen overwrites the pixels it covers (writeToGBuffers).
+    // Clear the mesh-instance-ID AOV to its sentinel every frame. It stays in
+    // GENERAL layout throughout: under hybrid the raster mesh pass writes it as
+    // an MRT color attachment (loadOp LOAD preserves this clear) and the raygen
+    // writes valid hits as a storage image; other pipelines leave the sentinel.
     {
       VkClearColorValue       instClear = {};
       instClear.uint32[0]               = 0xFFFFFFFFu;  // sentinel: background / no mesh
@@ -882,7 +896,8 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
           .srcStageMask        = VK_PIPELINE_STAGE_2_CLEAR_BIT,
           .srcAccessMask       = VK_ACCESS_2_TRANSFER_WRITE_BIT,
           .dstStageMask        = VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-          .dstAccessMask       = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT,
+          .dstAccessMask       = VK_ACCESS_2_SHADER_STORAGE_READ_BIT | VK_ACCESS_2_SHADER_STORAGE_WRITE_BIT
+                                 | VK_ACCESS_2_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
           .oldLayout           = VK_IMAGE_LAYOUT_GENERAL,
           .newLayout           = VK_IMAGE_LAYOUT_GENERAL,
           .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -1080,6 +1095,15 @@ void GaussianSplatting::renderHybridPipeline(VkCommandBuffer cmd, uint32_t splat
       // For FTB: depth buffer stays in GENERAL layout (storage image access)
       barriers.push_back(nvvk::makeImageMemoryBarrier({m_gBuffers.getColorImage(COLOR_RASTER_SPLATID),
                                                        VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_GENERAL}));
+
+      if(isHybridPipeline())
+      {
+        // Mesh-instance-id AOV: attachment writes from the raster mesh pass must be
+        // visible to the raygen (storage writes on hit) and the readback dump.
+        // Stays in GENERAL layout (no transition, memory barrier only).
+        barriers.push_back(nvvk::makeImageMemoryBarrier(
+            {m_gBuffers.getColorImage(COLOR_MESH_INSTANCE_ID), VK_IMAGE_LAYOUT_GENERAL, VK_IMAGE_LAYOUT_GENERAL}));
+      }
     }
 
     if(!barriers.empty())
@@ -2915,6 +2939,15 @@ void GaussianSplatting::initPipelines()
       pipelineState.colorBlendEnables.push_back(VK_FALSE);                // No blending for integer ID
       pipelineState.colorWriteMasks.push_back(VK_COLOR_COMPONENT_R_BIT);  // Single component for uint32
       pipelineState.colorBlendEquations.push_back({});                    // Unused but required
+
+      // Mesh-instance-id AOV attachment (hybrid only): written by the raster
+      // mesh pass, never by splats -> write mask 0.
+      if(isHybridPipeline())
+      {
+        pipelineState.colorBlendEnables.push_back(VK_FALSE);  // No blending for integer ID
+        pipelineState.colorWriteMasks.push_back(0);           // Splats do not write this attachment
+        pipelineState.colorBlendEquations.push_back({});      // Unused but required
+      }
     }
 
     // By default disable depth write and test for the pipeline
@@ -2946,6 +2979,10 @@ void GaussianSplatting::initPipelines()
             creator.colorFormats.push_back(m_rasterDepthFormat);
           }
           creator.colorFormats.push_back(m_splatIdFormat);
+          if(isHybridPipeline())
+          {
+            creator.colorFormats.push_back(m_meshInstanceIdFormat);  // mesh-instance-id AOV (write mask 0)
+          }
         }
         creator.renderingState.depthAttachmentFormat = m_depthFormat;
         creator.dynamicStateValues.push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
@@ -2972,6 +3009,10 @@ void GaussianSplatting::initPipelines()
             creator.colorFormats.push_back(m_rasterDepthFormat);
           }
           creator.colorFormats.push_back(m_splatIdFormat);
+          if(isHybridPipeline())
+          {
+            creator.colorFormats.push_back(m_meshInstanceIdFormat);  // mesh-instance-id AOV (write mask 0)
+          }
         }
         creator.renderingState.depthAttachmentFormat = m_depthFormat;
         creator.dynamicStateValues.push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
@@ -3016,6 +3057,10 @@ void GaussianSplatting::initPipelines()
           creator.colorFormats.push_back(m_rasterDepthFormat);
         }
         creator.colorFormats.push_back(m_splatIdFormat);
+        if(isHybridPipeline())
+        {
+          creator.colorFormats.push_back(m_meshInstanceIdFormat);  // mesh-instance-id AOV (write mask 0)
+        }
       }
       creator.renderingState.depthAttachmentFormat = m_depthFormat;
       creator.dynamicStateValues.push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
@@ -3064,6 +3109,14 @@ void GaussianSplatting::initPipelines()
       pipelineState.colorBlendEnables.push_back(VK_FALSE);
       pipelineState.colorWriteMasks.push_back(0);
       pipelineState.colorBlendEquations.push_back({});
+
+      // Mesh-instance-id AOV (hybrid only) - no blending (integer), meshes write the id
+      if(isHybridPipeline())
+      {
+        pipelineState.colorBlendEnables.push_back(VK_FALSE);
+        pipelineState.colorWriteMasks.push_back(VK_COLOR_COMPONENT_R_BIT);
+        pipelineState.colorBlendEquations.push_back({});
+      }
     }
 
     // TODOC
@@ -3109,6 +3162,10 @@ void GaussianSplatting::initPipelines()
         creator.colorFormats.push_back(m_rasterDepthFormat);
       }
       creator.colorFormats.push_back(m_splatIdFormat);
+      if(isHybridPipeline())
+      {
+        creator.colorFormats.push_back(m_meshInstanceIdFormat);  // mesh-instance-id AOV (written here)
+      }
     }
     creator.renderingState.depthAttachmentFormat = m_depthFormat;
     creator.dynamicStateValues.push_back(VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE);
@@ -3164,8 +3221,8 @@ void GaussianSplatting::initPipelines()
     pipelineStateDepth.depthStencilState.depthCompareOp   = VK_COMPARE_OP_LESS;  // Write if closer than existing
 
     // Disable color writes for all attachments (depth-only pass)
-    // Must match render pass color attachment count: main + normal + splatId = 3
-    // All arrays must have matching sizes
+    // Must match render pass color attachment count: main + normal + splatId
+    // (+ mesh-instance-id AOV when hybrid). All arrays must have matching sizes
     VkColorBlendEquationEXT noBlend{};  // Default values (no blending)
     pipelineStateDepth.colorBlendEnables   = {VK_FALSE, VK_FALSE, VK_FALSE};
     pipelineStateDepth.colorBlendEquations = {noBlend, noBlend, noBlend};
@@ -3175,6 +3232,13 @@ void GaussianSplatting::initPipelines()
     creatorDepth.pipelineInfo.layout = m_pipelineLayout;
     // Must match the render pass color attachments (FTB with generateSurface)
     creatorDepth.colorFormats                         = {prmRender.colorFormat, m_normalFormat, m_splatIdFormat};
+    if(isHybridPipeline())
+    {
+      pipelineStateDepth.colorBlendEnables.push_back(VK_FALSE);
+      pipelineStateDepth.colorBlendEquations.push_back(noBlend);
+      pipelineStateDepth.colorWriteMasks.push_back(0);
+      creatorDepth.colorFormats.push_back(m_meshInstanceIdFormat);  // mesh-instance-id AOV (write mask 0)
+    }
     creatorDepth.renderingState.depthAttachmentFormat = m_depthFormat;
 
     creatorDepth.addShader(VK_SHADER_STAGE_VERTEX_BIT, "main", m_shaders.depthConsolidateVertShader);
