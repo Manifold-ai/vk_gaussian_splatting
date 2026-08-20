@@ -37,6 +37,7 @@ def build_scene(tmp_path):
         position=(0, 0.5, 0),
         materials=[Material(name="glass", transmission=1.0, ior=1.5, roughness=0.0)],
     )
+    scene.add_mesh(str(tmp_path / "chair.glb"), name="chair", clear_textures=True)
     scene.add_light(LightType.POINT, translation=(2, 3, 1), intensity=40.0, radius=0.1)
     scene.add_light(LightType.DIRECTIONAL, rotation=(45, 0, 0), intensity=2.0)
     # gs-shadow light: only darkens the GS shadow mask, radius=0 = hard shadow
@@ -63,6 +64,18 @@ def test_roundtrip_equality(tmp_path):
     with open(resaved) as f:
         second = json.load(f)
     assert first == second
+
+
+def test_clear_textures_roundtrip(tmp_path):
+    scene = build_scene(tmp_path)
+    data = scene.to_json(str(tmp_path))
+    items = data["meshInstances"]["items"]
+    assert items[0]["clearTextures"] is False
+    assert items[1]["clearTextures"] is True
+
+    loaded = Scene.load(scene.save(str(tmp_path / "scene.vkgs")))
+    assert loaded.mesh_instances[0].clear_textures is False
+    assert loaded.mesh_instances[1].clear_textures is True
 
 
 def test_asset_dedup(tmp_path):

@@ -463,8 +463,23 @@ class EngineVKGS:
         flush, so e.g. ``materials.flat((1, 1, 1))`` gives a white-model
         reference render and ``materials.flat((0, 0, 0))`` a black occluder.
         Native Scene already supports per-instance materials; this exposes it
-        through the compat shim."""
+        through the compat shim.
+
+        Note: overrides replace factors only — the mesh's texture maps still
+        modulate them (e.g. white diffuse x base-color texture). For a true
+        white model on a textured mesh combine with
+        :meth:`clear_primitive_textures`."""
         self.primitives.set_primitive_material(name, material)
+        self.is_materials_dirty = True
+
+    def clear_primitive_textures(self, name: str, clear: bool = True) -> None:
+        """Drop (or with ``clear=False`` restore) every texture map of one
+        primitive — base color, normal, metallic-roughness, emissive, ... —
+        so it renders with its material factors only. Orthogonal to
+        :meth:`set_primitive_material` (which never touches textures); both
+        compose. Caveat: primitives loaded from the same mesh file share one
+        material buffer in the renderer, so clearing one clears them all."""
+        self.primitives.clear_primitive_textures(name, clear)
         self.is_materials_dirty = True
 
     def get_scene_bounds(self) -> Tuple[float, float, float]:
@@ -519,6 +534,9 @@ class EngineVKGS:
                 scale=prim.scale,
                 materials=[material] if material is not None else None,
                 show=show_meshes and prim.show and prim.primitive_type != OptixPrimitiveTypes.NONE,
+                # Per-primitive clear composes with the 3dgrut-parity global
+                # disable_pbr_textures toggle.
+                clear_textures=prim.clear_textures or self.primitives.disable_pbr_textures,
             )
 
         any_light = False

@@ -216,6 +216,9 @@ class PrimitiveVKGS:
     # Per-instance material override; when set it replaces the material derived
     # from ``primitive_type`` at scene flush (None = use the type preset).
     material_override: Optional[Material] = None
+    # Drop every texture map of the mesh at scene flush (factors only);
+    # orthogonal to material_override, which never touches textures.
+    clear_textures: bool = False
 
     def set_transform(self, matrix) -> None:
         """Set position/rotation/scale from a 3dgrut ObjectTransform model
@@ -234,6 +237,7 @@ class PrimitiveVKGS:
             tuple(self.scale),
             bool(self.show),
             repr(self.material_override),
+            bool(self.clear_textures),
         )
 
 
@@ -269,8 +273,10 @@ class PrimitivesVKGS:
         # (PBRMaterial instances there, vkgs Materials here; the texture-based
         # 'checkboard' preset is not representable, see vkgs.materials).
         self.registered_materials = {name: factory() for name, factory in materials.PRESETS.items()}
-        # 3dgrut toggles with no VKGS effect; kept so ported scripts run.
+        # 3dgrut toggle with no VKGS effect; kept so ported scripts run.
         self.use_smooth_normals: bool = True
+        # 3dgrut parity: True drops every primitive's texture maps at scene
+        # flush (same effect as clear_primitive_textures on all primitives).
         self.disable_pbr_textures: bool = False
 
     def register_available_assets(self, assets_folder: Optional[str]) -> Dict[str, Optional[str]]:
@@ -353,6 +359,16 @@ class PrimitivesVKGS:
         if name not in self.objects:
             raise KeyError(f"unknown primitive {name!r}; available: {sorted(self.objects)}")
         self.objects[name].material_override = material
+        self.dirty = True
+
+    def clear_primitive_textures(self, name: str, clear: bool = True) -> None:
+        """Drop (or with ``clear=False`` restore) every texture map of one
+        primitive, so it renders with material factors only. Orthogonal to
+        set_primitive_material: combine with a white diffuse override for a
+        true white-model render of a textured mesh."""
+        if name not in self.objects:
+            raise KeyError(f"unknown primitive {name!r}; available: {sorted(self.objects)}")
+        self.objects[name].clear_textures = bool(clear)
         self.dirty = True
 
     def duplicate_primitive(self, name: str) -> str:

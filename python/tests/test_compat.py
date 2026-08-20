@@ -690,6 +690,38 @@ def test_material_override_dirties_cache_and_unknown_name_raises(engine):
         engine.set_primitive_material("no such primitive", materials.mirror())
 
 
+def test_clear_primitive_textures_flags_instance(engine):
+    engine.clear_primitive_textures("Sphere 1")
+    assert engine._build_scene().mesh_instances[0].clear_textures is True
+    engine.clear_primitive_textures("Sphere 1", False)
+    assert engine._build_scene().mesh_instances[0].clear_textures is False
+
+
+def test_clear_textures_composes_with_material_override(engine):
+    # Orthogonal knobs: texture clear + factor override both survive the flush.
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    engine.clear_primitive_textures("Sphere 1")
+    inst = engine._build_scene().mesh_instances[0]
+    assert inst.clear_textures is True
+    assert inst.materials[0].metallic == 1.0  # override intact
+
+
+def test_disable_pbr_textures_clears_all_primitives(engine):
+    # 3dgrut-parity global toggle == clear_primitive_textures on everything.
+    engine.primitives.disable_pbr_textures = True
+    assert engine._build_scene().mesh_instances[0].clear_textures is True
+
+
+def test_clear_textures_dirties_cache_and_unknown_name_raises(engine):
+    cam = Camera(eye=(3, 1, 3))
+    _seed_cache(engine, cam)
+    assert not engine.is_dirty(cam)
+    engine.clear_primitive_textures("Sphere 1")
+    assert engine.is_dirty(cam)
+    with pytest.raises(KeyError):
+        engine.clear_primitive_textures("no such primitive")
+
+
 def test_get_scene_bounds_matches_ply_extent(engine):
     # toy_ply fixture spans (0,0,0)..(2,2,2) -> per-axis extent (2, 2, 2).
     assert engine.get_scene_bounds() == pytest.approx((2.0, 2.0, 2.0))

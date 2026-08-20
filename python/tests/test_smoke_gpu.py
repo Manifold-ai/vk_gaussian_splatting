@@ -310,3 +310,46 @@ def test_saveimage_pairing_semantics(tmp_path):
     assert sh0.max() > 0 and sh3.max() > 0
     # SH degree 0 drops all view-dependent color: images must differ measurably
     assert np.abs(sh0 - sh3).mean() > 0.1
+
+
+def _find_textured_glb():
+    env = os.environ.get("VKGS_TEST_GLB")
+    if env and os.path.isfile(env):
+        return env
+    matches = sorted(
+        glob.glob(os.path.expanduser("~/vkgs-test-models/**/*.glb"), recursive=True)
+    )
+    return matches[0] if matches else None
+
+
+TEST_GLB = _find_textured_glb()
+
+
+@needs_gpu_assets
+@pytest.mark.skipif(TEST_GLB is None, reason="requires a textured .glb (set $VKGS_TEST_GLB)")
+def test_clear_textures_changes_render(tmp_path):
+    """clearTextures A/B: the same textured GLB rendered with and without the
+    per-instance texture clear must differ measurably — with the flag on, the
+    shader skips every texture sample and only material factors show."""
+
+    def render(clear):
+        scene = Scene()
+        scene.renderer.pipeline = Pipeline.MESH
+        scene.add_splats(TEST_PLY, show=False)  # satisfy the loader; mesh-only view
+        scene.add_mesh(TEST_GLB, name="product", clear_textures=clear)
+        preset = scene.add_camera_preset(Camera(eye=(1.5, 1.0, 1.5), ctr=(0, 0, 0)))
+        result = render_scene(
+            scene,
+            [preset],
+            size=(320, 240),
+            spp=4,
+            buffers=("main",),
+            out_dir=str(tmp_path / ("clear" if clear else "textured")),
+        )
+        return result.image(0, "main").astype(np.float64)
+
+    textured = render(False)
+    cleared = render(True)
+    assert textured.max() > 0 and cleared.max() > 0
+    # Dropping the texture maps must change the image (factor-only shading).
+    assert np.abs(textured - cleared).mean() > 0.5

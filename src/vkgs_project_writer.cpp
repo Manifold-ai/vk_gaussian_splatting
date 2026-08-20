@@ -424,9 +424,10 @@ void VkgsProjectWriter::saveMeshes(json& data, const GaussianSplattingUI* ui, co
     const auto& mesh = *instance->mesh;
 
     json item;
-    item["meshAssetId"] = meshToId[instance->mesh.get()];
-    item["name"]        = instance->name;
-    item["show"]        = instance->show;
+    item["meshAssetId"]   = meshToId[instance->mesh.get()];
+    item["name"]          = instance->name;
+    item["show"]          = instance->show;
+    item["clearTextures"] = instance->clearTextures;
 
     // Transform
     item["position"] = {instance->translation.x, instance->translation.y, instance->translation.z};

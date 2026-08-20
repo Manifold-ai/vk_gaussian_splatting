@@ -56,6 +56,25 @@ namespace vk_gaussian_splatting {
       (val) = {(item)[name][0], (item)[name][1], (item)[name][2]};                                                     \
   } while(0)
 
+// Reset every texture index of a material to the "no texture" sentinel (-1),
+// so the shader (applyMaterialTextures, raster and RTX alike) skips all
+// sampling and only the factor fields show. Used by the per-instance
+// "clearTextures" project flag; textures stay resident in VRAM.
+static void clearMaterialTextures(Material& mat)
+{
+  mat.baseColorTexture               = -1;
+  mat.metallicRoughnessTexture       = -1;
+  mat.normalTexture                  = -1;
+  mat.emissiveTexture                = -1;
+  mat.occlusionTexture               = -1;
+  mat.specularTexture                = -1;
+  mat.specularColorTexture           = -1;
+  mat.clearcoatTexture               = -1;
+  mat.clearcoatRoughnessTexture      = -1;
+  mat.pbrSgDiffuseTexture            = -1;
+  mat.pbrSgSpecularGlossinessTexture = -1;
+}
+
 // Load material from JSON — version 7+ uses maxBounces, version 6 uses illum, older converts from Phong
 static void loadMaterialFromJson(Material& mat, const json& matItem, int fileVersion)
 {
@@ -590,6 +609,18 @@ void VkgsProjectReader::loadMeshInstances(const json&                           
       }
 
       // Use deferred API - materials will be uploaded in processVramUpdates()
+      ui->m_assets.meshes.updateMeshMaterials(instance->mesh);
+    }
+
+    // Optional clearTextures flag: drop every texture map of the mesh so only
+    // the material factors show (composes with the materials override above,
+    // which never touches texture indices). Applies to the shared mesh asset,
+    // so all instances of the same file are affected.
+    if(instItem.value("clearTextures", false))
+    {
+      instance->clearTextures = true;
+      for(auto& mat : mesh->materials)
+        clearMaterialTextures(mat);
       ui->m_assets.meshes.updateMeshMaterials(instance->mesh);
     }
   }
