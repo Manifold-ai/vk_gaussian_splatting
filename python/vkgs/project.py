@@ -17,6 +17,10 @@ Contract notes (pinned against the C++ sources):
 - Splat instance transforms are applied only when position AND rotation AND
   scale are all present (reader.cpp:372) — we always emit all three.
 - ``lights`` must contain both "assets" and "instances" arrays (v3+ branch).
+- ``meshInstances.items[].clearTextures`` (optional, default false) makes the
+  reader reset every texture index of the mesh's materials to -1, so the mesh
+  renders with factors only; older readers ignore the key. The reset applies
+  to the shared mesh asset, so all instances of the same file are affected.
 """
 
 from __future__ import annotations
@@ -199,6 +203,13 @@ class MeshInstance:
 
     ``materials`` overrides the mesh file's material slots in order; None (or
     a shorter list) keeps the remaining slots as authored in the file.
+
+    ``clear_textures`` drops every texture map of the mesh (base color,
+    normal, metallic-roughness, emissive, ...) so only the material factors
+    show; composes with ``materials`` overrides (which never touch textures).
+    Caveat: instances sharing the same mesh asset (same file path, see
+    Scene.add_mesh dedup) share one material buffer in the renderer, so
+    clearing one clears them all — same semantics as the materials override.
     """
 
     mesh_asset_id: int
@@ -208,6 +219,7 @@ class MeshInstance:
     rotation: Vec3 = (0.0, 0.0, 0.0)  # Euler XYZ degrees
     scale: Vec3 = (1.0, 1.0, 1.0)
     materials: List[Material] = field(default_factory=list)
+    clear_textures: bool = False
 
     def to_json(self) -> dict:
         item = {
@@ -218,6 +230,7 @@ class MeshInstance:
             "rotation": _v3(self.rotation),
             "scale": _v3(self.scale),
             "materials": [m.to_json(extended=False) for m in self.materials],
+            "clearTextures": bool(self.clear_textures),
         }
         return item
 
@@ -799,11 +812,14 @@ class Scene:
         scale: Union[float, Vec3] = (1.0, 1.0, 1.0),
         materials: Optional[Sequence[Material]] = None,
         show: bool = True,
+        clear_textures: bool = False,
     ) -> MeshInstance:
         """Add a mesh (.glb/.gltf/.obj) instance; asset deduplicated by path.
 
         ``materials`` overrides the file's material slots in order. An empty /
         omitted list keeps the materials authored in the mesh file.
+        ``clear_textures`` drops every texture map so only material factors
+        show (see MeshInstance for the shared-asset caveat).
         """
         abspath = os.path.abspath(path)
         asset = next((m for m in self.mesh_assets if m.path == abspath), None)
@@ -819,6 +835,7 @@ class Scene:
             rotation=_t3(rotation),
             scale=_t3((scale, scale, scale)) if isinstance(scale, (int, float)) else _t3(scale),
             materials=list(materials) if materials else [],
+            clear_textures=bool(clear_textures),
         )
         self.mesh_instances.append(instance)
         return instance
@@ -1057,6 +1074,7 @@ class Scene:
             inst.rotation = _t3(item.get("rotation", inst.rotation))
             inst.scale = _t3(item.get("scale", inst.scale))
             inst.materials = [Material.from_json(m) for m in item.get("materials", [])]
+            inst.clear_textures = bool(item.get("clearTextures", False))
             scene.mesh_instances.append(inst)
 
         lights = data.get("lights", {})

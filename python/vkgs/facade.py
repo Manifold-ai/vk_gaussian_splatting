@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import os
+import tempfile
 import warnings
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -108,9 +109,12 @@ def render_scene(
     buffers: Sequence[str] = ("main",),
     out_dir: str,
     hdr: bool = False,
+    image_format: Optional[str] = None,
     executable: Optional[str] = None,
     gpu: Optional[int] = None,
     keep_files: bool = True,
+    keep_buffers: Optional[Sequence[str]] = None,
+    log: bool = True,
     timeout: float = 1800,
     extra_args: Sequence[str] = (),
 ) -> RenderResult:
@@ -123,10 +127,24 @@ def render_scene(
       temporal pipelines need this >= the desired sample count to converge.
     - ``buffers``: which saved buffers to expect/read ("main", "depth",
       "normal", "aux1", and "ldr" when tonemapping is active).
-    - ``hdr``: save .hdr (float32 RGB, rendered into an RGBA32F color
-      buffer) instead of .png (RGBA8).
+    - ``hdr``: legacy toggle — save .hdr (float32, but stb_image_write drops
+      the alpha channel) instead of .png (RGBA8). Prefer ``image_format``.
+    - ``image_format``: explicit save format ("png" | "hdr" | "raw"); when
+      given it wins over ``hdr``. Use "raw" (RGBA32F) for lossless float that
+      **keeps alpha coverage** — ``.hdr`` drops alpha, ``.png`` keeps RGBA8
+      alpha. The ``main`` buffer's 4th channel is the per-pixel coverage.
     - ``keep_files``: when False, images are loaded eagerly and the
       intermediate files (images, .vkgs, .cfg) are deleted; the log is kept.
+    - ``keep_buffers``: selective reclaim (takes precedence over ``keep_files``
+      when not None). Keeps only the dumped buffer files whose name is in this
+      list and deletes every other dumped buffer plus scene.vkgs / render.cfg.
+      Note the renderer always dumps every buffer (saveImageBuffer -1), so this
+      is how you avoid leaving the unrequested ones on disk.
+    - ``log``: when True the renderer log is written to a uniquely named file
+      under ``$TMPDIR/vkgs_render_logs`` (kept). When False the same file is
+      still captured and parsed (error detection / warnings survive in the
+      returned RunResult) but deleted before returning. Either way the log is
+      NOT written into ``out_dir``.
     """
     buffers = list(buffers)
     unknown = [b for b in buffers if b not in BUFFER_POSTFIXES]
@@ -148,14 +166,15 @@ def render_scene(
     _warn_if_underconverged(scene, indices, spp)
     vkgs_path = scene.save(os.path.join(out_dir, "scene.vkgs"))
 
-    ext = ".hdr" if hdr else ".png"
+    ext = _resolve_ext(hdr, image_format)
+    float_format = ext in (".hdr", ".raw")
     script = RenderScript(frames=spp, averages=min(spp, 32))
     # Load/settle block: the project loads during this sequence; camera
     # presets only become available after it. colorBufferFormat 2 keeps full
-    # float32 precision for .hdr readback.
+    # float32 precision for float readback (.hdr / .raw).
     script.load_block(
         frames=max(spp, _MIN_SETTLE_FRAMES),
-        colorBufferFormat=ColorBufferFormat.RGBA32F if hdr else None,
+        colorBufferFormat=ColorBufferFormat.RGBA32F if float_format else None,
     )
 
     expected: List[str] = []
@@ -167,12 +186,19 @@ def render_scene(
             os.path.join(out_dir, f"cam{position}"),
             frames=spp,
             buffers=buffers,
-            hdr=hdr,
+            ext=ext,
         )
         stems[position] = stem
         expected += [stem + BUFFER_POSTFIXES[b] + ext for b in buffers]
 
     cfg_path = script.write(os.path.join(out_dir, "render.cfg"))
+
+    # Route the log to a unique file under $TMPDIR/vkgs_render_logs (never into
+    # out_dir). When log=False it is still captured+parsed, then deleted below.
+    fd, log_path = tempfile.mkstemp(
+        dir=_render_log_dir(), prefix=os.path.basename(out_dir) + "_", suffix=".log"
+    )
+    os.close(fd)
 
     runner = HeadlessRunner(executable)
     run = runner.run(
@@ -181,7 +207,7 @@ def render_scene(
         size=size,
         gpu=gpu,
         timeout=timeout,
-        log_path=os.path.join(out_dir, "render.log"),
+        log_path=log_path,
         expected_outputs=expected,
         extra_args=extra_args,
     )
@@ -191,17 +217,52 @@ def render_scene(
     paths = {position: images.find_outputs(stem) for position, stem in stems.items()}
     result = RenderResult(paths, run, out_dir)
 
-    if not keep_files:
+    if keep_buffers is not None:
+        # Selective reclaim: keep only the requested buffer files, drop every
+        # other dumped buffer plus the scaffolding (scene.vkgs, render.cfg).
+        keep = set(keep_buffers)
+        for files in paths.values():
+            for buffer, path in list(files.items()):
+                if buffer not in keep:
+                    _remove_quiet(path)
+                    del files[buffer]
+        _remove_quiet(vkgs_path)
+        _remove_quiet(cfg_path)
+    elif not keep_files:
         for position in stems:
             for buffer in buffers:
                 result.image(position, buffer)  # eager-load into the cache
         for files in paths.values():
             for path in files.values():
                 _remove_quiet(path)
+            files.clear()
         _remove_quiet(vkgs_path)
         _remove_quiet(cfg_path)
 
+    if not log:
+        _remove_quiet(log_path)  # RunResult.log_text already holds the contents
+
     return result
+
+
+_VALID_IMAGE_FORMATS = (".png", ".jpg", ".hdr", ".raw")
+
+
+def _resolve_ext(hdr: bool, image_format: Optional[str]) -> str:
+    """Resolve the save-file extension. ``image_format`` (png/jpg/hdr/raw)
+    wins when given; otherwise fall back to the legacy ``hdr`` bool. ``.raw``
+    (RGBA32F) and ``.png`` (RGBA8) keep the alpha channel; ``.hdr`` drops it
+    (stb_image_write)."""
+    if image_format is not None:
+        ext = image_format.lower()
+        if not ext.startswith("."):
+            ext = "." + ext
+        if ext not in _VALID_IMAGE_FORMATS:
+            raise ValueError(
+                f"unknown image_format {image_format!r}; expected one of {list(_VALID_IMAGE_FORMATS)}"
+            )
+        return ext
+    return ".hdr" if hdr else ".png"
 
 
 def _warn_if_underconverged(scene: Scene, indices: Sequence[int], spp: int) -> None:
@@ -226,3 +287,12 @@ def _remove_quiet(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _render_log_dir() -> str:
+    """Shared tmp folder for renderer logs ($TMPDIR/vkgs_render_logs), created
+    on demand. Keeps logs out of the per-render output directories so artifact
+    reclaim never touches them (mirrors geometry.py's vkgs_procedural cache)."""
+    path = os.path.join(tempfile.gettempdir(), "vkgs_render_logs")
+    os.makedirs(path, exist_ok=True)
+    return path

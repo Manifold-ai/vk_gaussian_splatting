@@ -189,6 +189,12 @@ protected:
     return (prmSelectedPipeline == PIPELINE_VERT || prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_MESH_3DGUT);
   }
 
+  // Check if current pipeline is hybrid (raster primary + RTX secondary)
+  inline bool isHybridPipeline() const
+  {
+    return (prmSelectedPipeline == PIPELINE_HYBRID || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
+  }
+
   // Check if a pipeline relies on VK_EXT_mesh_shader (raster MESH, MESH_3DGUT
   // and the hybrid raster paths all dispatch via vkCmdDrawMeshTasksEXT).
   static inline bool isMeshShaderPipeline(uint32_t pipeline)
@@ -451,12 +457,14 @@ protected:
     COLOR_RASTER_DEPTH      = 4,  // Rasterization: picked depth (R) + transmittance (G) for FTB
     COLOR_RASTER_SPLATID    = 5,  // Rasterization: global splat ID (R32_UINT)
     COLOR_LDR               = 6,  // Tone-mapped LDR output (R8G8B8A8_UNORM)
+    COLOR_MESH_INSTANCE_ID  = 7,  // Per-pixel visible mesh-instance index (R32_UINT); sentinel 0xFFFFFFFF
   };
   // G-Buffers: 9 color buffers + 1 depth buffer
   nvvk::GBuffer m_gBuffers;
   VkFormat      m_normalFormat = VK_FORMAT_R16G16B16A16_SFLOAT;  // Normal buffer format (RGB16F + alpha for roughness)
   VkFormat m_rasterDepthFormat = VK_FORMAT_R32G32_SFLOAT;  // Raster depth buffer format (R=depth, G=transmittance for FTB)
   VkFormat m_splatIdFormat = VK_FORMAT_R32_UINT;           // Splat ID buffer format (single uint32)
+  VkFormat m_meshInstanceIdFormat = VK_FORMAT_R32_UINT;    // Mesh instance ID buffer format (single uint32)
 
   // camera info for current frame, updated by onRender
   glm::vec3 m_eye{};

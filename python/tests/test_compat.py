@@ -2,10 +2,12 @@
 
 import json
 import math
+import struct
 
 import numpy as np
 import pytest
 
+from vkgs import materials
 from vkgs.camera import THREEDGRUT_TO_VKGS, Camera, rotation_matrix_from_euler_deg
 from vkgs.constants import CameraModel, DofMode, LightType as VkgsLightType, Pipeline, ShadowsMode
 from vkgs.compat import (
@@ -598,3 +600,310 @@ def test_postprocess_contract_shapes_tonemap_gamma(engine):
     rgba[..., 3] = 0.25
     rb = engine._postprocess(_StubResult(rgba), 0)
     assert np.all(rb["opacity"] == 0.25)
+
+
+# --------------------------------------------------------------------------
+# Backend AOVs: real alpha via .raw, optional depth (Phase 1)
+# --------------------------------------------------------------------------
+
+
+class _MultiBufferResult:
+    """Duck-typed RenderResult returning a distinct array per buffer name."""
+
+    def __init__(self, images):
+        self._images = images
+
+    def image(self, position, buffer):
+        return self._images[buffer]
+
+
+def test_render_many_requests_raw_and_optional_depth(engine, monkeypatch):
+    calls = {}
+    main = np.zeros((2, 3, 4), dtype=np.float32)
+    main[..., 3] = 0.5  # real coverage in the alpha channel of the .raw dump
+    depth = np.zeros((2, 3, 4), dtype=np.float32)
+    depth[..., 0] = 0.7  # NDC depth
+    depth[..., 1] = 0.1  # transmittance
+
+    def fake_render_scene(scene, cams, **kw):
+        calls.clear()
+        calls.update(kw)
+        calls["ncams"] = len(list(cams))
+        return _MultiBufferResult({"main": main, "depth": depth})
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+
+    # Default: .raw format (keeps alpha), main only, no depth key returned.
+    rb = engine.render(Camera(eye=(3, 1, 3)))
+    assert calls["image_format"] == "raw"
+    assert calls["buffers"] == ["main"]
+    # reclaim on by default -> keep only main; logs on by default.
+    assert calls["keep_buffers"] == ["main"]
+    assert calls["log"] is True
+    assert "depth" not in rb
+    assert np.all(rb["opacity"] == 0.5)  # coverage read from raw channel 3
+
+    # return_depth: requests depth too and returns NDC depth + transmittance.
+    engine.return_depth = True
+    rb = engine.render(Camera(eye=(3, 1, 3)))
+    assert calls["buffers"] == ["main", "depth"]
+    assert calls["keep_buffers"] == ["main", "depth"]
+    assert rb["depth"].shape == (1, 2, 3, 1)
+    assert np.all(rb["depth"] == 0.7)  # channel R only
+    assert np.all(rb["depth_transmittance"] == 0.1)  # channel G
+
+
+# --------------------------------------------------------------------------
+# Per-instance material override + scene bounds (Phase 1)
+# --------------------------------------------------------------------------
+
+
+def test_set_primitive_material_overrides_preset(engine):
+    # Seeded Sphere 1 is GLASS; override it with a mirror.
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    mat = engine._build_scene().mesh_instances[0].materials[0]
+    assert mat.metallic == 1.0 and mat.roughness == 0.0  # mirror, not glass
+
+
+def test_material_override_wins_on_pbr(engine):
+    # PBR's preset is None (keep authored materials); an override still wins.
+    engine.primitives.objects["Sphere 1"].primitive_type = OptixPrimitiveTypes.PBR
+    engine.set_primitive_material("Sphere 1", materials.flat((1.0, 1.0, 1.0)))
+    mat = engine._build_scene().mesh_instances[0].materials[0]
+    assert mat.emissive == (1.0, 1.0, 1.0) and mat.max_bounces == 0
+
+
+def test_material_override_reverts_with_none(engine):
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    engine.set_primitive_material("Sphere 1", None)
+    mat = engine._build_scene().mesh_instances[0].materials[0]
+    assert mat.transmission == 1.0  # back to the glass preset
+
+
+def test_material_override_dirties_cache_and_unknown_name_raises(engine):
+    cam = Camera(eye=(3, 1, 3))
+    _seed_cache(engine, cam)
+    assert not engine.is_dirty(cam)
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    assert engine.is_dirty(cam)  # material change invalidates the render cache
+    with pytest.raises(KeyError):
+        engine.set_primitive_material("no such primitive", materials.mirror())
+
+
+def test_clear_primitive_textures_flags_instance(engine):
+    engine.clear_primitive_textures("Sphere 1")
+    assert engine._build_scene().mesh_instances[0].clear_textures is True
+    engine.clear_primitive_textures("Sphere 1", False)
+    assert engine._build_scene().mesh_instances[0].clear_textures is False
+
+
+def test_clear_textures_composes_with_material_override(engine):
+    # Orthogonal knobs: texture clear + factor override both survive the flush.
+    engine.set_primitive_material("Sphere 1", materials.mirror())
+    engine.clear_primitive_textures("Sphere 1")
+    inst = engine._build_scene().mesh_instances[0]
+    assert inst.clear_textures is True
+    assert inst.materials[0].metallic == 1.0  # override intact
+
+
+def test_disable_pbr_textures_clears_all_primitives(engine):
+    # 3dgrut-parity global toggle == clear_primitive_textures on everything.
+    engine.primitives.disable_pbr_textures = True
+    assert engine._build_scene().mesh_instances[0].clear_textures is True
+
+
+def test_clear_textures_dirties_cache_and_unknown_name_raises(engine):
+    cam = Camera(eye=(3, 1, 3))
+    _seed_cache(engine, cam)
+    assert not engine.is_dirty(cam)
+    engine.clear_primitive_textures("Sphere 1")
+    assert engine.is_dirty(cam)
+    with pytest.raises(KeyError):
+        engine.clear_primitive_textures("no such primitive")
+
+
+def test_get_scene_bounds_matches_ply_extent(engine):
+    # toy_ply fixture spans (0,0,0)..(2,2,2) -> per-axis extent (2, 2, 2).
+    assert engine.get_scene_bounds() == pytest.approx((2.0, 2.0, 2.0))
+
+
+def test_ply_scene_extent_is_publicly_exported():
+    import vkgs.compat as compat
+    from vkgs.compat import ply_scene_extent as public_extent
+
+    assert "ply_scene_extent" in compat.__all__
+    assert public_extent is ply_scene_extent
+
+
+# --------------------------------------------------------------------------
+# Per-product instance-id masks (Phase 2)
+# --------------------------------------------------------------------------
+
+
+def _write_instance_id_raw(path, ids):
+    """Write a single-channel R32_UINT .raw dump matching saveRawUintImageToFile
+    (header {w, h, 1, 4} + row-major uint32)."""
+    ids = np.asarray(ids, dtype=np.uint32)
+    h, w = ids.shape
+    with open(path, "wb") as f:
+        f.write(struct.pack("<4I", w, h, 1, 4))
+        f.write(ids.tobytes())
+
+
+def test_mesh_instance_order_matches_add_order(engine):
+    # Seeded scene already has "Sphere 1"; add two more products.
+    engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.DIFFUSE)  # Sphere 2
+    engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.MIRROR)   # Sphere 3
+    assert engine._mesh_instance_order() == ["Sphere 1", "Sphere 2", "Sphere 3"]
+
+
+def test_render_masks_maps_instance_ids(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.HYBRID
+    engine.primitives.add_primitive("Sphere", OptixPrimitiveTypes.DIFFUSE)  # Sphere 2 -> id 1
+    # instance-id AOV: left half id 0, right half id 1, else sentinel
+    ids = np.full((2, 4), 0xFFFFFFFF, dtype=np.uint32)
+    ids[:, :2] = 0
+    ids[:, 2:] = 1
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, ids)
+
+    captured = {}
+
+    class _Result:
+        def path(self, position, buffer):
+            assert buffer == "instance_id"
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+    masks = engine.render_masks(Camera(eye=(3, 1, 3)))
+
+    assert captured["buffers"] == ["main", "instance_id"]
+    assert captured["image_format"] == "raw"
+    assert set(masks) == {"Sphere 1", "Sphere 2"}
+    assert masks["Sphere 1"].dtype == bool
+    assert masks["Sphere 1"].tolist() == [[True, True, False, False], [True, True, False, False]]
+    assert masks["Sphere 2"].tolist() == [[False, False, True, True], [False, False, True, True]]
+
+
+def test_render_masks_rejects_unknown_name(engine):
+    with pytest.raises(KeyError):
+        engine.render_masks(Camera(eye=(3, 1, 3)), names=["no such product"])
+
+
+def test_render_aovs_returns_requested_buffers(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.HYBRID
+    ids = np.zeros((2, 4), dtype=np.uint32)
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, ids)
+    main = np.zeros((2, 4, 4), dtype=np.float32)
+    main[..., 3] = 0.5
+    depth = np.zeros((2, 4, 4), dtype=np.float32)
+    depth[..., 0] = 0.25  # NDC depth in R
+    depth[..., 1] = 0.75  # transmittance in G
+
+    captured = {}
+
+    class _Result:
+        def image(self, position, buffer):
+            assert position == 0
+            return {"main": main, "depth": depth}[buffer]
+
+        def path(self, position, buffer):
+            assert buffer == "instance_id"
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+    out = engine.render_aovs(Camera(eye=(3, 1, 3)), spp=8)
+
+    assert captured["buffers"] == ["main", "depth", "instance_id"]
+    assert captured["image_format"] == "raw"
+    assert captured["spp"] == 8
+    assert out["mesh_instance_order"] == ["Sphere 1"]
+    assert out["main"].shape == (2, 4, 4)
+    assert np.allclose(out["main"][..., 3], 0.5)
+    assert np.allclose(out["depth"][..., 1], 0.75)
+    assert out["instance_id"].dtype == np.uint32
+
+
+def test_render_aovs_loads_only_requested_buffers(engine, tmp_path, monkeypatch):
+    # instance_id-only request must still ask the exe for "main" (dump anchor)
+    # but must not try to load it — the mocked result has no image().
+    engine.pipeline = Pipeline.HYBRID
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, np.zeros((1, 1), dtype=np.uint32))
+
+    captured = {}
+
+    class _Result:
+        def path(self, position, buffer):
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+    out = engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("instance_id",))
+
+    assert captured["buffers"] == ["main", "instance_id"]
+    assert "main" not in out
+    assert out["instance_id"].shape == (1, 1)
+
+
+def test_render_aovs_rejects_unknown_buffer(engine):
+    with pytest.raises(ValueError):
+        engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("main", "normal"))
+
+
+def test_render_aovs_reclaim_and_log_passthrough(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.HYBRID
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, np.zeros((1, 1), dtype=np.uint32))
+    captured = {}
+
+    class _Result:
+        def path(self, position, buffer):
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+
+    # Default: reclaim keeps only the caller's buffers (NOT the internal "main"
+    # anchor in request), logs on.
+    engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("instance_id",))
+    assert captured["buffers"] == ["main", "instance_id"]  # request still anchors main
+    assert captured["keep_buffers"] == ["instance_id"]     # but only this is kept
+    assert captured["log"] is True
+
+    # Toggles off: keep everything, no persisted log.
+    engine.reclaim = False
+    engine._render_logs = False
+    engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("instance_id",))
+    assert captured["keep_buffers"] is None
+    assert captured["log"] is False
+
+
+def test_render_masks_warns_on_non_hybrid_pipeline(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.MESH  # raster -> AOV never populated
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, np.full((1, 1), 0xFFFFFFFF, dtype=np.uint32))
+
+    class _Result:
+        def path(self, position, buffer):
+            return str(aov_path)
+
+    monkeypatch.setattr("vkgs.facade.render_scene", lambda *a, **k: _Result())
+    with pytest.warns(CompatWarning, match="hybrid"):
+        masks = engine.render_masks(Camera(eye=(3, 1, 3)))
+    assert not masks["Sphere 1"].any()  # all sentinel -> empty mask

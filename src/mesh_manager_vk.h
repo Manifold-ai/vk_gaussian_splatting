@@ -151,6 +151,11 @@ struct MeshInstanceVk
 
   bool show = true;  // User visibility toggle (eye icon in asset tree)
 
+  // Project "clearTextures" flag: the loader reset every texture index of the
+  // (shared) mesh materials to -1, so the mesh renders factors-only. Kept here
+  // for project save round-trip.
+  bool clearTextures = false;
+
   Flags flags = Flags::eNone;  // Set by manager methods only
 
   // Query methods for state

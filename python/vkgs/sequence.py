@@ -212,7 +212,8 @@ class RenderScript:
         *,
         frames: Optional[int] = None,
         buffers: Optional[Sequence[str]] = None,
-        hdr: bool = False,
+        ext: str = ".png",
+        hdr: Optional[bool] = None,
         **params,
     ) -> str:
         """Render from a camera preset and save the framebuffers.
@@ -223,8 +224,11 @@ class RenderScript:
         filename postfix; the save sequence always uses saveImageBuffer -1).
         Extra ``params`` go into the RENDER sequence.
 
-        Returns the absolute output stem; the app writes
-        ``<stem>_<buffer><ext>`` files (ext = .hdr when ``hdr`` else .png).
+        ``ext`` is the save-file extension (".png"/".hdr"/".raw"); the app
+        writes ``<stem>_<buffer><ext>`` files. ``hdr`` is a deprecated alias
+        (``hdr=True`` -> ``.hdr``) kept for backward compatibility.
+
+        Returns the absolute output stem.
         """
         if buffers:
             unknown = [b for b in buffers if b not in BUFFER_POSTFIXES]
@@ -235,7 +239,10 @@ class RenderScript:
         self.sequence(name, frames=frames, activateCameraPreset=int(camera_preset), **params)
 
         stem = os.path.abspath(out_stem)
-        ext = ".hdr" if hdr else ".png"
+        if hdr is not None:  # deprecated alias for ext
+            ext = ".hdr" if hdr else ".png"
+        if not ext.startswith("."):
+            ext = "." + ext
         # Order matters: saveImageBuffer must precede saveImage (the saveImage
         # callback reads the already-applied buffer index).
         self.sequence(

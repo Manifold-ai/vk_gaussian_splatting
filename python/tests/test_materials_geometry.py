@@ -83,6 +83,22 @@ def test_generic_helpers_semantics():
     assert d.base_color == pytest.approx((0.2, 0.3, 0.4))
 
 
+def test_flat_material_unlit_and_lit():
+    # unlit (default): renders the color directly via emissive, base_color=0,
+    # max_bounces=0 (matte ID / white-model / occlusion reference).
+    white = materials.flat((1.0, 1.0, 1.0))
+    assert white.emissive == pytest.approx((1.0, 1.0, 1.0))
+    assert white.base_color == pytest.approx((0.0, 0.0, 0.0))
+    assert white.emissive_strength == 1.0 and white.max_bounces == 0
+    # lit variant: a Lambertian surface of the given color.
+    lit = materials.flat((0.2, 0.3, 0.4), unlit=False)
+    assert lit.base_color == pytest.approx((0.2, 0.3, 0.4))
+    assert lit.emissive == pytest.approx((0.0, 0.0, 0.0))
+    # overrides forward through
+    assert materials.flat((1, 1, 1), roughness=0.3).roughness == 0.3
+    assert "flat" in materials.__all__
+
+
 def test_overrides_forwarded():
     m = materials.brushed_copper(roughness=0.2, max_bounces=7)
     assert m.roughness == 0.2 and m.max_bounces == 7

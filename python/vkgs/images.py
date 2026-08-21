@@ -53,30 +53,43 @@ def load_image(path: str, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
     return image
 
 
-def _load_raw(path: str, size: Optional[Tuple[int, int]]) -> np.ndarray:
+def _load_raw(path: str, size: Optional[Tuple[int, int]], dtype=np.float32) -> np.ndarray:
+    """Read a headered (or legacy headerless) .raw dump. ``dtype`` selects the
+    element type of the payload (float32 for color/depth, uint32 for the
+    integer instance-id AOV); both are 4 bytes so the header is identical."""
+    dtype = np.dtype(dtype)
     file_size = os.path.getsize(path)
     with open(path, "rb") as f:
         header = np.fromfile(f, dtype=np.uint32, count=4)
         if header.size == 4:
             width, height, channels, bytes_per_channel = (int(v) for v in header)
             expected = _RAW_HEADER_BYTES + width * height * channels * bytes_per_channel
-            if bytes_per_channel == 4 and 1 <= channels <= 4 and expected == file_size:
-                data = np.fromfile(f, dtype=np.float32, count=width * height * channels)
+            if bytes_per_channel == dtype.itemsize and 1 <= channels <= 4 and expected == file_size:
+                data = np.fromfile(f, dtype=dtype, count=width * height * channels)
                 image = data.reshape(height, width, channels)
                 if size is not None and (width, height) != (int(size[0]), int(size[1])):
                     raise ValueError(f"{path}: raw header says {width}x{height}, expected {size[0]}x{size[1]}")
                 return image
-        # Headerless fallback: tightly packed float32 RGBA, size required.
+        # Headerless fallback: tightly packed RGBA of `dtype`, size required.
         if size is None:
             raise ValueError(f"{path}: unrecognized .raw header and no size=(W, H) given")
         width, height = int(size[0]), int(size[1])
-        if file_size != width * height * 4 * 4:
+        if file_size != width * height * 4 * dtype.itemsize:
             raise ValueError(
-                f"{path}: {file_size} bytes matches neither headered nor packed float32 RGBA at {width}x{height}"
+                f"{path}: {file_size} bytes matches neither headered nor packed {dtype} RGBA at {width}x{height}"
             )
         f.seek(0)
-        data = np.fromfile(f, dtype=np.float32, count=width * height * 4)
+        data = np.fromfile(f, dtype=dtype, count=width * height * 4)
         return data.reshape(height, width, 4)
+
+
+def load_raw_uint(path: str, size: Optional[Tuple[int, int]] = None) -> np.ndarray:
+    """Load a single-channel R32_UINT ``.raw`` dump (the instance-id AOV) as a
+    ``(H, W)`` uint32 array. Background / no-mesh pixels hold the sentinel
+    ``0xFFFFFFFF``. Use this instead of :func:`load_image` for integer AOVs —
+    the generic loader would reinterpret the bytes as float32."""
+    arr = _load_raw(path, size, dtype=np.uint32)
+    return arr[..., 0] if arr.ndim == 3 else arr
 
 
 def resolve_outputs(stem: str, ext: str, tonemapping_active: bool = False) -> Dict[str, str]:

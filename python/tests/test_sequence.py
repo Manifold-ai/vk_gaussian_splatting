@@ -84,6 +84,26 @@ def test_capture_hdr_extension(tmp_path):
     assert re.search(r'--saveImage "[^"]+\.hdr"', script.text())
 
 
+def test_capture_raw_extension_keeps_pair(tmp_path):
+    script = RenderScript(frames=8)
+    script.load_block(frames=8)
+    script.capture("cam0", 0, str(tmp_path / "shot"), ext=".raw")
+    blocks = blocks_of(script.text())
+    assert [name for name, _ in blocks] == ["Load scene and settle", "cam0", "cam0 save"]
+    save = blocks[2][1]
+    # .raw filename, and the saveImageBuffer -1 BEFORE saveImage pair is intact
+    assert re.search(r'--saveImage "[^"]+\.raw"', "\n".join(save))
+    buffer_idx = next(i for i, l in enumerate(save) if l.startswith("--saveImageBuffer"))
+    image_idx = next(i for i, l in enumerate(save) if l.startswith("--saveImage "))
+    assert save[buffer_idx] == "--saveImageBuffer -1" and buffer_idx < image_idx
+
+
+def test_capture_ext_normalizes_leading_dot(tmp_path):
+    script = RenderScript()
+    script.capture("cam0", 0, str(tmp_path / "shot"), ext="raw")  # no leading dot
+    assert re.search(r'--saveImage "[^"]+\.raw"', script.text())
+
+
 def test_capture_rejects_unknown_buffer(tmp_path):
     script = RenderScript()
     with pytest.raises(ValueError, match="unknown buffer"):

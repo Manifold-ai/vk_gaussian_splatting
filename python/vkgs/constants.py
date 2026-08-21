@@ -182,6 +182,7 @@ BUFFER_POSTFIXES = {
     "comparison": "_comparison",  # conditional: image compare active
     "normal": "_normal",          # always
     "depth": "_depth",            # always
+    "instance_id": "_instance_id",  # always dumped; R32_UINT, populated by hybrid pipelines (raster mesh MRT + raygen)
     "ldr": "_ldr",                # conditional: tonemapping active
 }
 

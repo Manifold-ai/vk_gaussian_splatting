@@ -167,6 +167,111 @@ def test_gs_shadow_mask_smoke(tmp_path):
 
 
 @needs_gpu_assets
+@pytest.mark.parametrize("pipeline", [Pipeline.MESH, Pipeline.RTX])
+def test_alpha_coverage_via_raw(tmp_path, pipeline):
+    """image_format='raw' returns RGBA32F whose alpha channel is real
+    per-pixel coverage (not the old all-ones fake). Both the raster (MESH) and
+    RTX paths must populate it: RTX writes 1 - transmittance, raster writes
+    premultiplied alpha."""
+    scene = make_scene()
+    scene.renderer.pipeline = pipeline
+    # Real per-pixel coverage lives on the front-to-back surface path: the
+    # raster frag only emits premultiplied alpha under FRONT_TO_BACK &&
+    # NEED_SURFACE_INFO (else the 4th channel is an unbounded BTF blend
+    # accumulator). needSurfaceInfo() gates on force_surfel, so enable it —
+    # this mirrors how the backend always renders (force_surfel on).
+    scene.renderer.force_surfel = True
+    preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
+    result = render_scene(
+        scene,
+        [preset],
+        size=(320, 240),
+        spp=8,
+        buffers=("main",),
+        out_dir=str(tmp_path / f"raw_{int(pipeline)}"),
+        image_format="raw",
+    )
+    path = result.path(0, "main")
+    assert path.endswith("_main.raw")
+    image = result.image(0, "main")
+    assert image.shape == (240, 320, 4) and image.dtype == np.float32
+    alpha = image[..., 3]
+    assert float(alpha.min()) >= -1e-4 and float(alpha.max()) <= 1.0 + 1e-4
+    assert float(alpha.max()) > 0.5, "dense splats should give high coverage"
+    assert float(alpha.min()) < 0.99, "alpha is all-ones; coverage not real"
+    assert float(alpha.std()) > 0.01, "alpha is ~constant; not real coverage"
+
+
+@needs_gpu_assets
+def test_depth_aov_readback(tmp_path):
+    """The depth buffer reads back as NDC [0,1] in channel R and varies across
+    the frame (near geometry < far)."""
+    scene = make_scene()
+    scene.renderer.pipeline = Pipeline.MESH
+    # The depth AOV (depthTransmittanceBuffer) is written only inside the raster
+    # frag's FRONT_TO_BACK && NEED_SURFACE_INFO branch; without a needSurfaceInfo
+    # trigger it stays all-zero. force_surfel flips it on (as the backend does).
+    scene.renderer.force_surfel = True
+    preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
+    result = render_scene(
+        scene,
+        [preset],
+        size=(320, 240),
+        spp=8,
+        buffers=("main", "depth"),
+        out_dir=str(tmp_path / "depth"),
+        image_format="raw",
+    )
+    depth = result.image(0, "depth")
+    assert depth.ndim == 3 and depth.shape[:2] == (240, 320)
+    d = depth[..., 0]  # NDC depth in channel R
+    assert float(d.min()) >= -1e-4 and float(d.max()) <= 1.0 + 1e-4
+    assert float(d.std()) > 0.0, "depth is constant; expected near/far variation"
+
+
+@needs_gpu_assets
+def test_instance_id_aov(tmp_path):
+    """The mesh-instance-ID AOV (HYBRID pipeline) marks the visible mesh's
+    pixels with its instance index (0 for the only mesh) as an R32_UINT .raw,
+    and leaves the sentinel 0xFFFFFFFF for splat/background pixels. If this
+    fails all-sentinel, the shader gate (HYBRID_ENABLED && NEED_SURFACE_INFO)
+    is not active for this render — see the Phase 2 build notes."""
+    from vkgs.images import load_raw_uint
+
+    mesh = write_sphere_obj(str(tmp_path / "sphere.obj"), radius=1.0)
+    scene = Scene()
+    scene.renderer.pipeline = Pipeline.HYBRID
+    # The instance-id write is gated HYBRID_ENABLED && NEED_SURFACE_INFO; with no
+    # lighting/shadow-mask/surfel trigger the AOV is compiled inert and reads
+    # all-sentinel. force_surfel satisfies needSurfaceInfo() (the backend keeps
+    # it on for every product/AOV pass).
+    scene.renderer.force_surfel = True
+    scene.add_splats(TEST_PLY)
+    scene.add_mesh(
+        mesh,
+        position=(0.0, 0.0, 0.0),
+        scale=0.5,
+        materials=[Material(name="m", base_color=(1.0, 1.0, 1.0), roughness=1.0)],
+    )
+    preset = scene.add_camera_preset(Camera(eye=(1.7, 1.5, 1.7), ctr=(0, 0, 0)))
+    result = render_scene(
+        scene,
+        [preset],
+        size=(320, 240),
+        spp=8,
+        buffers=("main", "instance_id"),
+        out_dir=str(tmp_path / "iid"),
+        image_format="raw",
+    )
+    aov_path = result.path(0, "instance_id")
+    assert aov_path.endswith("_instance_id.raw")
+    aov = load_raw_uint(aov_path)
+    assert aov.shape == (240, 320) and aov.dtype == np.uint32
+    assert int((aov == 0).sum()) > 0, "mesh instance id 0 not present in the AOV"
+    assert int((aov == 0xFFFFFFFF).sum()) > 0, "no background sentinel pixels in the AOV"
+
+
+@needs_gpu_assets
 def test_saveimage_pairing_semantics(tmp_path):
     """Empirically verify the render/save pairing: saveImage captures the
     framebuffer from the END of the PREVIOUS sequence, so two capture pairs
@@ -205,3 +310,46 @@ def test_saveimage_pairing_semantics(tmp_path):
     assert sh0.max() > 0 and sh3.max() > 0
     # SH degree 0 drops all view-dependent color: images must differ measurably
     assert np.abs(sh0 - sh3).mean() > 0.1
+
+
+def _find_textured_glb():
+    env = os.environ.get("VKGS_TEST_GLB")
+    if env and os.path.isfile(env):
+        return env
+    matches = sorted(
+        glob.glob(os.path.expanduser("~/vkgs-test-models/**/*.glb"), recursive=True)
+    )
+    return matches[0] if matches else None
+
+
+TEST_GLB = _find_textured_glb()
+
+
+@needs_gpu_assets
+@pytest.mark.skipif(TEST_GLB is None, reason="requires a textured .glb (set $VKGS_TEST_GLB)")
+def test_clear_textures_changes_render(tmp_path):
+    """clearTextures A/B: the same textured GLB rendered with and without the
+    per-instance texture clear must differ measurably — with the flag on, the
+    shader skips every texture sample and only material factors show."""
+
+    def render(clear):
+        scene = Scene()
+        scene.renderer.pipeline = Pipeline.MESH
+        scene.add_splats(TEST_PLY, show=False)  # satisfy the loader; mesh-only view
+        scene.add_mesh(TEST_GLB, name="product", clear_textures=clear)
+        preset = scene.add_camera_preset(Camera(eye=(1.5, 1.0, 1.5), ctr=(0, 0, 0)))
+        result = render_scene(
+            scene,
+            [preset],
+            size=(320, 240),
+            spp=4,
+            buffers=("main",),
+            out_dir=str(tmp_path / ("clear" if clear else "textured")),
+        )
+        return result.image(0, "main").astype(np.float64)
+
+    textured = render(False)
+    cleared = render(True)
+    assert textured.max() > 0 and cleared.max() > 0
+    # Dropping the texture maps must change the image (factor-only shading).
+    assert np.abs(textured - cleared).mean() > 0.5

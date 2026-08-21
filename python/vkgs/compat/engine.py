@@ -5,20 +5,20 @@ Mirrors the outward surface of ``Engine3DGRUT``
 (threedgrut_playground/engine.py:895-1667) on a lazy execution model: every
 setter only mutates in-memory state; ``render(camera)`` serializes the
 scene to .vkgs + .cfg, runs one headless subprocess
-(vkgs.facade.render_scene, hdr=True) and returns
+(vkgs.facade.render_scene, image_format='raw') and returns
 ``{'rgb': (1, H, W, 3) float32 in [0, 1], 'opacity': (1, H, W, 1),
-'rgb_buffer': alias of rgb}`` — numpy by default, torch-wrapped with
-``return_torch=True``.
+'rgb_buffer': alias of rgb}`` (plus 'depth' when ``return_depth=True``) —
+numpy by default, torch-wrapped with ``return_torch=True``.
 
 Tonemapping/gamma are applied in Python on the HDR readback using 3dgrut's
 exact formulas (vkgs.compat.tonemap), so 'None'/'Reinhard'/'Filmic' match
 pixel-for-pixel modulo the renderer's own output differences.
 
-Opacity note: the .hdr readback carries no alpha, so ``opacity`` is
-currently all-ones. Real coverage requires the .raw RGBA32F dump path plus
-— for the RTX pipelines — the C++ alpha patch (RTX writes alpha=1.0 today,
-shaders/threedgrt_raytrace.rgen.slang:1956,2103); raster pipelines already
-accumulate a meaningful alpha.
+Opacity note: ``opacity`` is real per-pixel coverage, read from the 4th
+channel of the ``.raw`` RGBA32F main-buffer dump. Both pipelines write it:
+RTX as ``1 - transmittance`` (shaders/threedgrt_raytrace.rgen.slang), raster
+via premultiplied alpha. (A ``.hdr`` readback would drop alpha and yield
+all-ones; the compat engine uses ``.raw`` precisely to keep coverage.)
 
 Progressive-rendering surface (render_pass/is_dirty/...) is ported to the
 batch model: ``render_pass`` performs one full-quality render and then
@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
-from .. import facade
+from .. import facade, images
 from ..camera import Camera
 from ..constants import CameraModel, DofMode, EnvMode, Pipeline, ShadowsMode
 from ..geometry import ensure_procedural
@@ -59,6 +59,11 @@ _DOF_PIPELINES = {Pipeline.RTX, Pipeline.MESH_3DGUT, Pipeline.HYBRID_3DGUT}
 # Pipelines where the GS shadow mask takes effect (RTX-traced splats only,
 # src/parameters.h:185-188): RTX(2) / HYBRID(3) / HYBRID_3DGUT(5).
 _GS_SHADOW_MASK_PIPELINES = {Pipeline.RTX, Pipeline.HYBRID, Pipeline.HYBRID_3DGUT}
+
+# Pipelines that populate the mesh-instance-id AOV: the hybrid raygen writes it
+# (shader gate HYBRID_ENABLED && NEED_SURFACE_INFO), i.e. HYBRID(3) / HYBRID_3DGUT(5).
+# Pure RTX(2) and the raster pipelines leave the AOV at the sentinel.
+_INSTANCE_ID_PIPELINES = {Pipeline.HYBRID, Pipeline.HYBRID_3DGUT}
 
 _EXPORT_PLY_HINT = (
     ".pt/.ingp checkpoints are not auto-converted (project decision B1). "
@@ -199,8 +204,10 @@ class EngineVKGS:
 
     - ``executable``: renderer binary (default: vkgs.runner.find_executable
       search at render time, so construction works without a build);
-    - ``out_dir``: where .vkgs/.cfg/images/logs are written (default: a
-      fresh temp directory);
+    - ``out_dir``: where .vkgs/.cfg/images are written (default: a fresh temp
+      directory). With ``reclaim`` (default) each render keeps only the
+      requested buffer files there and drops the rest + .vkgs/.cfg; renderer
+      logs go to $TMPDIR/vkgs_render_logs instead (toggle with ``render_logs``);
     - ``size``: output (W, H) when the camera carries no resolution (kaolin
       cameras use their own width/height);
     - ``return_torch``: wrap render() results with torch.from_numpy;
@@ -227,7 +234,10 @@ class EngineVKGS:
         size: Tuple[int, int] = (1920, 1080),
         return_torch: bool = False,
         pipeline: int = Pipeline.HYBRID,
+        return_depth: bool = False,
         extra_args: Sequence[str] = (),
+        reclaim: bool = True,
+        render_logs: bool = True,
     ):
         ext = os.path.splitext(gs_object)[1].lower()
         if ext in (".pt", ".ingp"):
@@ -247,9 +257,20 @@ class EngineVKGS:
         self.size = (int(size[0]), int(size[1]))
         self.return_torch = bool(return_torch)
         self.pipeline = Pipeline(int(pipeline))
+        # When True, render_many also requests the depth buffer and returns it
+        # under a "depth" key (NDC [0,1]); off by default to skip the extra I/O.
+        self.return_depth = bool(return_depth)
         # Extra CLI args appended verbatim to every render subprocess command
         # (e.g. ["--spirvCacheDir", "/var/cache/vkgs"]).
         self.extra_args = tuple(extra_args)
+        # Default artifact reclaim: after each render keep only the requested
+        # buffer files on disk, drop the other auto-dumped buffers (the renderer
+        # always dumps all of them) plus scene.vkgs / render.cfg. Set False to
+        # keep every intermediate.
+        self.reclaim = bool(reclaim)
+        # When True renderer logs go to $TMPDIR/vkgs_render_logs (kept); when
+        # False they are captured+parsed then deleted (error detection intact).
+        self._render_logs = bool(render_logs)
         # Not applicable in the subprocess model; kept for script portability
         # (3dgrut scripts pass engine.device into add_primitive, which we ignore).
         self.device = None
@@ -436,6 +457,38 @@ class EngineVKGS:
     def invalidate_materials_on_gpu(self) -> None:
         self.is_materials_dirty = True
 
+    def set_primitive_material(self, name: str, material=None) -> None:
+        """Override (or, with ``material=None``, clear) the material of one
+        primitive instance. The override wins over the primitive_type preset at
+        flush, so e.g. ``materials.flat((1, 1, 1))`` gives a white-model
+        reference render and ``materials.flat((0, 0, 0))`` a black occluder.
+        Native Scene already supports per-instance materials; this exposes it
+        through the compat shim.
+
+        Note: overrides replace factors only — the mesh's texture maps still
+        modulate them (e.g. white diffuse x base-color texture). For a true
+        white model on a textured mesh combine with
+        :meth:`clear_primitive_textures`."""
+        self.primitives.set_primitive_material(name, material)
+        self.is_materials_dirty = True
+
+    def clear_primitive_textures(self, name: str, clear: bool = True) -> None:
+        """Drop (or with ``clear=False`` restore) every texture map of one
+        primitive — base color, normal, metallic-roughness, emissive, ... —
+        so it renders with its material factors only. Orthogonal to
+        :meth:`set_primitive_material` (which never touches textures); both
+        compose. Caveat: primitives loaded from the same mesh file share one
+        material buffer in the renderer, so clearing one clears them all."""
+        self.primitives.clear_primitive_textures(name, clear)
+        self.is_materials_dirty = True
+
+    def get_scene_bounds(self) -> Tuple[float, float, float]:
+        """Per-axis extent (max - min) of the splat cloud in the PLY-native
+        frame — NOT AABB corners and NOT a metric center. ``(1, 1, 1)``
+        fallback for non-.ply inputs (.spz/.splat have no cheap position
+        scan). Useful for framing a default camera."""
+        return self.primitives.scene_extent
+
     def has_progressive_effects_to_render(self) -> bool:
         """Always False: render()/render_pass() runs accumulate every sample
         inside one subprocess call (plan gap A2)."""
@@ -467,7 +520,12 @@ class EngineVKGS:
         for prim in self.primitives.objects.values():
             if prim.primitive_type == OptixPrimitiveTypes.SHADOW_CATCHER:
                 continue  # never rendered; only requests the GS shadow mask
-            material = primitive_type_to_material(prim.primitive_type, ior=prim.refractive_index)
+            # A per-instance override wins over the primitive_type preset — and
+            # applies even to PBR/NONE, whose preset is None.
+            if prim.material_override is not None:
+                material = prim.material_override
+            else:
+                material = primitive_type_to_material(prim.primitive_type, ior=prim.refractive_index)
             scene.add_mesh(
                 prim.path,
                 name=prim.name,
@@ -476,6 +534,9 @@ class EngineVKGS:
                 scale=prim.scale,
                 materials=[material] if material is not None else None,
                 show=show_meshes and prim.show and prim.primitive_type != OptixPrimitiveTypes.NONE,
+                # Per-primitive clear composes with the 3dgrut-parity global
+                # disable_pbr_textures toggle.
+                clear_textures=prim.clear_textures or self.primitives.disable_pbr_textures,
             )
 
         any_light = False
@@ -665,15 +726,19 @@ class EngineVKGS:
 
         out_dir = os.path.join(self.out_dir, f"render_{self._render_index:04d}")
         self._render_index += 1
+        buffers = ["main"] + (["depth"] if self.return_depth else [])
         result = facade.render_scene(
             scene,
             cams,
             size=size,
             spp=self._frames(),
+            buffers=buffers,
             out_dir=out_dir,
-            hdr=True,
+            image_format="raw",  # RGBA32F -> real alpha coverage in channel 3
             executable=self.executable,
             extra_args=self.extra_args,
+            keep_buffers=buffers if self.reclaim else None,
+            log=self._render_logs,
         )
 
         buffers: List[Dict[str, np.ndarray]] = []
@@ -683,6 +748,107 @@ class EngineVKGS:
         self._cache_last_state(cams[-1], buffers[-1])
         self.frame_id += self._frames()
         return buffers
+
+    # ------------------------------------------------- per-product AOV masks
+
+    def _mesh_instance_order(self) -> List[str]:
+        """Primitive names in the order they become mesh instances in the built
+        scene — which equals the C++ TLAS InstanceID and the value written into
+        the instance-id AOV. Mirrors _build_scene's mesh add order: every
+        non-SHADOW_CATCHER primitive (visible or not), in insertion order.
+        Area-light quads (added afterwards) get later ids and are not products."""
+        return [
+            prim.name
+            for prim in self.primitives.objects.values()
+            if prim.primitive_type != OptixPrimitiveTypes.SHADOW_CATCHER
+        ]
+
+    _AOV_BUFFERS = ("main", "depth", "instance_id")
+
+    def render_aovs(
+        self,
+        camera,
+        buffers: Sequence[str] = ("main", "depth", "instance_id"),
+        spp: Optional[int] = None,
+    ) -> Dict[str, np.ndarray]:
+        """ONE raw render returning the requested AOV arrays.
+
+        Returns a dict holding only the requested buffers as numpy arrays —
+        ``main`` (H, W, 4) float32 RGBA with real coverage alpha, ``depth``
+        (H, W, C) float32 (channel R = NDC [0,1] depth, G = transmittance of
+        the splats in front of the primary mesh hit), ``instance_id`` (H, W)
+        uint32 (sentinel 0xFFFFFFFF) — plus ``"mesh_instance_order"``: the
+        primitive names in TLAS-InstanceID order for id->name mapping.
+
+        ``instance_id`` requires a hybrid pipeline (HYBRID / HYBRID_3DGUT:
+        raster mesh MRT and/or raygen write it); other pipelines leave it at
+        the sentinel (a CompatWarning is emitted). ``spp`` overrides the accumulated
+        frame count for this render only. The exe run always dumps every
+        buffer; only the buffers listed in ``buffers`` are loaded, and with
+        ``reclaim`` (default) only those are kept on disk."""
+        want = list(dict.fromkeys(buffers))
+        unknown = [b for b in want if b not in self._AOV_BUFFERS]
+        if unknown:
+            raise ValueError(
+                f"unsupported AOV buffer(s) {unknown}; expected {list(self._AOV_BUFFERS)}"
+            )
+        if "instance_id" in want and self.pipeline not in _INSTANCE_ID_PIPELINES:
+            warn_compat(
+                f"the instance-id AOV needs a hybrid pipeline "
+                f"{sorted(int(p) for p in _INSTANCE_ID_PIPELINES)}; current pipeline "
+                f"{int(self.pipeline)} leaves the sentinel (all masks empty). Set "
+                "engine.pipeline = vkgs.constants.Pipeline.HYBRID."
+            )
+
+        cam, size_hint = self._prepare_camera(camera)
+        size = size_hint if size_hint is not None else self.size
+        scene = self._build_scene()
+        scene.set_camera(cam)
+        out_dir = os.path.join(self.out_dir, f"aovs_{self._render_index:04d}")
+        self._render_index += 1
+        request = ["main"] + [b for b in want if b != "main"]
+        result = facade.render_scene(
+            scene,
+            [cam],
+            size=size,
+            spp=int(spp) if spp is not None else self._frames(),
+            buffers=request,
+            out_dir=out_dir,
+            image_format="raw",
+            executable=self.executable,
+            extra_args=self.extra_args,
+            # Keep only what the caller asked for (``want``), not the always-added
+            # ``main`` in ``request`` — reclaim drops main too when unrequested.
+            keep_buffers=want if self.reclaim else None,
+            log=self._render_logs,
+        )
+        out: Dict[str, np.ndarray] = {"mesh_instance_order": self._mesh_instance_order()}
+        if "main" in want:
+            out["main"] = np.asarray(result.image(0, "main"), dtype=np.float32)
+        if "depth" in want:
+            out["depth"] = np.asarray(result.image(0, "depth"), dtype=np.float32)
+        if "instance_id" in want:
+            out["instance_id"] = images.load_raw_uint(result.path(0, "instance_id"))
+        return out
+
+    def render_masks(self, camera, names: Optional[Sequence[str]] = None) -> Dict[str, np.ndarray]:
+        """Per-product visibility masks from ONE render via the instance-id AOV
+        (no per-product paint-white/paint-black passes). Returns
+        ``{name: bool (H, W)}`` — True where that product's mesh instance is the
+        visible primary surface.
+
+        Requires a hybrid pipeline (HYBRID / HYBRID_3DGUT) with
+        surface info; other pipelines leave the AOV at the sentinel and yield
+        empty masks (a CompatWarning is emitted). ``names`` selects a subset
+        (default: every mesh primitive)."""
+        order = self._mesh_instance_order()
+        id_of = {name: index for index, name in enumerate(order)}
+        want = list(order) if names is None else list(names)
+        unknown = [n for n in want if n not in id_of]
+        if unknown:
+            raise KeyError(f"unknown primitive(s) {unknown}; known: {sorted(id_of)}")
+        aov = self.render_aovs(camera, buffers=("instance_id",))["instance_id"]
+        return {name: (aov == id_of[name]) for name in want}
 
     def _postprocess(self, result, position: int) -> Dict[str, np.ndarray]:
         image = result.image(position, "main")
@@ -701,6 +867,19 @@ class EngineVKGS:
             opacity = np.ones(rgb.shape[:3] + (1,), dtype=np.float32)
 
         rb = {"rgb": rgb, "opacity": opacity, "rgb_buffer": rgb}
+        if self.return_depth:
+            try:
+                depth_img = result.image(position, "depth")
+            except KeyError:
+                warn_compat("return_depth=True but no depth buffer was saved; skipping depth")
+            else:
+                # Channel R = depth in NDC [0,1] (NOT metric world distance —
+                # un-project with the camera projection for view-space Z);
+                # channel G = transmittance.
+                rb["depth"] = depth_img[..., 0:1].astype(np.float32)[np.newaxis]  # (1, H, W, 1)
+                if depth_img.ndim == 3 and depth_img.shape[2] >= 2:
+                    rb["depth_transmittance"] = depth_img[..., 1:2].astype(np.float32)[np.newaxis]
+
         if self.return_torch:
             try:
                 import torch
