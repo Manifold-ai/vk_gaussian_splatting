@@ -204,8 +204,10 @@ class EngineVKGS:
 
     - ``executable``: renderer binary (default: vkgs.runner.find_executable
       search at render time, so construction works without a build);
-    - ``out_dir``: where .vkgs/.cfg/images/logs are written (default: a
-      fresh temp directory);
+    - ``out_dir``: where .vkgs/.cfg/images are written (default: a fresh temp
+      directory). With ``reclaim`` (default) each render keeps only the
+      requested buffer files there and drops the rest + .vkgs/.cfg; renderer
+      logs go to $TMPDIR/vkgs_render_logs instead (toggle with ``render_logs``);
     - ``size``: output (W, H) when the camera carries no resolution (kaolin
       cameras use their own width/height);
     - ``return_torch``: wrap render() results with torch.from_numpy;
@@ -234,6 +236,8 @@ class EngineVKGS:
         pipeline: int = Pipeline.HYBRID,
         return_depth: bool = False,
         extra_args: Sequence[str] = (),
+        reclaim: bool = True,
+        render_logs: bool = True,
     ):
         ext = os.path.splitext(gs_object)[1].lower()
         if ext in (".pt", ".ingp"):
@@ -259,6 +263,14 @@ class EngineVKGS:
         # Extra CLI args appended verbatim to every render subprocess command
         # (e.g. ["--spirvCacheDir", "/var/cache/vkgs"]).
         self.extra_args = tuple(extra_args)
+        # Default artifact reclaim: after each render keep only the requested
+        # buffer files on disk, drop the other auto-dumped buffers (the renderer
+        # always dumps all of them) plus scene.vkgs / render.cfg. Set False to
+        # keep every intermediate.
+        self.reclaim = bool(reclaim)
+        # When True renderer logs go to $TMPDIR/vkgs_render_logs (kept); when
+        # False they are captured+parsed then deleted (error detection intact).
+        self._render_logs = bool(render_logs)
         # Not applicable in the subprocess model; kept for script portability
         # (3dgrut scripts pass engine.device into add_primitive, which we ignore).
         self.device = None
@@ -707,6 +719,8 @@ class EngineVKGS:
             image_format="raw",  # RGBA32F -> real alpha coverage in channel 3
             executable=self.executable,
             extra_args=self.extra_args,
+            keep_buffers=buffers if self.reclaim else None,
+            log=self._render_logs,
         )
 
         buffers: List[Dict[str, np.ndarray]] = []
@@ -748,11 +762,12 @@ class EngineVKGS:
         uint32 (sentinel 0xFFFFFFFF) — plus ``"mesh_instance_order"``: the
         primitive names in TLAS-InstanceID order for id->name mapping.
 
-        ``instance_id`` requires an RTX-traced hybrid pipeline
-        (HYBRID / HYBRID_3DGUT); other pipelines leave it at the sentinel
-        (a CompatWarning is emitted). ``spp`` overrides the accumulated
-        frame count for this render only. The exe run always dumps the
-        ``main`` buffer; only the buffers listed in ``buffers`` are loaded."""
+        ``instance_id`` requires a hybrid pipeline (HYBRID / HYBRID_3DGUT:
+        raster mesh MRT and/or raygen write it); other pipelines leave it at
+        the sentinel (a CompatWarning is emitted). ``spp`` overrides the accumulated
+        frame count for this render only. The exe run always dumps every
+        buffer; only the buffers listed in ``buffers`` are loaded, and with
+        ``reclaim`` (default) only those are kept on disk."""
         want = list(dict.fromkeys(buffers))
         unknown = [b for b in want if b not in self._AOV_BUFFERS]
         if unknown:
@@ -761,7 +776,7 @@ class EngineVKGS:
             )
         if "instance_id" in want and self.pipeline not in _INSTANCE_ID_PIPELINES:
             warn_compat(
-                f"the instance-id AOV needs an RTX-traced hybrid pipeline "
+                f"the instance-id AOV needs a hybrid pipeline "
                 f"{sorted(int(p) for p in _INSTANCE_ID_PIPELINES)}; current pipeline "
                 f"{int(self.pipeline)} leaves the sentinel (all masks empty). Set "
                 "engine.pipeline = vkgs.constants.Pipeline.HYBRID."
@@ -784,6 +799,10 @@ class EngineVKGS:
             image_format="raw",
             executable=self.executable,
             extra_args=self.extra_args,
+            # Keep only what the caller asked for (``want``), not the always-added
+            # ``main`` in ``request`` — reclaim drops main too when unrequested.
+            keep_buffers=want if self.reclaim else None,
+            log=self._render_logs,
         )
         out: Dict[str, np.ndarray] = {"mesh_instance_order": self._mesh_instance_order()}
         if "main" in want:
@@ -800,7 +819,7 @@ class EngineVKGS:
         ``{name: bool (H, W)}`` — True where that product's mesh instance is the
         visible primary surface.
 
-        Requires an RTX-traced hybrid pipeline (HYBRID / HYBRID_3DGUT) with
+        Requires a hybrid pipeline (HYBRID / HYBRID_3DGUT) with
         surface info; other pipelines leave the AOV at the sentinel and yield
         empty masks (a CompatWarning is emitted). ``names`` selects a subset
         (default: every mesh primitive)."""

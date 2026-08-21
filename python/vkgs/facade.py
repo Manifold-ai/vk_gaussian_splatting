@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 import os
+import tempfile
 import warnings
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
@@ -112,6 +113,8 @@ def render_scene(
     executable: Optional[str] = None,
     gpu: Optional[int] = None,
     keep_files: bool = True,
+    keep_buffers: Optional[Sequence[str]] = None,
+    log: bool = True,
     timeout: float = 1800,
     extra_args: Sequence[str] = (),
 ) -> RenderResult:
@@ -132,6 +135,16 @@ def render_scene(
       alpha. The ``main`` buffer's 4th channel is the per-pixel coverage.
     - ``keep_files``: when False, images are loaded eagerly and the
       intermediate files (images, .vkgs, .cfg) are deleted; the log is kept.
+    - ``keep_buffers``: selective reclaim (takes precedence over ``keep_files``
+      when not None). Keeps only the dumped buffer files whose name is in this
+      list and deletes every other dumped buffer plus scene.vkgs / render.cfg.
+      Note the renderer always dumps every buffer (saveImageBuffer -1), so this
+      is how you avoid leaving the unrequested ones on disk.
+    - ``log``: when True the renderer log is written to a uniquely named file
+      under ``$TMPDIR/vkgs_render_logs`` (kept). When False the same file is
+      still captured and parsed (error detection / warnings survive in the
+      returned RunResult) but deleted before returning. Either way the log is
+      NOT written into ``out_dir``.
     """
     buffers = list(buffers)
     unknown = [b for b in buffers if b not in BUFFER_POSTFIXES]
@@ -180,6 +193,13 @@ def render_scene(
 
     cfg_path = script.write(os.path.join(out_dir, "render.cfg"))
 
+    # Route the log to a unique file under $TMPDIR/vkgs_render_logs (never into
+    # out_dir). When log=False it is still captured+parsed, then deleted below.
+    fd, log_path = tempfile.mkstemp(
+        dir=_render_log_dir(), prefix=os.path.basename(out_dir) + "_", suffix=".log"
+    )
+    os.close(fd)
+
     runner = HeadlessRunner(executable)
     run = runner.run(
         cfg_path,
@@ -187,7 +207,7 @@ def render_scene(
         size=size,
         gpu=gpu,
         timeout=timeout,
-        log_path=os.path.join(out_dir, "render.log"),
+        log_path=log_path,
         expected_outputs=expected,
         extra_args=extra_args,
     )
@@ -197,15 +217,30 @@ def render_scene(
     paths = {position: images.find_outputs(stem) for position, stem in stems.items()}
     result = RenderResult(paths, run, out_dir)
 
-    if not keep_files:
+    if keep_buffers is not None:
+        # Selective reclaim: keep only the requested buffer files, drop every
+        # other dumped buffer plus the scaffolding (scene.vkgs, render.cfg).
+        keep = set(keep_buffers)
+        for files in paths.values():
+            for buffer, path in list(files.items()):
+                if buffer not in keep:
+                    _remove_quiet(path)
+                    del files[buffer]
+        _remove_quiet(vkgs_path)
+        _remove_quiet(cfg_path)
+    elif not keep_files:
         for position in stems:
             for buffer in buffers:
                 result.image(position, buffer)  # eager-load into the cache
         for files in paths.values():
             for path in files.values():
                 _remove_quiet(path)
+            files.clear()
         _remove_quiet(vkgs_path)
         _remove_quiet(cfg_path)
+
+    if not log:
+        _remove_quiet(log_path)  # RunResult.log_text already holds the contents
 
     return result
 
@@ -252,3 +287,12 @@ def _remove_quiet(path: str) -> None:
         os.remove(path)
     except OSError:
         pass
+
+
+def _render_log_dir() -> str:
+    """Shared tmp folder for renderer logs ($TMPDIR/vkgs_render_logs), created
+    on demand. Keeps logs out of the per-render output directories so artifact
+    reclaim never touches them (mirrors geometry.py's vkgs_procedural cache)."""
+    path = os.path.join(tempfile.gettempdir(), "vkgs_render_logs")
+    os.makedirs(path, exist_ok=True)
+    return path

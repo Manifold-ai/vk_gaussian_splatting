@@ -4,6 +4,7 @@ The headless subprocess is stubbed out (HeadlessRunner.run), so these assert
 on the generated .cfg text and the predicted output paths only.
 """
 
+import os
 import struct
 
 import numpy as np
@@ -76,6 +77,76 @@ def test_render_scene_png_default_no_float_colorbuffer(tmp_path, monkeypatch):
     )
     assert "--colorBufferFormat" not in captured["cfg"]
     assert all(p.endswith("_main.png") for p in captured["expected"])
+
+
+class _FileStubRun:
+    log_path = ""
+    sequences = []
+    warnings = []
+    log_text = ""
+
+
+def _stub_runner_files(monkeypatch):
+    """Stub runner that also creates each expected output file plus one extra
+    unrequested buffer (_aux1 per stem), to exercise selective reclaim / logs."""
+    captured = {}
+
+    class _StubRunner:
+        def __init__(self, executable=None):
+            pass
+
+        def run(self, cfg_path, **kw):
+            captured["expected"] = list(kw.get("expected_outputs", []))
+            captured["log_path"] = kw.get("log_path")
+            for p in captured["expected"]:
+                open(p, "wb").close()
+                base, ext = os.path.splitext(p)
+                stem = base.rsplit("_", 1)[0]  # ".../cam0_main" -> ".../cam0"
+                open(stem + "_aux1" + ext, "wb").close()  # unrequested dump
+            return _FileStubRun()
+
+    monkeypatch.setattr(facade, "HeadlessRunner", _StubRunner)
+    return captured
+
+
+def test_keep_buffers_reclaims_all_but_requested(tmp_path, monkeypatch):
+    _stub_runner_files(monkeypatch)
+    out = tmp_path / "o"
+    result = facade.render_scene(
+        Scene(), Camera(eye=(0, 0, 3)), size=(8, 8), spp=4,
+        buffers=["main", "depth"], out_dir=str(out), image_format="raw",
+        keep_buffers=["main"], log=False,  # log=False so the tmp log self-cleans
+    )
+    assert os.path.isfile(result.path(0, "main"))          # requested + kept
+    with pytest.raises(KeyError):
+        result.path(0, "depth")                            # requested but not kept
+    assert not os.path.exists(out / "cam0_depth.raw")      # deleted from disk
+    assert not os.path.exists(out / "cam0_aux1.raw")       # unrequested dump gone
+    assert not os.path.exists(out / "scene.vkgs")
+    assert not os.path.exists(out / "render.cfg")
+
+
+def test_log_goes_to_render_logs_dir_and_is_kept(tmp_path, monkeypatch):
+    captured = _stub_runner_files(monkeypatch)
+    out = tmp_path / "o"
+    facade.render_scene(
+        Scene(), Camera(eye=(0, 0, 3)), size=(8, 8), spp=4,
+        buffers=["main"], out_dir=str(out), image_format="raw", log=True,
+    )
+    log_path = captured["log_path"]
+    assert os.path.basename(os.path.dirname(log_path)) == "vkgs_render_logs"
+    assert os.path.isfile(log_path)                        # kept when log=True
+    assert not os.path.exists(out / "render.log")          # never in out_dir
+    os.remove(log_path)                                    # don't leak into $TMPDIR
+
+
+def test_log_false_deletes_log_after_parsing(tmp_path, monkeypatch):
+    captured = _stub_runner_files(monkeypatch)
+    facade.render_scene(
+        Scene(), Camera(eye=(0, 0, 3)), size=(8, 8), spp=4,
+        buffers=["main"], out_dir=str(tmp_path / "o"), image_format="raw", log=False,
+    )
+    assert not os.path.exists(captured["log_path"])        # captured, then removed
 
 
 def test_load_raw_uint_roundtrip(tmp_path):

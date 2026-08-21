@@ -2003,10 +2003,13 @@ void writeToGBuffers<let kVisualizeMode : uint, let kHybridEnabled : uint>(in Fr
 
 #if HYBRID_ENABLED && NEED_SURFACE_INFO
   // Per-pixel visible mesh-instance ID AOV: the primary (bounce-0) mesh hit's
-  // object index (== TLAS InstanceID == Scene.mesh_instances order), else the
-  // sentinel for background / splat-only pixels.
-  rasterInstanceIdBuffer[pixelId] =
-      (pixel.primaryHitObjId != PAYLOAD_INVALID_ID) ? uint(pixel.primaryHitObjId) : 0xFFFFFFFFu;
+  // object index (== TLAS InstanceID == Scene.mesh_instances order).
+  // Write ONLY on a valid hit: under plain HYBRID the raster mesh pass writes
+  // this AOV as an MRT attachment (threedmesh_raster.frag) and an unconditional
+  // sentinel write here would clobber it. The 0xFFFFFFFF sentinel for
+  // background / splat-only pixels is guaranteed by the per-frame clear.
+  if(pixel.primaryHitObjId != PAYLOAD_INVALID_ID)
+    rasterInstanceIdBuffer[pixelId] = uint(pixel.primaryHitObjId);
 #endif
 
   //

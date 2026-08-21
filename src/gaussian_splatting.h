@@ -189,6 +189,12 @@ protected:
     return (prmSelectedPipeline == PIPELINE_VERT || prmSelectedPipeline == PIPELINE_MESH || prmSelectedPipeline == PIPELINE_MESH_3DGUT);
   }
 
+  // Check if current pipeline is hybrid (raster primary + RTX secondary)
+  inline bool isHybridPipeline() const
+  {
+    return (prmSelectedPipeline == PIPELINE_HYBRID || prmSelectedPipeline == PIPELINE_HYBRID_3DGUT);
+  }
+
   // Check if a pipeline relies on VK_EXT_mesh_shader (raster MESH, MESH_3DGUT
   // and the hybrid raster paths all dispatch via vkCmdDrawMeshTasksEXT).
   static inline bool isMeshShaderPipeline(uint32_t pipeline)
