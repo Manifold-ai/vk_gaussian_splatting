@@ -637,6 +637,9 @@ def test_render_many_requests_raw_and_optional_depth(engine, monkeypatch):
     rb = engine.render(Camera(eye=(3, 1, 3)))
     assert calls["image_format"] == "raw"
     assert calls["buffers"] == ["main"]
+    # reclaim on by default -> keep only main; logs on by default.
+    assert calls["keep_buffers"] == ["main"]
+    assert calls["log"] is True
     assert "depth" not in rb
     assert np.all(rb["opacity"] == 0.5)  # coverage read from raw channel 3
 
@@ -644,6 +647,7 @@ def test_render_many_requests_raw_and_optional_depth(engine, monkeypatch):
     engine.return_depth = True
     rb = engine.render(Camera(eye=(3, 1, 3)))
     assert calls["buffers"] == ["main", "depth"]
+    assert calls["keep_buffers"] == ["main", "depth"]
     assert rb["depth"].shape == (1, 2, 3, 1)
     assert np.all(rb["depth"] == 0.7)  # channel R only
     assert np.all(rb["depth_transmittance"] == 0.1)  # channel G
@@ -825,6 +829,37 @@ def test_render_aovs_loads_only_requested_buffers(engine, tmp_path, monkeypatch)
 def test_render_aovs_rejects_unknown_buffer(engine):
     with pytest.raises(ValueError):
         engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("main", "normal"))
+
+
+def test_render_aovs_reclaim_and_log_passthrough(engine, tmp_path, monkeypatch):
+    engine.pipeline = Pipeline.HYBRID
+    aov_path = tmp_path / "cam0_instance_id.raw"
+    _write_instance_id_raw(aov_path, np.zeros((1, 1), dtype=np.uint32))
+    captured = {}
+
+    class _Result:
+        def path(self, position, buffer):
+            return str(aov_path)
+
+    def fake_render_scene(scene, cams, **kw):
+        captured.update(kw)
+        return _Result()
+
+    monkeypatch.setattr("vkgs.facade.render_scene", fake_render_scene)
+
+    # Default: reclaim keeps only the caller's buffers (NOT the internal "main"
+    # anchor in request), logs on.
+    engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("instance_id",))
+    assert captured["buffers"] == ["main", "instance_id"]  # request still anchors main
+    assert captured["keep_buffers"] == ["instance_id"]     # but only this is kept
+    assert captured["log"] is True
+
+    # Toggles off: keep everything, no persisted log.
+    engine.reclaim = False
+    engine._render_logs = False
+    engine.render_aovs(Camera(eye=(3, 1, 3)), buffers=("instance_id",))
+    assert captured["keep_buffers"] is None
+    assert captured["log"] is False
 
 
 def test_render_masks_warns_on_non_hybrid_pipeline(engine, tmp_path, monkeypatch):
